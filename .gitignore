@@ -1,6 +1,7 @@
 .env
 habit_key_map.json
 checkin_failures.log
+device_errors.log
 venv/
 __pycache__/
 *.pyc
