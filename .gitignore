@@ -1,0 +1,6 @@
+.env
+habit_key_map.json
+checkin_failures.log
+venv/
+__pycache__/
+*.pyc
