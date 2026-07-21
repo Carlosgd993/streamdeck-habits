@@ -1,7 +1,6 @@
 #!/opt/streamdeck-habits/venv/bin/python
 import sys
 import threading
-import time
 from datetime import datetime
 
 import auth
@@ -24,15 +23,17 @@ def today_stamp():
     return int(now.strftime("%Y%m%d"))
 
 
-def make_key_callback(deck, client, mapping, habits_ref, done_ids_ref):
+def make_key_callback(deck, client, mapping, habits_ref, done_ids_ref, refresh_event):
     key_to_habit_id = {k: hid for hid, k in mapping.items()}
 
     def on_key_change(deck, key, pressed):
         if not pressed:
             return
+        if special_keys.handle_key_press(key, refresh_event):
+            return  # tecla reservada (p.ej. refresco manual), ya gestionada
         habit_id = key_to_habit_id.get(key)
         if habit_id is None:
-            return  # tecla reservada o sin habito asignado todavia
+            return  # sin habito asignado todavia
 
         with state_lock:
             if habit_id in pending_requests:
@@ -82,6 +83,7 @@ def main():
     mapping = habit_key_map.load_map()
     habits_ref = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
     done_ids_ref = {"value": set()}
+    refresh_event = threading.Event()  # se activa por el timer o al pulsar KEY_REFRESH
 
     def refresh_cycle():
         nonlocal mapping
@@ -110,7 +112,7 @@ def main():
 
         done_ids_ref["value"] = done_ids
         deck_renderer.render_all(deck, mapping, habits_ref["value"], done_ids)
-        deck.set_key_callback(make_key_callback(deck, client, mapping, habits_ref, done_ids_ref))
+        deck.set_key_callback(make_key_callback(deck, client, mapping, habits_ref, done_ids_ref, refresh_event))
 
     try:
         while True:
@@ -123,7 +125,8 @@ def main():
                 health.log_device_error(str(exc))
                 print(f"Error de dispositivo, intentando reconectar: {exc}", flush=True)
                 session.reconnect()
-            time.sleep(REFRESH_SECONDS)
+            refresh_event.wait(timeout=REFRESH_SECONDS)
+            refresh_event.clear()
     finally:
         session.close()
 

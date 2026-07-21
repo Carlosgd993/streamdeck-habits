@@ -7,6 +7,7 @@ FAIL_LOG = os.path.join(BASE_DIR, "checkin_failures.log")
 DEVICE_LOG = os.path.join(BASE_DIR, "device_errors.log")
 
 RESERVED_KEYS = {0, 5, 10}
+KEY_REFRESH = 0  # tecla reservada que fuerza un refresco inmediato desde la API
 ALL_KEYS = set(range(15))
 AVAILABLE_KEYS = sorted(ALL_KEYS - RESERVED_KEYS)
 
