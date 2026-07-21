@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta
+
 import requests
 
 BASE_URL = "https://api.ticktick.com/open/v1"
@@ -45,15 +47,20 @@ class TickTickClient:
             raise TickTickAPIError("GET habit -> respuesta no es JSON valido") from exc
 
     def get_checkins_for(self, habit_ids, stamp):
-        """Devuelve el set de habit_ids que YA tienen checkin para 'stamp'."""
+        """Devuelve el set de habit_ids con un checkin completado (value >= goal)
+        para 'stamp'. La API de TickTick trata 'to' como limite EXCLUSIVO, asi
+        que para incluir el propio dia de 'stamp' hay que pedir hasta el dia
+        siguiente."""
         if not habit_ids:
             return set()
+
+        next_day = int((datetime.strptime(str(stamp), "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d"))
 
         try:
             resp = requests.get(
                 CHECKINS_URL,
                 headers=self._headers(),
-                params={"habitIds": ",".join(habit_ids), "from": stamp, "to": stamp},
+                params={"habitIds": ",".join(habit_ids), "from": stamp, "to": next_day},
                 timeout=10,
             )
         except requests.RequestException as exc:
@@ -71,8 +78,10 @@ class TickTickClient:
 
         done = set()
         for entry in entries:
-            if entry.get("checkins"):
-                done.add(entry["habitId"])
+            for checkin in entry.get("checkins") or []:
+                if checkin.get("stamp") == stamp and checkin.get("value", 0) >= checkin.get("goal", 1.0):
+                    done.add(entry["habitId"])
+                    break
         return done
 
     def create_checkin(self, habit_id, payload):
