@@ -10,6 +10,9 @@ from config import (
     COLOR_HABIT_DONE,
     COLOR_HABIT_PENDING,
     COLOR_RESERVED,
+    COLOR_TEXT_HABIT_DONE,
+    COLOR_TEXT_HABIT_PENDING,
+    FONT_SIZE_HABIT_PENDING,
     RESERVED_KEYS,
 )
 from habits.base import Habit
@@ -17,15 +20,26 @@ from render_primitives import solid_tile, text_tile
 
 
 def render_habit(deck: Any, key: int, habit: Habit | None, done: bool) -> None:
-    """Pinta una tecla de habito: verde si esta hecho hoy, azul si pendiente.
+    """Pinta una tecla de habito.
 
-    Si ``habit`` es ``None`` la tecla se pinta vacia (negra).
+    Pendiente: fondo blanco y texto negro grande, para resaltar sobre el
+    resto. Hecho hoy: fondo gris oscuro y texto atenuado, para pasar
+    desapercibido. Si ``habit`` es ``None`` la tecla se pinta vacia (negra).
     """
     if habit is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
-    color = COLOR_HABIT_DONE if done else COLOR_HABIT_PENDING
-    deck.set_key_image(key, text_tile(deck, color, habit.name))
+    if done:
+        image = text_tile(deck, COLOR_HABIT_DONE, habit.name, text_color=COLOR_TEXT_HABIT_DONE)
+    else:
+        image = text_tile(
+            deck,
+            COLOR_HABIT_PENDING,
+            habit.name,
+            text_color=COLOR_TEXT_HABIT_PENDING,
+            font_size=FONT_SIZE_HABIT_PENDING,
+        )
+    deck.set_key_image(key, image)
 
 
 def render_checkin_error(deck: Any, key: int, code: str) -> None:

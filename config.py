@@ -16,8 +16,12 @@ AVAILABLE_KEYS = sorted(ALL_KEYS - RESERVED_KEYS)
 
 REFRESH_SECONDS = 900  # 15 min
 
-COLOR_HABIT_PENDING = (40, 60, 200)   # azul: hoy no hecho
-COLOR_HABIT_DONE = (30, 200, 60)      # verde: hoy hecho
-COLOR_ERROR = (200, 40, 40)           # rojo: fallo al enviar
+COLOR_HABIT_PENDING = (255, 255, 255)  # blanco: hoy no hecho, resalta sobre el resto
+COLOR_HABIT_DONE = (55, 55, 55)        # gris oscuro apagado: hoy hecho, pasa desapercibido
+COLOR_ERROR = (200, 40, 40)            # rojo: fallo al enviar
 COLOR_RESERVED = (25, 25, 25)
 COLOR_EMPTY = (0, 0, 0)
+
+COLOR_TEXT_HABIT_PENDING = (0, 0, 0)        # texto negro sobre fondo blanco
+COLOR_TEXT_HABIT_DONE = (110, 110, 110)     # texto tambien atenuado, refuerza el bajo contraste
+FONT_SIZE_HABIT_PENDING = 16                # texto mas grande para resaltar lo pendiente
