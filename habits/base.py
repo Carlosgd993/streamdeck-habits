@@ -5,6 +5,10 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from emoji_utils import extract_emoji
+
+_ICON_TEXT_PREFIX = "txt_"  # prefijo que usa TickTick en iconRes cuando el icono elegido es un emoji
+
 
 class Habit(ABC):
     """Habito de TickTick, envoltorio sobre su representacion JSON cruda.
@@ -31,6 +35,21 @@ class Habit(ABC):
         """Nombre del habito (el que se muestra en la tecla)."""
         return self.data["name"]
 
+    @property
+    def emoji(self) -> str:
+        """Emoji elegido como icono del habito, o cadena vacia si no tiene.
+
+        TickTick no guarda el emoji en ``name``: cuando el usuario elige un
+        emoji como icono en la app, ``iconRes`` vale ``"txt_<emoji>"`` (p.ej.
+        ``"txt_🤸"``); los iconos predefinidos (no emoji) usan otros valores
+        como ``"habit_daily_check_in"``.
+        """
+        icon_res = str(self.data.get("iconRes", ""))
+        if not icon_res.startswith(_ICON_TEXT_PREFIX):
+            return ""
+        emoji, _ = extract_emoji(icon_res[len(_ICON_TEXT_PREFIX) :])
+        return emoji
+
     def is_done_today(self, done_ids: set[str]) -> bool:
         """Indica si el habito esta completado hoy.
 
@@ -53,10 +72,11 @@ class Habit(ABC):
         return False
 
     def display_label(self, current_value: float | None = None) -> str:
-        """Texto a mostrar en la tecla.
+        """Texto a mostrar en la tecla (aparte del emoji, ver ``emoji``).
 
         Por defecto el nombre del habito. Los habitos cuantificables lo
-        sobrescriben para anadir el progreso (p.ej. ``"3/8 Cups"``).
+        sobrescriben para mostrar el progreso en vez del nombre (p.ej.
+        ``"3/8 Cups"``).
 
         Args:
             current_value: Progreso acumulado hoy, si se conoce.

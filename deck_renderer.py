@@ -25,8 +25,9 @@ def render_habit(deck: Any, key: int, habit: Habit | None, done: bool, current_v
     Pendiente: fondo blanco y texto negro grande, para resaltar sobre el
     resto. Hecho hoy: fondo gris oscuro y texto atenuado, para pasar
     desapercibido. Si ``habit`` es ``None`` la tecla se pinta vacia (negra).
-    El texto lo decide ``habit.display_label`` (nombre a secas para
-    booleanos, nombre + progreso para habitos cuantificables).
+    El texto lo decide ``habit.display_label`` (nombre sin emoji para
+    booleanos, solo progreso para habitos cuantificables); el emoji del
+    nombre (``habit.emoji``), si tiene, se pinta aparte como icono a color.
 
     Args:
         current_value: Progreso acumulado hoy, si se conoce (solo relevante
@@ -37,7 +38,7 @@ def render_habit(deck: Any, key: int, habit: Habit | None, done: bool, current_v
         return
     label = habit.display_label(current_value)
     if done:
-        image = text_tile(deck, COLOR_HABIT_DONE, label, text_color=COLOR_TEXT_HABIT_DONE)
+        image = text_tile(deck, COLOR_HABIT_DONE, label, text_color=COLOR_TEXT_HABIT_DONE, emoji=habit.emoji)
     else:
         image = text_tile(
             deck,
@@ -45,6 +46,7 @@ def render_habit(deck: Any, key: int, habit: Habit | None, done: bool, current_v
             label,
             text_color=COLOR_TEXT_HABIT_PENDING,
             font_size=FONT_SIZE_HABIT_PENDING,
+            emoji=habit.emoji,
         )
     deck.set_key_image(key, image)
 

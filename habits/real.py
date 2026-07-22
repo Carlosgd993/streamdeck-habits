@@ -42,12 +42,17 @@ class RealHabit(Habit):
         return self.is_done_today(done_ids)
 
     def display_label(self, current_value: float | None = None) -> str:
-        """Nombre del habito seguido del progreso (p.ej. ``"Drink Water 3/8 Cups"``)."""
+        """Progreso acumulado hoy, sin el nombre (p.ej. ``"3/8 Cups"``).
+
+        El nombre se omite a proposito: el emoji del habito (ver
+        ``Habit.emoji``) ya identifica de que habito se trata, y en la
+        tecla apenas hay sitio para nombre + progreso legibles.
+        """
         value = current_value if current_value is not None else 0.0
         progress = f"{_format_number(value)}/{_format_number(self.goal)}"
         if self.unit:
             progress = f"{progress} {self.unit}"
-        return f"{self.name} {progress}"
+        return progress
 
     def build_checkin_payload(self, stamp: int, current_value: float = 0.0) -> dict[str, Any]:
         """Suma ``step`` al progreso actual, sin superar ``goal``."""
