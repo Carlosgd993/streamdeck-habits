@@ -88,7 +88,7 @@ Al desarrollar fuera de la Pi, trata `BASE_DIR` como fijo; no hay override por v
 
 ### Despliegue
 
-`deploy/deploy.sh` hace `git pull` y reinicia el servicio (matando el proceso principal, que corre como `admin`, para que systemd lo relance por `Restart=on-failure` con el código nuevo — **sin sudo**, así que corre por SSH de forma no interactiva). Acepta `--test`, que hace lo mismo pero **sin `git pull`** (ver [Probar código sin mergear](#probar-código-sin-mergear-deploysh---test)). No instala cambios de la unit de systemd (`deploy/streamdeck-habits.service`); si cambias ese fichero, cópialo a mano a `/etc/systemd/system/` con `sudo` + `daemon-reload` + `restart`.
+`deploy/deploy.sh` sincroniza con `origin/main` (`git fetch` + `git reset --hard origin/main`, descartando cualquier cambio local) y reinicia el servicio (matando el proceso principal, que corre como `admin`, para que systemd lo relance por `Restart=on-failure` con el código nuevo — **sin sudo**, así que corre por SSH de forma no interactiva). Acepta `--test`, que reinicia el código ya en disco **sin tocar git** (ver [Probar código sin mergear](#probar-código-sin-mergear-deploysh---test)). No instala cambios de la unit de systemd (`deploy/streamdeck-habits.service`); si cambias ese fichero, cópialo a mano a `/etc/systemd/system/` con `sudo` + `daemon-reload` + `restart`.
 
 ### Acceso a la Raspberry Pi
 
@@ -105,6 +105,21 @@ ssh admin@RP3-MotoComm-1.local "bash /opt/streamdeck-habits/deploy/deploy.sh"
 Existe un alias `habits-update` en `~/.bashrc` para uso interactivo, pero **no funciona desde `ssh host "habits-update"`**: el `.bashrc` de Debian corta la ejecución al inicio si el shell no es interactivo (guarda `case $- in *i*) ;; *) return;; esac`), así que un comando SSH no interactivo nunca llega a definir el alias y falla con `command not found`. Usa siempre la ruta completa al script.
 
 Como con cualquier acción que afecte al servicio en producción, confirma con el usuario antes de ejecutar el despliegue o reiniciar el servicio, salvo que ya lo haya pedido explícitamente en el mismo turno. La verificación previa al despliegue (compilar/importar en un directorio temporal) no afecta al servicio y no necesita confirmación.
+
+## Procedimiento de una feature / conversación
+
+Flujo estándar para cualquier cambio de código pedido en una conversación. **La regla de oro: no se commitea ni se sube nada a `main` hasta que el usuario valida** (paso 6); todo lo anterior es iteración local + prueba en la Pi sobre código sin mergear.
+
+1. **Petición** — el usuario pide algo.
+2. **Analizar, investigar e implementar** en esta máquina de desarrollo (aquí no hay Python ni hardware, así que no se ejecuta nada localmente).
+3. **Llevar a la Pi en modo prueba** — validar antes sintaxis/imports (ver [Verificación previa al despliegue](#verificación-previa-al-despliegue)), copiar el árbol de trabajo a la Pi y reiniciar con `deploy.sh --test` (ver [Probar código sin mergear](#probar-código-sin-mergear-deploysh---test)). Esto corre el código **sin commitearlo ni tocar `main`**; la Pi queda "sucia" respecto a `main`, de forma reversible.
+4. **Comprobar que todo está correcto** — arranque limpio: PID nuevo estable (sin crash-loop), sin errores en el journal ni en `checkin_failures.log`/`device_errors.log`.
+5. **Pedir validación al usuario** — lo que no se puede verificar desde aquí es el hardware (colores, texto, pulsaciones), así que el usuario confirma mirando la Stream Deck.
+   - **5.1. Si NO valida** → volver al paso 1 con su feedback, iterando sobre el código **sin commitear** (nuevas copias en modo `--test` sobre la misma prueba).
+6. **Si valida que todo OK** — y solo entonces:
+   1. **Documentar** los cambios que lo requieran en `CLAUDE.md` y `README.md`.
+   2. **Subir al repo**: commit + push a `main`.
+   3. **Desplegar**: `deploy.sh` **sin** `--test`. Se encarga de todo: sincroniza con `origin/main` (`git fetch` + `git reset --hard origin/main`), lo que **descarta por sí solo el estado sucio de la prueba** y trae el commit recién subido, y reinicia. No hace falta ningún `git` manual previo.
 
 ## Arquitectura
 

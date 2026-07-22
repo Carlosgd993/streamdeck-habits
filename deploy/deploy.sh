@@ -34,7 +34,9 @@ cd "$REPO_DIR"
 
 if [ "$TEST" -eq 0 ]; then
     echo "Trayendo cambios del repo..."
-    git pull
+    echo "Sincronizando con origin/main (se descartan cambios locales)..."
+    git fetch origin
+    git reset --hard origin/main
 else
     echo "Modo --test: se usa el codigo ya presente en $REPO_DIR (sin git pull)."
 fi
