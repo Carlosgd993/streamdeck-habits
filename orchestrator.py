@@ -39,14 +39,17 @@ def make_key_callback(
     mapping: dict[str, int],
     habits_ref: dict[str, dict[str, Habit]],
     done_ids_ref: dict[str, set[str]],
+    values_ref: dict[str, dict[str, float]],
     refresh_event: Event,
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el mapeo actual.
 
     El closure resultante gestiona la tecla de refresco, ignora teclas sin
     habito asignado, evita checkins duplicados por habito (``pending_requests``
-    + ``state_lock``) y, al pulsar una tecla de habito, envia el checkin a
-    TickTick pintando la tecla en verde (exito) o rojo con codigo (fallo).
+    + ``state_lock``), ignora pulsaciones sobre habitos ya bloqueados
+    (``habit.is_locked``, p.ej. un habito cuantificable que ya alcanzo su
+    objetivo) y, al pulsar una tecla de habito, envia el checkin a TickTick
+    pintando la tecla en verde/gris (exito) o rojo con codigo (fallo).
 
     Args:
         deck: El dispositivo Stream Deck.
@@ -55,6 +58,8 @@ def make_key_callback(
         habits_ref: Wrapper de un solo campo ``{"value": {id: Habit}}`` para
             que el closure observe actualizaciones de ciclos posteriores.
         done_ids_ref: Wrapper analogo con el conjunto de ids hechos hoy.
+        values_ref: Wrapper analogo con el progreso acumulado hoy por habito
+            (solo relevante para habitos cuantificables).
         refresh_event: Evento que despierta el bucle principal (refresco manual).
 
     Returns:
@@ -77,8 +82,18 @@ def make_key_callback(
             pending_requests.add(habit_id)
 
         habit = habits_ref["value"].get(habit_id)
+        if habit is not None and habit.is_locked(done_ids_ref["value"]):
+            with state_lock:
+                pending_requests.discard(habit_id)
+            return  # objetivo ya alcanzado, la tecla no admite mas progreso
+
+        current_value = values_ref["value"].get(habit_id, 0.0)
         stamp = today_stamp()
-        payload = habit.build_checkin_payload(stamp) if habit else {"stamp": stamp, "value": 1.0, "goal": 1.0}
+        payload = (
+            habit.build_checkin_payload(stamp, current_value)
+            if habit
+            else {"stamp": stamp, "value": 1.0, "goal": 1.0}
+        )
 
         try:
             client.create_checkin(habit_id, payload)
@@ -91,9 +106,13 @@ def make_key_callback(
                 health.log_device_error(str(device_exc))
             print(f"Checkin FALLO [{code}]: {habit_id} ({stamp}) - ver {FAIL_LOG}", flush=True)
         else:
-            done_ids_ref["value"].add(habit_id)
+            new_value = payload["value"]
+            values_ref["value"][habit_id] = new_value
+            done_now = new_value >= payload["goal"]
+            if done_now:
+                done_ids_ref["value"].add(habit_id)
             try:
-                deck_renderer.render_habit(deck, key, habit, done=True)
+                deck_renderer.render_habit(deck, key, habit, done=done_now, current_value=new_value)
             except Exception as device_exc:
                 health.log_device_error(str(device_exc))
             print(f"Checkin OK: {habit.name if habit else habit_id} ({stamp})", flush=True)
@@ -126,6 +145,7 @@ def main() -> None:
     mapping = habit_key_map.load_map()
     habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
     done_ids_ref: dict[str, set[str]] = {"value": set()}
+    values_ref: dict[str, dict[str, float]] = {"value": {}}  # progreso acumulado hoy, habitos cuantificables
     refresh_event = threading.Event()  # se activa por el timer o al pulsar KEY_REFRESH
 
     def refresh_cycle() -> None:
@@ -146,16 +166,21 @@ def main() -> None:
 
         stamp = today_stamp()
         try:
-            done_ids = client.get_checkins_for(list(mapping.keys()), stamp)
+            progress = client.get_checkin_progress_for(list(mapping.keys()), stamp)
         except TickTickError as exc:
             _, code = health.classify(exc)
             print(f"[{code}] {CODES[code]}: {exc}", flush=True)
             deck_renderer.render_error_all(deck, mapping, code)
             return
 
+        done_ids = {hid for hid, entry in progress.items() if entry["value"] >= entry["goal"]}
+        values_by_id = {hid: entry["value"] for hid, entry in progress.items()}
         done_ids_ref["value"] = done_ids
-        deck_renderer.render_all(deck, mapping, habits_ref["value"], done_ids)
-        deck.set_key_callback(make_key_callback(deck, client, mapping, habits_ref, done_ids_ref, refresh_event))
+        values_ref["value"] = values_by_id
+        deck_renderer.render_all(deck, mapping, habits_ref["value"], done_ids, values_by_id)
+        deck.set_key_callback(
+            make_key_callback(deck, client, mapping, habits_ref, done_ids_ref, values_ref, refresh_event)
+        )
 
     try:
         while True:

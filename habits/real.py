@@ -1,4 +1,5 @@
-"""Habito cuantificable (tipo 'Real' en TickTick). Esqueleto sin implementar."""
+"""Habito cuantificable (tipo 'Real' en TickTick): acumula valor con cada
+pulsacion (p.ej. +1 vaso de agua) hasta alcanzar un objetivo."""
 
 from __future__ import annotations
 
@@ -7,16 +8,48 @@ from typing import Any
 from habits.base import Habit
 
 
-class RealHabit(Habit):
-    """Esqueleto para habitos cuantificables (tipo 'Real' en TickTick).
+def _format_number(value: float) -> str:
+    """Formatea un numero sin ``.0`` cuando es entero (``8`` en vez de ``8.0``)."""
+    return str(int(value)) if value == int(value) else f"{value:g}"
 
-    Todavia no implementado -- se define en una sesion posterior. No esta
-    conectado desde ``habits/registry.py``: por ahora los habitos 'Real' se
-    siguen tratando como ``BooleanHabit`` para no romper produccion.
+
+class RealHabit(Habit):
+    """Habito cuantificable; cada checkin fija el valor TOTAL acumulado del dia.
+
+    La API de TickTick no ofrece un checkin incremental: cada POST hace
+    upsert del ``value`` de ese ``stamp``. Por eso ``build_checkin_payload``
+    necesita el progreso actual (``current_value``) para poder sumarle
+    ``step`` antes de reenviarlo.
     """
 
-    def is_done_today(self, done_ids: set[str]) -> bool:
-        raise NotImplementedError
+    @property
+    def goal(self) -> float:
+        """Objetivo diario del habito (p.ej. ``8.0`` vasos)."""
+        return float(self.data.get("goal", 1.0))
 
-    def build_checkin_payload(self, stamp: int) -> dict[str, Any]:
-        raise NotImplementedError
+    @property
+    def step(self) -> float:
+        """Cantidad que suma cada pulsacion (p.ej. ``1.0``)."""
+        return float(self.data.get("step", 1.0))
+
+    @property
+    def unit(self) -> str:
+        """Unidad del habito (p.ej. ``"Cups"``); vacia si no esta definida."""
+        return str(self.data.get("unit", ""))
+
+    def is_locked(self, done_ids: set[str]) -> bool:
+        """Bloquea la tecla una vez alcanzado el objetivo (no se supera el goal)."""
+        return self.is_done_today(done_ids)
+
+    def display_label(self, current_value: float | None = None) -> str:
+        """Nombre del habito seguido del progreso (p.ej. ``"Drink Water 3/8 Cups"``)."""
+        value = current_value if current_value is not None else 0.0
+        progress = f"{_format_number(value)}/{_format_number(self.goal)}"
+        if self.unit:
+            progress = f"{progress} {self.unit}"
+        return f"{self.name} {progress}"
+
+    def build_checkin_payload(self, stamp: int, current_value: float = 0.0) -> dict[str, Any]:
+        """Suma ``step`` al progreso actual, sin superar ``goal``."""
+        new_value = min(current_value + self.step, self.goal)
+        return {"stamp": stamp, "value": new_value, "goal": self.goal}

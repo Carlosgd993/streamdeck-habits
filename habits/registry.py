@@ -6,13 +6,11 @@ from typing import Any
 
 from habits.base import Habit
 from habits.boolean import BooleanHabit
+from habits.real import RealHabit
 
-# habits/real.py (RealHabit) todavia no esta implementado (ver ese fichero).
-# Hasta entonces, los habitos de tipo "Real" se enrutan a BooleanHabit para
-# no romper el checkin de habitos que hoy ya funcionan en produccion.
 _TYPE_MAP: dict[str, type[Habit]] = {
     "Boolean": BooleanHabit,
-    "Real": BooleanHabit,  # TODO: cambiar a RealHabit cuando este implementado
+    "Real": RealHabit,
 }
 
 

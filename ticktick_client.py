@@ -73,12 +73,13 @@ class TickTickClient:
         except ValueError as exc:
             raise TickTickAPIError("GET habit -> respuesta no es JSON valido") from exc
 
-    def get_checkins_for(self, habit_ids: list[str], stamp: int) -> set[str]:
-        """Devuelve el conjunto de habitos con un checkin completado en un dia.
+    def get_checkin_progress_for(self, habit_ids: list[str], stamp: int) -> dict[str, dict[str, float]]:
+        """Devuelve el value/goal del checkin de cada habito en un dia concreto.
 
-        Un checkin cuenta como completado cuando ``value >= goal``. La API de
-        TickTick trata ``to`` como limite EXCLUSIVO, asi que para incluir el
-        propio dia de ``stamp`` se pide hasta el dia siguiente.
+        La API de TickTick trata ``to`` como limite EXCLUSIVO, asi que para
+        incluir el propio dia de ``stamp`` se pide hasta el dia siguiente.
+        Un habito sin checkin registrado ese dia simplemente no aparece en el
+        resultado (progreso 0 implicito).
 
         Args:
             habit_ids: Ids de los habitos a consultar. Si esta vacio no se
@@ -86,7 +87,9 @@ class TickTickClient:
             stamp: Dia a consultar en formato ``YYYYMMDD``.
 
         Returns:
-            El conjunto de ids con checkin completado ese dia.
+            Dict habito_id -> ``{"value": ..., "goal": ...}`` tal como consta
+            en el checkin de ese dia. El ``goal`` es el vigente cuando se
+            registro el checkin, no necesariamente el goal actual del habito.
 
         Raises:
             TickTickAuthError: Si el token es invalido o ha caducado (401).
@@ -94,7 +97,7 @@ class TickTickClient:
             TickTickAPIError: Si la respuesta no es 200 o no es JSON valido.
         """
         if not habit_ids:
-            return set()
+            return {}
 
         next_day = int((datetime.strptime(str(stamp), "%Y%m%d") + timedelta(days=1)).strftime("%Y%m%d"))
 
@@ -118,13 +121,16 @@ class TickTickClient:
         except ValueError as exc:
             raise TickTickAPIError("GET habit/checkins -> respuesta no es JSON valido") from exc
 
-        done = set()
+        progress: dict[str, dict[str, float]] = {}
         for entry in entries:
             for checkin in entry.get("checkins") or []:
-                if checkin.get("stamp") == stamp and checkin.get("value", 0) >= checkin.get("goal", 1.0):
-                    done.add(entry["habitId"])
+                if checkin.get("stamp") == stamp:
+                    progress[entry["habitId"]] = {
+                        "value": checkin.get("value", 0.0),
+                        "goal": checkin.get("goal", 1.0),
+                    }
                     break
-        return done
+        return progress
 
     def create_checkin(self, habit_id: str, payload: dict[str, Any]) -> bool:
         """Registra un checkin para un habito.
