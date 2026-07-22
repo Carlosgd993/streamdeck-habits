@@ -2,8 +2,10 @@
 
 Daemon en Python que convierte una Elgato Stream Deck fisica en un mando de
 seguimiento de habitos para [TickTick](https://ticktick.com). Corre en una
-Raspberry Pi, sondea la API abierta de TickTick, ilumina cada tecla en azul
-(pendiente) o verde (hecho hoy), y envia un checkin a TickTick al pulsarla.
+Raspberry Pi, sondea la API abierta de TickTick, ilumina cada tecla en blanco
+con texto negro grande (pendiente) o en gris oscuro con texto atenuado (hecho
+hoy, para que pase desapercibido frente a lo pendiente), y envia un checkin a
+TickTick al pulsarla.
 
 ## Instalacion
 
@@ -46,8 +48,12 @@ python scripts/toggle_test.py  # smoke test visual (alterna azul/verde, sin red)
 ## Despliegue
 
 El daemon corre como servicio systemd en una Raspberry Pi. `deploy/deploy.sh`
-hace `git pull`, copia `deploy/streamdeck-habits.service` a
-`/etc/systemd/system/` y reinicia el servicio (`Restart=on-failure`).
+hace `git pull` y reinicia el servicio (`Restart=on-failure`); acepta
+`--test` para reiniciar sin `git pull` (probar codigo aun no mergeado). No
+instala cambios de la unit de systemd
+(`deploy/streamdeck-habits.service`) — si se modifica ese fichero, hay que
+copiarlo a mano a `/etc/systemd/system/` con `sudo` + `daemon-reload` +
+`restart`.
 
 ## Desarrollo
 
