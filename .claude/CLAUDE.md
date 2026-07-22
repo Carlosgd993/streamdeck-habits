@@ -4,9 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Qué es esto
 
-Un demonio Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos para TickTick. Corre en una Raspberry Pi, sondea la API abierta de TickTick, ilumina cada tecla en azul (pendiente) o verde (hecho hoy), y envía un checkin a TickTick al pulsar una tecla.
+Un demonio Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos para TickTick. Corre en una Raspberry Pi 3, sondea la API abierta de TickTick, ilumina cada tecla en azul (pendiente) o verde (hecho hoy), y envía un checkin a TickTick al pulsar una tecla.
 
-No hay build system, `requirements.txt` ni suite de tests — es un daemon desplegable (`orchestrator.py` + módulos) más dos scripts de smoke-test de hardware en `scripts/`.
+Es un daemon desplegable (`orchestrator.py` + módulos) más dos scripts de smoke-test de hardware en `scripts/`. Hay un `pyproject.toml` con configuración de herramientas (ruff, mypy) y metadatos del proyecto, pero **las dependencias se instalan a mano** (no hay `requirements.txt` ni lockfile) y **no hay suite de tests automatizada** — la verificación se hace ejecutando en la Pi (ver [Verificación previa al despliegue](#verificación-previa-al-despliegue)).
 
 ## Cómo ejecutar
 
@@ -24,11 +24,61 @@ Los tres esperan que la librería `StreamDeck` (python-elgato-streamdeck) tenga 
 
 ### Flujo de desarrollo
 
-El daemon corre en una Raspberry Pi 3, que tiene este mismo repo clonado. El desarrollo (edición de código, con Claude Code) se hace en esta máquina; los cambios se envían luego a la RP3 y se prueban ahí — esta máquina de desarrollo no tiene Python ni el hardware de la Stream Deck, así que no se puede ejecutar ni probar nada localmente.
+El daemon corre en una Raspberry Pi 3, que tiene este mismo repo clonado. El desarrollo (edición de código, con Claude Code) se hace en esta máquina; los cambios se envían luego a la RP3 y se prueban ahí. **Esta máquina de desarrollo no tiene Python usable** (solo un alias stub de la Microsoft Store que no ejecuta nada) **ni el hardware de la Stream Deck**, así que no se puede ejecutar ni probar nada localmente — hay que acceder a la Raspberry Pi para ello (ver más abajo cómo hacerlo por SSH sin depender del usuario).
+
+### Verificación previa al despliegue
+
+Aunque no se puede *ejecutar* el daemon fuera de la Pi, sí se puede **validar sintaxis e imports** de cualquier cambio antes de desplegar, sin tocar el servicio en marcha, copiando los `.py` a un directorio temporal en la Pi y compilándolos/importándolos con el venv real (Python 3.13.5, con todas las dependencias instaladas). Es lo más parecido a un test disponible desde esta máquina:
+
+```bash
+# Chequeo de sintaxis (byte-compila, no ejecuta nada):
+tar cf - $(find . -name '*.py' -not -path './venv/*') | ssh admin@RP3-MotoComm-1.local \
+  'd=$(mktemp -d); tar xf - -C "$d"; /opt/streamdeck-habits/venv/bin/python -m compileall -q "$d" && echo SYNTAX_OK; rc=$?; rm -rf "$d"; exit $rc'
+
+# Chequeo más fuerte: importar los módulos (detecta imports circulares, NameError, etc.).
+# Seguro porque main() está bajo `if __name__ == "__main__"`, así que importar no arranca el daemon
+# ni necesita un deck conectado (importar DeviceManager no requiere hardware):
+tar cf - $(find . -name '*.py' -not -path './venv/*') | ssh admin@RP3-MotoComm-1.local \
+  'd=$(mktemp -d); tar xf - -C "$d"; cd "$d"; /opt/streamdeck-habits/venv/bin/python -c "import orchestrator, deck_renderer, special_keys, habits.registry, health, habit_key_map, ticktick_client, auth, deck_session; print(\"IMPORTS_OK\")"; rc=$?; cd /; rm -rf "$d"; exit $rc'
+```
+
+### Probar código sin mergear (deploy-test.sh)
+
+Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear/mergear a `main`**, sin depender de `git pull` (que machacaría el código de prueba) ni de sudo (en la Pi no hay `NOPASSWD`, así que `deploy.sh`/`sudo systemctl` piden contraseña y no se pueden lanzar de forma no interactiva):
+
+1. **Copiar** el árbol de trabajo (solo versionado + nuevos no-ignorados; nunca `.env`, `venv/`, logs ni `habit_key_map.json`) sobre `/opt/streamdeck-habits`:
+
+   ```bash
+   tar cf - $(git ls-files -c -o --exclude-standard) | ssh admin@RP3-MotoComm-1.local 'tar xf - -C /opt/streamdeck-habits'
+   ```
+
+   Deja el árbol git de la Pi "sucio" respecto a `main`, pero es reversible. Al venir de Windows los ficheros llegan con CRLF (inocuo para Python; `.gitattributes` fuerza LF en los `.sh`/`.service` para que los scripts no se rompan).
+
+2. **Reiniciar** el servicio con el código copiado, sin pull y sin sudo, con el script dedicado (mata el proceso principal —es de `admin`— y systemd lo relanza por `Restart=on-failure`):
+
+   ```bash
+   ssh admin@RP3-MotoComm-1.local 'bash /opt/streamdeck-habits/deploy/deploy-test.sh'
+   ```
+
+3. **Observar** que arranca limpio (PID nuevo estable, sin errores en journal ni en `checkin_failures.log`/`device_errors.log`) y confirmar el comportamiento en el hardware.
+
+4. **Si va bien** → commit + push a `main`; luego en la Pi `git -C /opt/streamdeck-habits fetch && git -C /opt/streamdeck-habits reset --hard origin/main` (deja `main` limpio con LF) y reiniciar (`deploy-test.sh`, o `habits-update` si tienes la contraseña a mano).
+   **Si va mal** → en la Pi `git -C /opt/streamdeck-habits checkout -- .` (restaura `main`) y `deploy/deploy-test.sh`. Si el código de prueba llegó a crashear en bucle y systemd lo dejó parado, arrancarlo de nuevo sí necesita sudo: `sudo systemctl start streamdeck-habits.service`.
+
+`deploy.sh` también acepta `--nopull` (redespliega el código en disco sin `git pull`), pero usa sudo; para pruebas autónomas usa `deploy-test.sh`.
+
+### Estilo de código y herramientas
+
+El estándar de estilo está en `pyproject.toml` (ver también `.claude/SKILL_Python_Code_Style_&_Documentation.md`):
+
+- **`ruff`** — lint + formato (línea 120, comillas dobles, isort/pyupgrade/bugbear/simplify): `ruff check --fix .` y `ruff format .`
+- **`mypy`** — comprobación de tipos (`target py313`; `StreamDeck.*` con `ignore_missing_imports` porque no publica stubs): `mypy .`
+- **Type hints** en todas las APIs públicas, con `from __future__ import annotations` al principio de cada módulo (evaluación diferida: la anotación nunca se evalúa en runtime, así que es segura aunque un tipo apunte a algo no importado).
+- **Docstrings estilo Google** (Args/Returns/Raises) en clases y funciones públicas.
 
 ### Disposición en tiempo de ejecución (despliegue en Raspberry Pi)
 
-`config.py` fija `BASE_DIR = "/opt/streamdeck-habits"` y el shebang de `orchestrator.py` apunta a `/opt/streamdeck-habits/venv/bin/python`. En la Pi desplegada se espera, junto al código, lo siguiente (todo gitignored salvo `.env.example`):
+`config.py` fija `BASE_DIR = "/opt/streamdeck-habits"` y el shebang de `orchestrator.py` apunta a `/opt/streamdeck-habits/venv/bin/python` (Python 3.13.5). En la Pi desplegada se espera, junto al código, lo siguiente (todo gitignored salvo `.env.example`):
 - `.env` — debe definir `TICKTICK_ACCESS_TOKEN` (cargado vía `python-dotenv` en `auth.get_token()`; se regenera a mano cuando caduca, no hay flujo de refresh)
 - `habit_key_map.json` — mapeo persistido `habit_id -> key_index` (se crea/actualiza solo)
 - `checkin_failures.log` — log JSON-lines de checkins fallidos hacia TickTick (errores de API, tecla en rojo)
@@ -39,6 +89,20 @@ Al desarrollar fuera de la Pi, trata `BASE_DIR` como fijo; no hay override por v
 ### Despliegue
 
 `deploy/deploy.sh` hace `git pull`, copia `deploy/streamdeck-habits.service` a `/etc/systemd/system/`, y reinicia el servicio systemd (`ExecStart` apunta a `orchestrator.py`, `Restart=on-failure`).
+
+### Acceso a la Raspberry Pi
+
+Hay acceso SSH sin contraseña (clave pública ya autorizada) desde esta máquina de desarrollo a la Pi: `ssh admin@RP3-MotoComm-1.local`. Esto permite lanzar comandos directamente en la Pi (revisar logs, estado del servicio, reiniciar, desplegar, verificar cambios) sin depender del usuario para ejecutarlos a mano.
+
+La resolución del hostname `.local` (mDNS) es a veces intermitente: si un comando falla con "Could not resolve hostname", reintenta antes de darlo por caído.
+
+Tras hacer cambios en el código y subirlos (push), la forma más rápida de desplegar es conectarse y ejecutar el alias `habits-update` (invoca `deploy/deploy.sh`):
+
+```
+ssh admin@RP3-MotoComm-1.local "habits-update"
+```
+
+Como con cualquier acción que afecte al servicio en producción, confirma con el usuario antes de ejecutar el despliegue o reiniciar el servicio, salvo que ya lo haya pedido explícitamente en el mismo turno. La verificación previa al despliegue (compilar/importar en un directorio temporal) no afecta al servicio y no necesita confirmación.
 
 ## Arquitectura
 
@@ -65,3 +129,4 @@ El antiguo script único (`habits_display.py`) se dividió en módulos; `orchest
 
 - Los mensajes de log de cara al usuario y los comentarios de código están en español; mantén los nuevos consistentes con eso.
 - Todos los `print` usan `flush=True` porque esto corre como servicio en segundo plano sin buffer (logging estilo journald/systemd).
+- El estilo de código (ruff, mypy, type hints, docstrings) se detalla en [Estilo de código y herramientas](#estilo-de-código-y-herramientas); mantén los módulos nuevos consistentes con ese estándar.

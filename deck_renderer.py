@@ -1,3 +1,9 @@
+"""Helpers de alto nivel para pintar teclas individuales o el deck completo."""
+
+from __future__ import annotations
+
+from typing import Any
+
 from config import (
     COLOR_EMPTY,
     COLOR_ERROR,
@@ -6,10 +12,15 @@ from config import (
     COLOR_RESERVED,
     RESERVED_KEYS,
 )
+from habits.base import Habit
 from render_primitives import solid_tile, text_tile
 
 
-def render_habit(deck, key, habit, done):
+def render_habit(deck: Any, key: int, habit: Habit | None, done: bool) -> None:
+    """Pinta una tecla de habito: verde si esta hecho hoy, azul si pendiente.
+
+    Si ``habit`` es ``None`` la tecla se pinta vacia (negra).
+    """
     if habit is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
@@ -17,19 +28,30 @@ def render_habit(deck, key, habit, done):
     deck.set_key_image(key, text_tile(deck, color, habit.name))
 
 
-def render_checkin_error(deck, key, code):
+def render_checkin_error(deck: Any, key: int, code: str) -> None:
+    """Pinta una tecla en rojo con un codigo de error corto."""
     deck.set_key_image(key, text_tile(deck, COLOR_ERROR, code))
 
 
-def render_reserved(deck, key):
+def render_reserved(deck: Any, key: int) -> None:
+    """Pinta una tecla reservada con su color gris apagado."""
     deck.set_key_image(key, solid_tile(deck, COLOR_RESERVED))
 
 
-def render_empty(deck, key):
+def render_empty(deck: Any, key: int) -> None:
+    """Pinta una tecla vacia (negra)."""
     deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
 
 
-def render_all(deck, mapping, habits_by_id, done_ids):
+def render_all(deck: Any, mapping: dict[str, int], habits_by_id: dict[str, Habit], done_ids: set[str]) -> None:
+    """Repinta las 15 teclas segun el mapeo, los habitos y los checkins de hoy.
+
+    Args:
+        deck: El dispositivo Stream Deck.
+        mapping: Mapeo habito -> tecla.
+        habits_by_id: Objetos ``Habit`` indexados por id.
+        done_ids: Ids de habitos con checkin completado hoy.
+    """
     key_to_habit_id = {k: hid for hid, k in mapping.items()}
     for key in range(deck.key_count()):
         if key in RESERVED_KEYS:
@@ -41,7 +63,7 @@ def render_all(deck, mapping, habits_by_id, done_ids):
         render_habit(deck, key, habit, done)
 
 
-def render_error_all(deck, mapping, code):
+def render_error_all(deck: Any, mapping: dict[str, int], code: str) -> None:
     """Pinta con el codigo de error corto todas las teclas actualmente
     mapeadas a un habito (se usa cuando falla la lectura de habitos o de
     checkins, para no dejar informacion potencialmente obsoleta en pantalla)."""

@@ -1,29 +1,47 @@
+"""Persistencia del mapeo habito -> tecla en habit_key_map.json."""
+
+from __future__ import annotations
+
 import json
 import os
+from typing import Any
 
 from config import AVAILABLE_KEYS, MAP_FILE
 from error_codes import CODES
 
 
-def load_map():
+def load_map() -> dict[str, int]:
+    """Carga el mapeo habito -> tecla persistido, o un dict vacio si no existe."""
     if os.path.exists(MAP_FILE):
         with open(MAP_FILE) as f:
             return json.load(f)
     return {}
 
 
-def save_map(mapping):
+def save_map(mapping: dict[str, int]) -> None:
+    """Escribe el mapeo habito -> tecla a disco en formato JSON."""
     with open(MAP_FILE, "w") as f:
         json.dump(mapping, f, indent=2)
 
 
-def update_mapping(habits, mapping):
-    """Asigna la primera tecla libre a cada habito nuevo (nunca la reasigna) y
-    libera las teclas de habitos que ya no aparecen en 'habits'.
+def update_mapping(habits: list[dict[str, Any]], mapping: dict[str, int]) -> dict[str, int]:
+    """Reconcilia el mapeo habito -> tecla con la lista actual de habitos.
 
-    IMPORTANTE: solo debe llamarse tras una lectura de get_habits() exitosa
+    Asigna la primera tecla libre a cada habito nuevo (nunca la reasigna) y
+    libera las teclas de habitos que ya no aparecen en ``habits``. Si no queda
+    ninguna tecla libre, el habito nuevo se registra como omitido (codigo
+    ``KFUL``) y no recibe tecla. Persiste el resultado si hubo cambios.
+
+    IMPORTANTE: solo debe llamarse tras una lectura de ``get_habits()`` exitosa
     (sin excepcion) -- nunca tras un fallo de red o de autenticacion, o se
     liberarian teclas de habitos que en realidad siguen existiendo.
+
+    Args:
+        habits: Habitos actuales devueltos por la API de TickTick.
+        mapping: Mapeo actual habito -> tecla, modificado in situ.
+
+    Returns:
+        El mismo ``mapping`` ya reconciliado.
     """
     changed = False
 

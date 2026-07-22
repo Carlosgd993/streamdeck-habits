@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
-from StreamDeck.DeviceManager import DeviceManager
+"""Smoke test de hardware: enumera el Stream Deck, imprime modelo/serie/
+firmware y registra las pulsaciones crudas. Requiere el dispositivo fisico."""
+
+from __future__ import annotations
+
 import time
+from typing import Any
+
+from StreamDeck.DeviceManager import DeviceManager
 
 decks = DeviceManager().enumerate()
 print(f"Dispositivos encontrados: {len(decks)}")
@@ -18,7 +25,7 @@ print("Nº de teclas:", deck.key_count())
 
 deck.set_brightness(30)
 
-def on_key_change(deck, key, state):
+def on_key_change(deck: Any, key: int, state: bool) -> None:
     print(f"Tecla {key}: {'pulsada' if state else 'soltada'}")
 
 deck.set_key_callback(on_key_change)

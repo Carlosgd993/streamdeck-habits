@@ -1,0 +1,5 @@
+# Los scripts de shell y las units de systemd deben conservar finales de linea
+# LF aunque se editen o clonen en Windows: si se cuela un CR (\r), al copiarlos
+# a la Raspberry Pi rompe el interprete ("#!/bin/bash^M: bad interpreter").
+*.sh text eol=lf
+*.service text eol=lf

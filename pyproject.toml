@@ -1,0 +1,45 @@
+[project]
+name = "streamdeck-habits"
+version = "0.1.0"
+description = "Daemon que convierte una Elgato Stream Deck en un mando de seguimiento de habitos para TickTick."
+requires-python = ">=3.13"
+dependencies = [
+    "streamdeck",
+    "python-dotenv",
+    "requests",
+    "Pillow",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+    "SIM", # flake8-simplify
+]
+ignore = ["E501"]  # longitud de linea gestionada por el formateador
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+
+[tool.mypy]
+python_version = "3.13"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+
+# La libreria python-elgato-streamdeck (modulo StreamDeck) no publica type stubs;
+# se ignoran sus imports para que mypy no falle sobre codigo de terceros.
+[[tool.mypy.overrides]]
+module = ["StreamDeck.*"]
+ignore_missing_imports = true

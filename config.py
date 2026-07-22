@@ -1,3 +1,6 @@
+"""Constantes compartidas del daemon: rutas de ficheros, teclas reservadas,
+intervalo de refresco y colores de las teclas."""
+
 import os
 
 BASE_DIR = "/opt/streamdeck-habits"

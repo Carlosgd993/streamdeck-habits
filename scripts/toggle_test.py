@@ -1,19 +1,26 @@
 #!/opt/streamdeck-habits/venv/bin/python
+"""Smoke test visual: alterna cada tecla entre azul y verde al pulsarla, sin
+llamadas de red. Requiere el dispositivo Stream Deck fisico."""
+
+from __future__ import annotations
+
 import sys
 import time
+from typing import Any
+
 from StreamDeck.DeviceManager import DeviceManager
 from StreamDeck.ImageHelpers import PILHelper
 
-COLOR_OFF = (30, 30, 200)   # azul
-COLOR_ON  = (30, 200, 60)   # verde
+COLOR_OFF = (30, 30, 200)  # azul
+COLOR_ON = (30, 200, 60)  # verde
 
 
-def make_key_image(deck, color):
+def make_key_image(deck: Any, color: tuple[int, int, int]) -> bytes:
     image = PILHelper.create_image(deck, background=color)
     return PILHelper.to_native_format(deck, image)
 
 
-def find_deck(retries=30, delay=2):
+def find_deck(retries: int = 30, delay: int = 2) -> Any:
     for i in range(retries):
         decks = DeviceManager().enumerate()
         if decks:
@@ -23,7 +30,7 @@ def find_deck(retries=30, delay=2):
     return None
 
 
-def main():
+def main() -> None:
     deck = find_deck()
     if deck is None:
         print("No se encontro la Stream Deck tras los reintentos.", flush=True)
@@ -40,7 +47,7 @@ def main():
     for k in range(deck.key_count()):
         deck.set_key_image(k, img_off)
 
-    def on_key_change(deck, key, pressed):
+    def on_key_change(deck: Any, key: int, pressed: bool) -> None:
         if not pressed:
             return
         state[key] = not state[key]
