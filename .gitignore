@@ -10,3 +10,4 @@ __pycache__/
 .claude/ticktick_task.http
 .claude/ticktick_project.http
 .claude/ticktick_focus.http
+.vscode/settings.json
