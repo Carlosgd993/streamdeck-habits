@@ -42,9 +42,9 @@ tar cf - $(find . -name '*.py' -not -path './venv/*') | ssh admin@RP3-MotoComm-1
   'd=$(mktemp -d); tar xf - -C "$d"; cd "$d"; /opt/streamdeck-habits/venv/bin/python -c "import orchestrator, deck_renderer, special_keys, habits.registry, health, habit_key_map, ticktick_client, auth, deck_session; print(\"IMPORTS_OK\")"; rc=$?; cd /; rm -rf "$d"; exit $rc'
 ```
 
-### Probar código sin mergear (deploy-test.sh)
+### Probar código sin mergear (`deploy.sh --test`)
 
-Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear/mergear a `main`**, sin depender de `git pull` (que machacaría el código de prueba) ni de sudo (en la Pi no hay `NOPASSWD`, así que `deploy.sh`/`sudo systemctl` piden contraseña y no se pueden lanzar de forma no interactiva):
+Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear/mergear a `main`**, sin que `git pull` machaque el código de prueba:
 
 1. **Copiar** el árbol de trabajo (solo versionado + nuevos no-ignorados; nunca `.env`, `venv/`, logs ni `habit_key_map.json`) sobre `/opt/streamdeck-habits`:
 
@@ -54,18 +54,16 @@ Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear
 
    Deja el árbol git de la Pi "sucio" respecto a `main`, pero es reversible. Al venir de Windows los ficheros llegan con CRLF (inocuo para Python; `.gitattributes` fuerza LF en los `.sh`/`.service` para que los scripts no se rompan).
 
-2. **Reiniciar** el servicio con el código copiado, sin pull y sin sudo, con el script dedicado (mata el proceso principal —es de `admin`— y systemd lo relanza por `Restart=on-failure`):
+2. **Reiniciar** con el código copiado, sin `git pull` (modo `--test` de `deploy.sh`):
 
    ```bash
-   ssh admin@RP3-MotoComm-1.local 'bash /opt/streamdeck-habits/deploy/deploy-test.sh'
+   ssh admin@RP3-MotoComm-1.local 'bash /opt/streamdeck-habits/deploy/deploy.sh --test'
    ```
 
 3. **Observar** que arranca limpio (PID nuevo estable, sin errores en journal ni en `checkin_failures.log`/`device_errors.log`) y confirmar el comportamiento en el hardware.
 
-4. **Si va bien** → commit + push a `main`; luego en la Pi `git -C /opt/streamdeck-habits fetch && git -C /opt/streamdeck-habits reset --hard origin/main` (deja `main` limpio con LF) y reiniciar (`deploy-test.sh`, o `habits-update` si tienes la contraseña a mano).
-   **Si va mal** → en la Pi `git -C /opt/streamdeck-habits checkout -- .` (restaura `main`) y `deploy/deploy-test.sh`. Si el código de prueba llegó a crashear en bucle y systemd lo dejó parado, arrancarlo de nuevo sí necesita sudo: `sudo systemctl start streamdeck-habits.service`.
-
-`deploy.sh` también acepta `--nopull` (redespliega el código en disco sin `git pull`), pero usa sudo; para pruebas autónomas usa `deploy-test.sh`.
+4. **Si va bien** → commit + push a `main`; luego en la Pi `git -C /opt/streamdeck-habits fetch && git -C /opt/streamdeck-habits reset --hard origin/main` (deja `main` limpio con LF) y desplegar normal (`deploy.sh` o `habits-update`).
+   **Si va mal** → en la Pi `git -C /opt/streamdeck-habits checkout -- .` (restaura `main`) y `deploy/deploy.sh --test`. Si el código de prueba llegó a crashear en bucle y systemd lo dejó parado, arrancarlo de nuevo sí necesita sudo: `sudo systemctl start streamdeck-habits.service`.
 
 ### Estilo de código y herramientas
 
@@ -88,7 +86,7 @@ Al desarrollar fuera de la Pi, trata `BASE_DIR` como fijo; no hay override por v
 
 ### Despliegue
 
-`deploy/deploy.sh` hace `git pull`, copia `deploy/streamdeck-habits.service` a `/etc/systemd/system/`, y reinicia el servicio systemd (`ExecStart` apunta a `orchestrator.py`, `Restart=on-failure`).
+`deploy/deploy.sh` hace `git pull` y reinicia el servicio (matando el proceso principal, que corre como `admin`, para que systemd lo relance por `Restart=on-failure` con el código nuevo — **sin sudo**, así que corre por SSH de forma no interactiva). Acepta `--test`, que hace lo mismo pero **sin `git pull`** (ver [Probar código sin mergear](#probar-código-sin-mergear-deploysh---test)). No instala cambios de la unit de systemd (`deploy/streamdeck-habits.service`); si cambias ese fichero, cópialo a mano a `/etc/systemd/system/` con `sudo` + `daemon-reload` + `restart`.
 
 ### Acceso a la Raspberry Pi
 
