@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Qué es esto
 
-Un demonio Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos para TickTick. Corre en una Raspberry Pi 3, sondea la API abierta de TickTick, ilumina cada tecla en azul (pendiente) o verde (hecho hoy), y envía un checkin a TickTick al pulsar una tecla.
+Un demonio Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos sobre una base de datos propia en Supabase. Corre en una Raspberry Pi 3, sondea la base de datos vía PostgREST, ilumina cada tecla en blanco (pendiente) o gris oscuro (hecho hoy), y registra un checkin en la base de datos al pulsar una tecla.
 
 Es un daemon desplegable (`orchestrator.py` + módulos) más dos scripts de smoke-test de hardware en `scripts/`. Hay un `pyproject.toml` con configuración de herramientas (ruff, mypy) y metadatos del proyecto, pero **las dependencias se instalan a mano** (no hay `requirements.txt` ni lockfile) y **no hay suite de tests automatizada** — la verificación se hace ejecutando en la Pi (ver [Verificación previa al despliegue](#verificación-previa-al-despliegue)).
 
@@ -41,7 +41,7 @@ tar cf - $(find . -name '*.py' -not -path './venv/*') | ssh admin@RP3-MotoComm-1
 # Seguro porque main() está bajo `if __name__ == "__main__"`, así que importar no arranca el daemon
 # ni necesita un deck conectado (importar DeviceManager no requiere hardware):
 tar cf - $(find . -name '*.py' -not -path './venv/*') | ssh admin@RP3-MotoComm-1.local \
-  'd=$(mktemp -d); tar xf - -C "$d"; cd "$d"; /opt/streamdeck-habits/venv/bin/python -c "import orchestrator, provider.base, provider.ticktick, core.key_map, core.health, core.error_codes, core.emoji, deck.session, deck.primitives, deck.renderer, deck.keys; print(\"IMPORTS_OK\")"; rc=$?; cd /; rm -rf "$d"; exit $rc'
+  'd=$(mktemp -d); tar xf - -C "$d"; cd "$d"; /opt/streamdeck-habits/venv/bin/python -c "import orchestrator, provider.base, provider.supabase, core.key_map, core.health, core.error_codes, core.emoji, deck.session, deck.primitives, deck.renderer, deck.keys; print(\"IMPORTS_OK\")"; rc=$?; cd /; rm -rf "$d"; exit $rc'
 ```
 
 ### Probar código sin mergear (`deploy.sh --test`)
@@ -79,9 +79,9 @@ El estándar de estilo está en `pyproject.toml` (ver también `.claude/SKILL_Py
 ### Disposición en tiempo de ejecución (despliegue en Raspberry Pi)
 
 `config.py` fija `BASE_DIR = "/opt/streamdeck-habits"` y el shebang de `orchestrator.py` apunta a `/opt/streamdeck-habits/venv/bin/python` (Python 3.13.5). En la Pi desplegada se espera, junto al código, lo siguiente (todo gitignored salvo `.env.example`):
-- `.env` — debe definir `TICKTICK_ACCESS_TOKEN` (cargado vía `python-dotenv` en `auth.get_token()`; se regenera a mano cuando caduca, no hay flujo de refresh)
+- `.env` — debe definir `SUPABASE_URL` y `SUPABASE_PUBLISHABLE_KEY` (cargados vía `python-dotenv` en `SupabaseProvider.__init__`)
 - `habit_key_map.json` — mapeo persistido `habit_id -> key_index` (se crea/actualiza solo)
-- `checkin_failures.log` — log JSON-lines de checkins fallidos hacia TickTick (errores de API, tecla en rojo)
+- `checkin_failures.log` — log JSON-lines de checkins fallidos hacia Supabase (errores de API, tecla en rojo)
 - `device_errors.log` — log de texto plano de fallos del propio dispositivo Stream Deck (nunca se muestran en tecla)
 
 Al desarrollar fuera de la Pi, trata `BASE_DIR` como fijo; no hay override por variable de entorno.
@@ -110,7 +110,7 @@ Como con cualquier acción que afecte al servicio en producción, confirma con e
 
 El código está organizado en **tres capas por carpetas**, con una regla de dependencia clara: `provider/` no sabe nada del Stream Deck; `deck/` no sabe nada del proveedor de datos; `core/` y `orchestrator.py` orquestan ambos hablando solo con abstracciones. `orchestrator.py` y `config.py` viven en la raíz (el primero es el `ExecStart` de systemd; ambos son compartidos por las tres capas).
 
-El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` define el puerto abstracto y TickTick es solo un adaptador detrás de él. Sustituir de API = escribir otro adaptador que implemente `HabitProvider` y cambiar **una línea** en `orchestrator.main()` (`TickTickProvider()`); ni `core/`, ni `deck/`, ni el resto del orquestador cambian.
+El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` define el puerto abstracto y Supabase es solo un adaptador detrás de él. Sustituir de API = escribir otro adaptador que implemente `HabitProvider` y cambiar **una línea** en `orchestrator.main()` (`SupabaseProvider()`); ni `core/`, ni `deck/`, ni el resto del orquestador cambian.
 
 ### Raíz (compartido)
 
@@ -120,14 +120,15 @@ El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` de
 ### `provider/` — la API, aislada tras un puerto
 
 - **`provider/base.py`** — el **puerto**. Contiene TODO lo que el resto del proyecto necesita saber de "la API", sin acoplarse a ningún backend:
-  - **`HabitProvider`** (ABC): interfaz con `get_habits() -> list[Habit]`, `get_progress(habit_ids, day) -> dict[str, Progress]` y `checkin(habit, day, value) -> None`. `day` es un `datetime.date` (no el `stamp` `YYYYMMDD`, que es formato TickTick).
+  - **`HabitProvider`** (ABC): interfaz con `get_habits() -> list[Habit]`, `get_progress(habit_ids, day) -> dict[str, Progress]` y `checkin(habit, day, value) -> None`. `day` es un `datetime.date`.
   - **Excepciones agnósticas**: `ProviderError` (base) → `ProviderAuthError`, `ProviderNetworkError`, `ProviderDataError`.
   - **`Progress`** (dataclass): `value`/`goal` del checkin de un día (el `goal` es el vigente cuando se registró, no necesariamente el actual); el orquestador deriva de ahí tanto `done_ids` (`value >= goal`) como el progreso acumulado.
   - **Modelo de dominio `Habit`** (agnóstico, construido desde campos ya parseados — **no** desde JSON crudo): `id`, `name`, `emoji`, `order` (pista de orden para asignar teclas), `is_done_today`, `is_locked` (por defecto `False`), `display_label` (por defecto el nombre), `goal` (propiedad, por defecto `1.0`) y `next_value(current_value)` abstracto (el valor TOTAL tras una pulsación; el dominio lo decide, el adaptador lo traduce a su llamada). `BooleanHabit`: `next_value` → `1.0`. `RealHabit` (cuantificables, con `goal`/`step`/`unit`): `next_value` → `min(current+step, goal)`, `is_locked` bloquea al alcanzar el objetivo, `display_label` muestra *solo* el progreso (p.ej. `"3/8 Cups"`).
-- **`provider/ticktick.py`** — el **adaptador** de TickTick; concentra todo lo específico del backend (antes repartido entre `auth.py`, `ticktick_client.py` y `habits/`):
-  - Carga del token del `.env` (`TICKTICK_ACCESS_TOKEN`); `TickTickProvider.__init__` lanza `ProviderAuthError` si falta.
-  - `TickTickProvider(HabitProvider)`: llamadas `requests` contra `api.ticktick.com/open/v1/habit*`, traduciendo `RequestException`/401/no-200/JSON-inválido a las excepciones `Provider*`. `get_progress` maneja el `to` exclusivo de TickTick (pide `day+1`). El checkin **no es incremental**: cada `POST .../checkin` hace upsert del `value` total de ese `stamp`, por eso `checkin` recibe el total ya calculado (vía `habit.next_value`) y arma `{stamp, value, goal: habit.goal}`.
-  - `build_habit(data)`: mapea el JSON crudo de TickTick al dominio — parsea `iconRes` (`"txt_<emoji>"` → emoji del icono, vía `core.emoji.extract_emoji`; los iconos predefinidos como `"habit_daily_check_in"` dan emoji vacío), enruta `type == "Real"` a `RealHabit` y el resto (incluido `"Boolean"` y desconocidos) a `BooleanHabit`, y toma `order` de `sortOrder`.
+- **`provider/supabase.py`** — el **adaptador** de Supabase; concentra todo lo específico del backend:
+  - Carga de `SUPABASE_URL` y `SUPABASE_PUBLISHABLE_KEY` del `.env`; `SupabaseProvider.__init__` lanza `ProviderAuthError` si falta alguna. La base de PostgREST es `<url>/rest/v1`; cada petición manda las cabeceras `apikey` + `Authorization: Bearer <key>`.
+  - `SupabaseProvider(HabitProvider)`: llamadas `requests` (PostgREST) contra `/habits` y `/habit_checkins`, traduciendo `RequestException`/401-403/no-2xx/JSON-inválido a las excepciones `Provider*`. `get_habits` filtra `status=eq.0` (solo activos) y ordena por `sort_order`. `get_progress` filtra `habit_checkins` por `habit_id=in.(...)` y `checkin_date=eq.<día>` (fecha exacta, sin aritmética de rangos). El checkin **no es incremental**: es un upsert por `(habit_id, checkin_date)` (`on_conflict=habit_id,checkin_date` + `Prefer: resolution=merge-duplicates`), por eso `checkin` recibe el total ya calculado (vía `habit.next_value`) y arma `{habit_id, checkin_date, value, goal: habit.goal}`.
+  - `build_habit(data)`: mapea la fila de la tabla `habits` al dominio — parsea `icon_res` (`"txt_<emoji>"` → emoji del icono, vía `core.emoji.extract_emoji`; los iconos predefinidos como `"habit_water"` dan emoji vacío), enruta `type == "Real"` a `RealHabit` y el resto (incluido `"Boolean"` y desconocidos) a `BooleanHabit`, y toma `order` de `sort_order`.
+  - El esquema de las tablas está documentado en `.claude/estructura-bd.md`; hay peticiones PostgREST de ejemplo/documentación en `.claude/supabase.http`.
 
 ### `core/` — dominio/orquestación agnósticos
 

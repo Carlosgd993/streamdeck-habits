@@ -1,0 +1,359 @@
+###############################################################################
+# Peticiones PostgREST contra la base de datos Supabase del proyecto.
+#
+# Esquema: ver .claude/estructura-bd.md (modelo inspirado en TickTick:
+#   proyectos/tareas/hábitos). PK uuid, snake_case, mono-usuario.
+#
+# Autenticación: se usa la PUBLISHABLE key (pública). Las tablas tienen RLS
+#   activo con una política permisiva "acceso total anon", así que con esta key
+#   se puede leer y escribir. Para operaciones que deban saltarse RLS existe
+#   SUPABASE_SECRET_KEY (solo servidor; NO exponer en cliente).
+#
+# Los @..._id de ejemplo son los del sembrado inicial; si borras/recreas datos,
+#   cámbialos por un id real (los GET de cada sección los devuelven).
+###############################################################################
+
+@base    = {{$dotenv SUPABASE_URL}}
+@apikey  = {{$dotenv SUPABASE_PUBLISHABLE_KEY}}
+
+# IDs de ejemplo (del sembrado inicial)
+@project_id       = 185ea396-238b-428b-bd42-ce55114a3e67
+@status_por_hacer = 4cc856a5-6145-485b-9405-80a44b825381
+@status_hecho     = 020ff339-30a3-449d-9def-d579d674fb82
+@habit_id         = 31c17dce-2656-404f-846b-9878b0bc3a95
+@section_id       = 450c6221-32eb-4e6d-95c1-b1e57f6727d7
+
+###############################################################################
+# ESTADOS DE TAREA (statuses)  —  catálogo Por hacer / En progreso / Hecho
+###############################################################################
+
+### Listar estados ordenados por el flujo
+GET {{base}}/statuses?select=*&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear un estado nuevo
+POST {{base}}/statuses
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "En revisión",
+  "color": "#A855F7",
+  "sort_order": 3
+}
+
+###############################################################################
+# CARPETAS DE PROYECTOS (project_groups)
+###############################################################################
+
+### Listar carpetas
+GET {{base}}/project_groups?select=*&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear carpeta
+POST {{base}}/project_groups
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "Trabajo",
+  "sort_order": 0
+}
+
+###############################################################################
+# PROYECTOS (projects)
+###############################################################################
+
+### Listar proyectos
+GET {{base}}/projects?select=*&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Proyecto con sus tareas embebidas (resource embedding por FK)
+GET {{base}}/projects?select=id,name,tasks(id,title,priority,statuses(name))&id=eq.{{project_id}}
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear proyecto
+POST {{base}}/projects
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "Diario",
+  "color": "#F18181",
+  "view_mode": "list",
+  "kind": "TASK"
+}
+
+### Actualizar proyecto
+PATCH {{base}}/projects?id=eq.{{project_id}}
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "Bandeja de entrada (renombrada)"
+}
+
+### Borrar proyecto (borra en cascada sus tareas)
+DELETE {{base}}/projects?id=eq.<id>
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Prefer: return=representation
+
+###############################################################################
+# TAREAS (tasks)
+###############################################################################
+
+### Listar tareas con proyecto, estado, subtareas y etiquetas embebidas
+GET {{base}}/tasks?select=id,title,priority,completed_time,projects(name),statuses(name),checklist_items(title,status),tags(name)
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Filtrar: tareas pendientes (estado "Por hacer") de prioridad alta o media
+GET {{base}}/tasks?select=title,priority&status_id=eq.{{status_por_hacer}}&priority=in.(3,5)&order=priority.desc
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear tarea
+POST {{base}}/tasks
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "project_id": "{{project_id}}",
+  "status_id": "{{status_por_hacer}}",
+  "title": "Comprar café",
+  "priority": 3,
+  "kind": "TEXT"
+}
+
+### Mover una tarea de estado (p.ej. a "Hecho") y marcar completada
+# El id de la tarea se obtiene del GET de arriba; sustituye <task_id>.
+PATCH {{base}}/tasks?id=eq.<task_id>
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "status_id": "{{status_hecho}}",
+  "completed_time": "2026-07-23T12:00:00+0000"
+}
+
+### Borrar tarea (borra en cascada subtareas y vínculos de etiqueta)
+DELETE {{base}}/tasks?id=eq.<task_id>
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Prefer: return=representation
+
+###############################################################################
+# SUBTAREAS (checklist_items)
+###############################################################################
+
+### Subtareas de una tarea
+GET {{base}}/checklist_items?select=*&task_id=eq.<task_id>&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear subtarea
+POST {{base}}/checklist_items
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "task_id": "<task_id>",
+  "title": "Paso 1",
+  "status": 0,
+  "sort_order": 0
+}
+
+###############################################################################
+# ETIQUETAS (tags) + relación N:M (task_tags)
+###############################################################################
+
+### Listar etiquetas
+GET {{base}}/tags?select=*&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear etiqueta
+POST {{base}}/tags
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "urgente",
+  "color": "#EF4444"
+}
+
+### Vincular una etiqueta a una tarea (fila en la tabla puente)
+POST {{base}}/task_tags
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "task_id": "<task_id>",
+  "tag_id": "<tag_id>"
+}
+
+### Desvincular etiqueta de tarea
+DELETE {{base}}/task_tags?task_id=eq.<task_id>&tag_id=eq.<tag_id>
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Prefer: return=representation
+
+###############################################################################
+# SECCIONES DE HÁBITOS (habit_sections)
+###############################################################################
+
+### Listar secciones
+GET {{base}}/habit_sections?select=*&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear sección
+POST {{base}}/habit_sections
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "Productividad",
+  "sort_order": 1
+}
+
+###############################################################################
+# HÁBITOS (habits)
+###############################################################################
+
+### Listar hábitos con su sección embebida
+GET {{base}}/habits?select=id,name,type,goal,step,unit,color,record_enable,habit_sections(name)&order=sort_order
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Hábito con sus checkins embebidos
+GET {{base}}/habits?select=name,type,goal,habit_checkins(checkin_date,value,goal)&id=eq.{{habit_id}}
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Crear hábito Boolean (hecho/no hecho)
+POST {{base}}/habits
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "Leer",
+  "icon_res": "habit_reading",
+  "color": "#4D8CF5",
+  "type": "Boolean",
+  "goal": 1,
+  "step": 1,
+  "unit": "Count",
+  "repeat_rule": "RRULE:FREQ=DAILY;INTERVAL=1",
+  "record_enable": false,
+  "section_id": "{{section_id}}"
+}
+
+### Crear hábito Real (cuantificable, acumula progreso)
+POST {{base}}/habits
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "name": "Beber agua",
+  "icon_res": "habit_water",
+  "color": "#4CAF50",
+  "type": "Real",
+  "goal": 8,
+  "step": 1,
+  "unit": "Vasos",
+  "repeat_rule": "RRULE:FREQ=DAILY;INTERVAL=1",
+  "record_enable": true,
+  "section_id": "{{section_id}}"
+}
+
+### Actualizar hábito
+PATCH {{base}}/habits?id=eq.{{habit_id}}
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation
+
+{
+  "goal": 10
+}
+
+### Borrar hábito (borra en cascada sus checkins)
+DELETE {{base}}/habits?id=eq.<id>
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Prefer: return=representation
+
+###############################################################################
+# CHECKINS DE HÁBITO (habit_checkins)  —  un registro por (habit_id, fecha)
+###############################################################################
+
+### Checkins de un hábito en un rango de fechas
+GET {{base}}/habit_checkins?select=checkin_date,value,goal&habit_id=eq.{{habit_id}}&checkin_date=gte.2026-07-01&checkin_date=lte.2026-07-31&order=checkin_date
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Accept: application/json
+
+### Registrar / actualizar el checkin de hoy (UPSERT por habit_id + checkin_date)
+# on_conflict + Prefer: resolution=merge-duplicates -> si ya existe la fila del día,
+# la actualiza en vez de fallar por el índice único (habit_id, checkin_date).
+# El checkin NO es incremental: se manda el "value" TOTAL del día. Para sumar +step
+# a un hábito Real, primero lee el value de hoy (GET de arriba) y reenvíalo + step.
+POST {{base}}/habit_checkins?on_conflict=habit_id,checkin_date
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Content-Type: application/json
+Prefer: return=representation,resolution=merge-duplicates
+
+{
+  "habit_id": "{{habit_id}}",
+  "checkin_date": "2026-07-23",
+  "value": 3,
+  "goal": 8
+}
+
+### Borrar el checkin de un día
+DELETE {{base}}/habit_checkins?habit_id=eq.{{habit_id}}&checkin_date=eq.2026-07-23
+apikey: {{apikey}}
+Authorization: Bearer {{apikey}}
+Prefer: return=representation

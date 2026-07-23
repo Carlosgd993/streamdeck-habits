@@ -10,11 +10,11 @@ en particular:
   construido desde campos ya parseados -- nunca desde el JSON crudo de un backend.
 - ``Progress``: el progreso (value/goal) de un habito en un dia.
 
-Para sustituir TickTick por otra API basta con escribir un adaptador nuevo que
-implemente ``HabitProvider`` devolviendo objetos ``Habit``/``Progress`` de este
-modulo y traduciendo sus fallos a las excepciones ``Provider*`` de aqui; el
-resto del proyecto no necesita cambiar (ver ``provider/ticktick.py`` como
-ejemplo de adaptador concreto).
+Para sustituir de backend basta con escribir un adaptador nuevo que implemente
+``HabitProvider`` devolviendo objetos ``Habit``/``Progress`` de este modulo y
+traduciendo sus fallos a las excepciones ``Provider*`` de aqui; el resto del
+proyecto no necesita cambiar (ver ``provider/supabase.py`` como ejemplo de
+adaptador concreto).
 """
 
 from __future__ import annotations

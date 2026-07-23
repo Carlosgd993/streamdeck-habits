@@ -5,7 +5,7 @@ del proveedor con las teclas del Stream Deck y gestiona los checkins al pulsar.
 El orquestador depende solo del puerto abstracto ``provider.base`` (interfaz
 ``HabitProvider``, modelo ``Habit``/``Progress`` y excepciones ``Provider*``);
 la unica linea acoplada a un backend concreto es la construccion del proveedor
-(``TickTickProvider()``). Sustituir de API = escribir otro adaptador que
+(``SupabaseProvider()``). Sustituir de API = escribir otro adaptador que
 implemente ``HabitProvider`` y cambiar esa linea.
 """
 
@@ -26,7 +26,7 @@ from config import REFRESH_SECONDS
 from core.error_codes import CODES
 from deck.session import DeckSession
 from provider.base import Habit, HabitProvider, ProviderError
-from provider.ticktick import TickTickProvider
+from provider.supabase import SupabaseProvider
 
 state_lock = threading.Lock()
 pending_requests: set[str] = set()  # habit_ids con checkin en vuelo, para no duplicar por doble pulsacion
@@ -133,7 +133,7 @@ def main() -> None:
     y dispara una reconexion.
     """
     try:
-        provider: HabitProvider = TickTickProvider()
+        provider: HabitProvider = SupabaseProvider()
     except ProviderError as exc:
         print(f"No se pudo inicializar el proveedor de habitos: {exc}", flush=True)
         sys.exit(1)

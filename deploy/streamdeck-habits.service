@@ -1,5 +1,5 @@
 [Unit]
-Description=Stream Deck - mostrar habitos de TickTick
+Description=Stream Deck - mando de seguimiento de habitos
 After=systemd-udevd.service local-fs.target network-online.target
 Wants=systemd-udevd.service network-online.target
 

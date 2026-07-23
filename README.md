@@ -1,11 +1,12 @@
 # streamdeck-habits
 
 Daemon en Python que convierte una Elgato Stream Deck fisica en un mando de
-seguimiento de habitos para [TickTick](https://ticktick.com). Corre en una
-Raspberry Pi, sondea la API abierta de TickTick, ilumina cada tecla en blanco
-con texto negro grande (pendiente) o en gris oscuro con texto atenuado (hecho
-hoy, para que pase desapercibido frente a lo pendiente), y envia un checkin a
-TickTick al pulsarla.
+seguimiento de habitos sobre una base de datos propia en
+[Supabase](https://supabase.com). Corre en una Raspberry Pi, sondea la base de
+datos via PostgREST, ilumina cada tecla en blanco con texto negro grande
+(pendiente) o en gris oscuro con texto atenuado (hecho hoy, para que pase
+desapercibido frente a lo pendiente), y registra un checkin en la base de datos
+al pulsarla.
 
 ## Instalacion
 
@@ -23,16 +24,17 @@ pip install streamdeck python-dotenv requests Pillow
 El daemon lee su configuracion de un fichero `.env` junto al codigo (ver
 [.env.example](.env.example)):
 
-| Variable                | Descripcion                                            |
-| ----------------------- | ------------------------------------------------------ |
-| `TICKTICK_ACCESS_TOKEN` | Token de acceso de la API abierta de TickTick. Se regenera a mano cuando caduca (no hay flujo de refresh). |
+| Variable                   | Descripcion                                         |
+| -------------------------- | --------------------------------------------------- |
+| `SUPABASE_URL`             | URL del proyecto Supabase (p.ej. `https://<ref>.supabase.co`). |
+| `SUPABASE_PUBLISHABLE_KEY` | Clave publishable con la que el daemon lee/escribe via PostgREST. |
 
 Las rutas de ejecucion (`BASE_DIR = /opt/streamdeck-habits`, logs, mapeo de
 teclas) estan fijadas en [config.py](config.py). En la Pi desplegada se generan
 solos, junto al codigo, estos ficheros (todos ignorados por git):
 
 - `habit_key_map.json` — mapeo persistido `habit_id -> key_index`.
-- `checkin_failures.log` — log JSON-lines de checkins fallidos hacia TickTick.
+- `checkin_failures.log` — log JSON-lines de checkins fallidos hacia Supabase.
 - `device_errors.log` — log de texto plano de fallos del propio Stream Deck.
 
 ## Uso
@@ -82,7 +84,7 @@ dependencia clara:
 
 - **`provider/`** — la API, aislada tras un puerto abstracto (`base.py`:
   interfaz `HabitProvider`, modelo de dominio `Habit`/`Progress` y excepciones
-  agnosticas). TickTick es solo un adaptador (`ticktick.py`) detras del puerto;
+  agnosticas). Supabase es solo un adaptador (`supabase.py`) detras del puerto;
   sustituirlo por otra API es escribir otro adaptador y cambiar una linea en
   `orchestrator.py`.
 - **`deck/`** — todo lo de la Stream Deck (hardware y pintado): `session`,

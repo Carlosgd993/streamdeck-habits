@@ -1,7 +1,7 @@
 [project]
 name = "streamdeck-habits"
 version = "0.1.0"
-description = "Daemon que convierte una Elgato Stream Deck en un mando de seguimiento de habitos para TickTick."
+description = "Daemon que convierte una Elgato Stream Deck en un mando de seguimiento de habitos sobre Supabase."
 requires-python = ">=3.13"
 dependencies = [
     "streamdeck",
