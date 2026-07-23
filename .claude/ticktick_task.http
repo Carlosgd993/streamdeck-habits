@@ -1,0 +1,79 @@
+
+
+@token = {{$dotenv TICKTICK_ACCESS_TOKEN}}
+@base_url = https://api.ticktick.com
+@project_id = 6226ff9877acee87727f6bca
+@task_id = 63b7bebb91c0a5474805fcd4
+
+### Get task by project id and task id
+GET {{base_url}}/open/v1/project/{{project_id}}/task/{{task_id}}
+Authorization: Bearer {{token}}
+
+### Create task
+POST {{base_url}}/open/v1/task
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "title": "Task Title",
+  "projectId": "{{project_id}}",
+  "tags": ["work", "urgent"]
+}
+
+### Update task
+POST {{base_url}}/open/v1/task/{{task_id}}
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "id": "{{task_id}}",
+  "projectId": "{{project_id}}",
+  "title": "Task Title",
+  "priority": 1
+}
+
+### Complete task
+POST {{base_url}}/open/v1/project/{{project_id}}/task/{{task_id}}/complete
+Authorization: Bearer {{token}}
+
+### Delete task
+DELETE {{base_url}}/open/v1/project/{{project_id}}/task/{{task_id}}
+Authorization: Bearer {{token}}
+
+### Move task
+POST {{base_url}}/open/v1/task/move
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+[
+  {
+    "fromProjectId": "69a850ef1c20d2030e148fdd",
+    "toProjectId": "69a850f41c20d2030e148fdf",
+    "taskId": "69a850f8b9061f374d54a046"
+  }
+]
+
+### List completed tasks
+POST {{base_url}}/open/v1/task/completed
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "projectIds": ["{{project_id}}"],
+  "startDate": "2026-03-01T00:58:20.000+0000",
+  "endDate": "2026-03-05T10:58:20.000+0000"
+}
+
+### Filter tasks
+POST {{base_url}}/open/v1/task/filter
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "projectIds": ["{{project_id}}"],
+  "startDate": "2026-03-01T00:58:20.000+0000",
+  "endDate": "2026-03-06T10:58:20.000+0000",
+  "priority": [0],
+  "tag": ["urgent"],
+  "status": [0]
+}

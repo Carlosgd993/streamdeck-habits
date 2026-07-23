@@ -6,8 +6,4 @@ venv/
 __pycache__/
 *.pyc
 .claude/ticktick-api-doc.md
-.claude/ticktick_habits.http
-.claude/ticktick_task.http
-.claude/ticktick_project.http
-.claude/ticktick_focus.http
 .vscode/settings.json

@@ -1,0 +1,135 @@
+
+
+@token = {{$dotenv TICKTICK_ACCESS_TOKEN}}
+@base_url ={{$dotenv TICKTICK_BASE_URL}}/habit
+@habit_id = 6a5f37f66e0b607ac473b9c5
+
+
+### Get habits
+GET {{base_url}}
+Authorization: Bearer {{token}}
+
+### Get habit by habit id
+GET {{base_url}}/{{habit_id}}
+Authorization: Bearer {{token}}
+
+### Create habit
+POST {{base_url}}
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Read",
+  "iconRes": "habit_reading",
+  "color": "#4D8CF5",
+  "type": "Boolean",
+  "goal": 1.0,
+  "step": 1.0,
+  "unit": "Count",
+  "repeatRule": "RRULE:FREQ=DAILY;INTERVAL=1",
+  "recordEnable": false
+}
+
+### Update habit
+POST {{base_url}}/{{habit_id}}
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Read more",
+  "goal": 2.0,
+  "repeatRule": "RRULE:FREQ=DAILY;INTERVAL=1"
+}
+
+### check habit
+POST {{base_url}}/6a5f37f66e0b607ac473b9c5/checkin
+Host: api.ticktick.com
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "stamp": 20260721,
+  "value": 1.0,
+  "goal": 1.0
+}
+
+### Get habit check-ins
+GET {{base_url}}/checkins?habitIds={{habit_id}}&from=20260720&to=20260722
+Authorization: Bearer {{token}}
+
+
+### Habits real ###
+@habit_real_id = 6a5f37f66e0b607ac473b9c5
+### Create habit (Real)
+POST {{base_url}}
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Drink Water",
+  "iconRes": "habit_water",
+  "color": "#4CAF50",
+  "type": "Real",
+  "goal": 8.0,
+  "step": 1.0,
+  "unit": "Cups",
+  "repeatRule": "RRULE:FREQ=DAILY;INTERVAL=1",
+  "recordEnable": true
+}
+
+### Update habit (Real)
+POST {{base_url}}/{{habit_real_id}}
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "name": "Habito objetivo",
+  "goal": 20.0,
+  "step": 1.0,
+  "unit": "Flex",
+  "repeatRule": "RRULE:FREQ=DAILY;INTERVAL=1"
+}
+
+### check habit (Real, partial progress)
+POST {{base_url}}/{{habit_real_id}}/checkin
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "stamp": 20260721,
+  "value": 4.0,
+  "goal": 20.0
+}
+
+### check habit (Real, goal reached)
+POST {{base_url}}/{{habit_real_id}}/checkin
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "stamp": 20260721,
+  "value": 20.0,
+  "goal": 20.0
+}
+
+### Sumar +step al value actual de un habito real ###
+# El checkin de TickTick no es incremental: cada POST fija el "value" total del dia (upsert por stamp).
+# No hay endpoint para "sumar 1"; hay que leer el value de hoy y volver a mandarlo + step.
+
+### 1. Leer el checkin de hoy del habito real
+GET {{base_url}}/checkins?habitIds={{habit_real_id}}&from=20260721&to=20260722
+Authorization: Bearer {{token}}
+
+### 2. Reenviar el checkin con value = value leido arriba + step (aqui step=1.0)
+# Copia el "value" de la respuesta del paso 1 y suma el step antes de mandar esta peticion
+@current_value = 5.0
+
+POST {{base_url}}/{{habit_real_id}}/checkin
+Content-Type: application/json
+Authorization: Bearer {{token}}
+
+{
+  "stamp": 20260722,
+  "value": {{current_value}},
+  "goal": 20.0
+}
