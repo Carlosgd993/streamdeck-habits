@@ -1,5 +1,5 @@
-"""Clasificacion y registro de fallos: en tecla (API TickTick) o en fichero
-(errores del propio dispositivo Stream Deck)."""
+"""Clasificacion y registro de fallos: en tecla (errores del proveedor de
+habitos) o en fichero (errores del propio dispositivo Stream Deck)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 
 from config import DEVICE_LOG, FAIL_LOG
-from ticktick_client import TickTickAPIError, TickTickAuthError, TickTickError, TickTickNetworkError
+from provider.base import ProviderAuthError, ProviderError, ProviderNetworkError
 
 
 def classify(exc: Exception) -> tuple[str, str | None]:
@@ -17,17 +17,17 @@ def classify(exc: Exception) -> tuple[str, str | None]:
         exc: La excepcion capturada durante el ciclo o el checkin.
 
     Returns:
-        ``("key", codigo)`` para errores de la API de TickTick (se muestran en
-        tecla con ese codigo corto), o ``("file", None)`` para todo lo demas
+        ``("key", codigo)`` para errores del proveedor de habitos (se muestran
+        en tecla con ese codigo corto), o ``("file", None)`` para todo lo demas
         (errores del propio dispositivo Stream Deck, que nunca se muestran en
         tecla y van a un log de fichero plano).
     """
-    if isinstance(exc, TickTickAuthError):
-        return "key", "T401"
-    if isinstance(exc, TickTickNetworkError):
-        return "key", "TNET"
-    if isinstance(exc, (TickTickAPIError, TickTickError)):
-        return "key", "TERR"
+    if isinstance(exc, ProviderAuthError):
+        return "key", "AUTH"
+    if isinstance(exc, ProviderNetworkError):
+        return "key", "NET"
+    if isinstance(exc, ProviderError):
+        return "key", "API"
     return "file", None
 
 

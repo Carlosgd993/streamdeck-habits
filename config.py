@@ -1,5 +1,9 @@
-"""Constantes compartidas del daemon: rutas de ficheros, teclas reservadas,
-intervalo de refresco y colores de las teclas."""
+"""Constantes compartidas del daemon: rutas de ficheros, layout de teclas del
+Stream Deck e intervalo de refresco. Agnosticas del proveedor de datos.
+
+Los colores y tamanos de fuente de las teclas viven en ``deck/style.py`` (capa
+de pintado), no aqui.
+"""
 
 import os
 
@@ -10,18 +14,8 @@ FAIL_LOG = os.path.join(BASE_DIR, "checkin_failures.log")
 DEVICE_LOG = os.path.join(BASE_DIR, "device_errors.log")
 
 RESERVED_KEYS = {0, 5, 10}
-KEY_REFRESH = 0  # tecla reservada que fuerza un refresco inmediato desde la API
+KEY_REFRESH = 0  # tecla reservada que fuerza un refresco inmediato desde el proveedor
 ALL_KEYS = set(range(15))
 AVAILABLE_KEYS = sorted(ALL_KEYS - RESERVED_KEYS)
 
 REFRESH_SECONDS = 900  # 15 min
-
-COLOR_HABIT_PENDING = (255, 255, 255)  # blanco: hoy no hecho, resalta sobre el resto
-COLOR_HABIT_DONE = (55, 55, 55)        # gris oscuro apagado: hoy hecho, pasa desapercibido
-COLOR_ERROR = (200, 40, 40)            # rojo: fallo al enviar
-COLOR_RESERVED = (25, 25, 25)
-COLOR_EMPTY = (0, 0, 0)
-
-COLOR_TEXT_HABIT_PENDING = (0, 0, 0)        # texto negro sobre fondo blanco
-COLOR_TEXT_HABIT_DONE = (110, 110, 110)     # texto tambien atenuado, refuerza el bajo contraste
-FONT_SIZE_HABIT_PENDING = 16                # texto mas grande para resaltar lo pendiente

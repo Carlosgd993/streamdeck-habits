@@ -6,7 +6,7 @@ from threading import Event
 from typing import Any
 
 from config import KEY_REFRESH, RESERVED_KEYS
-from deck_renderer import render_reserved
+from deck.renderer import render_reserved
 
 
 def render_reserved_keys(deck: Any) -> None:

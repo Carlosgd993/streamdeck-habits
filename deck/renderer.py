@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from config import (
+from config import RESERVED_KEYS
+from deck.primitives import solid_tile, text_tile
+from deck.style import (
     COLOR_EMPTY,
     COLOR_ERROR,
     COLOR_HABIT_DONE,
@@ -13,10 +15,8 @@ from config import (
     COLOR_TEXT_HABIT_DONE,
     COLOR_TEXT_HABIT_PENDING,
     FONT_SIZE_HABIT_PENDING,
-    RESERVED_KEYS,
 )
-from habits.base import Habit
-from render_primitives import solid_tile, text_tile
+from provider.base import Habit
 
 
 def render_habit(deck: Any, key: int, habit: Habit | None, done: bool, current_value: float | None = None) -> None:
@@ -26,8 +26,8 @@ def render_habit(deck: Any, key: int, habit: Habit | None, done: bool, current_v
     resto. Hecho hoy: fondo gris oscuro y texto atenuado, para pasar
     desapercibido. Si ``habit`` es ``None`` la tecla se pinta vacia (negra).
     El texto lo decide ``habit.display_label`` (nombre sin emoji para
-    booleanos, solo progreso para habitos cuantificables); el emoji del
-    nombre (``habit.emoji``), si tiene, se pinta aparte como icono a color.
+    booleanos, solo progreso para habitos cuantificables); el emoji del icono
+    (``habit.emoji``), si tiene, se pinta aparte como icono a color.
 
     Args:
         current_value: Progreso acumulado hoy, si se conoce (solo relevante

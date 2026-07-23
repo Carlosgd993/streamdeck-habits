@@ -1,5 +1,5 @@
 """Gestion del ciclo de vida del dispositivo Stream Deck (apertura, cierre,
-reconexion y brillo), sin conocimiento de habitos ni de la API de TickTick."""
+reconexion y brillo), sin conocimiento de habitos ni del proveedor de datos."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ BRIGHTNESS = 60
 
 class DeckSession:
     """Apertura/cierre/reconexion del dispositivo Stream Deck y gestion de
-    brillo. No sabe nada de habitos ni de la API de TickTick.
+    brillo. No sabe nada de habitos ni del proveedor de datos.
 
     Attributes:
         deck: El dispositivo abierto, o ``None`` mientras no se haya abierto.

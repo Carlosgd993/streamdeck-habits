@@ -77,8 +77,19 @@ mypy .               # comprobacion de tipos
 
 ## Arquitectura
 
-`orchestrator.py` es el punto de entrada y coordina el resto de modulos:
-`config`, `auth`, `ticktick_client`, `habit_key_map`, `habits/` (jerarquia de
-tipos de habito), `error_codes`, `health`, `render_primitives`,
-`deck_renderer`, `special_keys` y `deck_session`. Ver
-[.claude/CLAUDE.md](.claude/CLAUDE.md) para el detalle de cada uno.
+El codigo esta organizado en tres capas por carpetas, con una regla de
+dependencia clara:
+
+- **`provider/`** — la API, aislada tras un puerto abstracto (`base.py`:
+  interfaz `HabitProvider`, modelo de dominio `Habit`/`Progress` y excepciones
+  agnosticas). TickTick es solo un adaptador (`ticktick.py`) detras del puerto;
+  sustituirlo por otra API es escribir otro adaptador y cambiar una linea en
+  `orchestrator.py`.
+- **`deck/`** — todo lo de la Stream Deck (hardware y pintado): `session`,
+  `primitives`, `renderer`, `keys`, `style`. No sabe nada del proveedor de datos.
+- **`core/`** — dominio/orquestacion agnosticos: `key_map`, `health`,
+  `error_codes`, `emoji`.
+
+`orchestrator.py` (punto de entrada) y `config.py` viven en la raiz y coordinan
+las tres capas hablando solo con abstracciones. Ver
+[.claude/CLAUDE.md](.claude/CLAUDE.md) para el detalle de cada modulo.

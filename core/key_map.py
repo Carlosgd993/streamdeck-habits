@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any
 
 from config import AVAILABLE_KEYS, MAP_FILE
-from error_codes import CODES
+from core.error_codes import CODES
+from provider.base import Habit
 
 
 def load_map() -> dict[str, int]:
@@ -24,7 +24,7 @@ def save_map(mapping: dict[str, int]) -> None:
         json.dump(mapping, f, indent=2)
 
 
-def update_mapping(habits: list[dict[str, Any]], mapping: dict[str, int]) -> dict[str, int]:
+def update_mapping(habits: list[Habit], mapping: dict[str, int]) -> dict[str, int]:
     """Reconcilia el mapeo habito -> tecla con la lista actual de habitos.
 
     Asigna la primera tecla libre a cada habito nuevo (nunca la reasigna) y
@@ -37,7 +37,7 @@ def update_mapping(habits: list[dict[str, Any]], mapping: dict[str, int]) -> dic
     liberarian teclas de habitos que en realidad siguen existiendo.
 
     Args:
-        habits: Habitos actuales devueltos por la API de TickTick.
+        habits: Habitos actuales devueltos por el proveedor.
         mapping: Mapeo actual habito -> tecla, modificado in situ.
 
     Returns:
@@ -45,7 +45,7 @@ def update_mapping(habits: list[dict[str, Any]], mapping: dict[str, int]) -> dic
     """
     changed = False
 
-    current_ids = {h["id"] for h in habits}
+    current_ids = {h.id for h in habits}
     stale_ids = [hid for hid in mapping if hid not in current_ids]
     for hid in stale_ids:
         key = mapping.pop(hid)
@@ -56,17 +56,17 @@ def update_mapping(habits: list[dict[str, Any]], mapping: dict[str, int]) -> dic
     free_keys = [k for k in AVAILABLE_KEYS if k not in used_keys]
 
     known_ids = set(mapping.keys())
-    new_habits = [h for h in habits if h["id"] not in known_ids]
-    new_habits.sort(key=lambda h: h.get("sortOrder", h["id"]))
+    new_habits = [h for h in habits if h.id not in known_ids]
+    new_habits.sort(key=lambda h: (h.order, h.id))
 
     for habit in new_habits:
         if not free_keys:
-            print(f"[KFUL] {CODES['KFUL']}: {habit['name']}", flush=True)
+            print(f"[KFUL] {CODES['KFUL']}: {habit.name}", flush=True)
             continue
         key = free_keys.pop(0)
-        mapping[habit["id"]] = key
+        mapping[habit.id] = key
         changed = True
-        print(f"Nuevo habito '{habit['name']}' -> tecla {key}", flush=True)
+        print(f"Nuevo habito '{habit.name}' -> tecla {key}", flush=True)
 
     if changed:
         save_map(mapping)

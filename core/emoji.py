@@ -1,7 +1,8 @@
-"""Extraccion de emoji de texto libre (p.ej. el nombre de un habito de TickTick).
+"""Extraccion de emoji de texto libre (p.ej. el icono de un habito).
 
-Modulo sin dependencias de Pillow/StreamDeck para que lo puedan usar tanto
-``habits/`` (logica de dominio) como ``render_primitives.py`` (dibujado).
+Modulo sin dependencias de Pillow/StreamDeck ni de ningun proveedor concreto,
+para poder usarse desde cualquier adaptador de ``provider/`` que necesite
+separar el emoji de un icono textual.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ def extract_emoji(text: str) -> tuple[str, str]:
     """Separa el primer emoji (o secuencia de emoji) de un texto.
 
     Args:
-        text: Texto de entrada, p.ej. el nombre de un habito.
+        text: Texto de entrada, p.ej. el icono textual de un habito.
 
     Returns:
         Tupla ``(emoji, resto)``: ``emoji`` es la subcadena emoji encontrada
