@@ -1,29 +1,26 @@
-"""Adaptador de Supabase: implementa el puerto ``HabitProvider`` contra la base
-de datos Postgres del proyecto, expuesta via PostgREST (``<url>/rest/v1``).
+"""Adaptador de Supabase: implementa el puerto ``HabitProvider`` contra el
+contrato publico de la base de datos, expuesto via PostgREST (``<url>/rest/v1``).
 
 Concentra TODO lo especifico de Supabase/PostgREST, aislado del resto del
 proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
-- Las llamadas HTTP (``requests``) contra ``rest/v1/habits`` y
-  ``rest/v1/habit_checkins``.
-- El mapeo de la fila cruda de la tabla ``habits`` al modelo de dominio
-  agnostico (``provider.base.Habit`` y subtipos).
+- Las llamadas HTTP (``requests``) contra la vista ``v_today_habits`` y la
+  funcion ``rpc/habit_step`` del contrato.
+- El mapeo de la fila cruda de la vista al modelo de dominio agnostico
+  (``provider.base.Habit`` y subtipos).
 - La traduccion de cualquier fallo (``requests``, status, JSON) a la jerarquia
   de excepciones agnostica ``Provider*Error``.
 
-El esquema de las tablas esta documentado en ``.claude/estructura-bd.md``; las columnas
-relevantes para habitos son ``id``, ``name``, ``icon_res``, ``type``
-(``Boolean``/``Real``), ``goal``, ``step``, ``unit``, ``sort_order``, ``status``
-(0=activo, 1=archivado), y en ``habit_checkins``: ``habit_id``,
-``checkin_date`` (``date``), ``value``, ``goal``, con indice unico
-``(habit_id, checkin_date)`` para el upsert por dia.
+El contrato (que vistas/funciones existen y que garantizan) esta documentado
+en ``habits-core/docs/contrato.md``; este adaptador no conoce ni le hace falta
+conocer ninguna tabla subyacente -- las tablas estan cerradas con RLS y solo
+el contrato es accesible con la clave publishable.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import date
 from typing import Any
 
 import requests
@@ -38,14 +35,12 @@ from provider.base import (
     ProviderAuthError,
     ProviderDataError,
     ProviderNetworkError,
-    Progress,
     RealHabit,
 )
 
 URL_ENV_VAR = "SUPABASE_URL"
 KEY_ENV_VAR = "SUPABASE_PUBLISHABLE_KEY"
 _ICON_TEXT_PREFIX = "txt_"  # prefijo de icon_res cuando el icono elegido es un emoji
-_ACTIVE_STATUS = 0  # habits.status: 0=activo, 1=archivado
 
 
 def _load_config() -> tuple[str | None, str | None]:
@@ -68,14 +63,15 @@ def _extract_emoji_icon(icon_res: str) -> str:
 
 
 def build_habit(data: dict[str, Any]) -> Habit:
-    """Mapea una fila cruda de la tabla ``habits`` al modelo de dominio.
+    """Mapea una fila cruda de ``v_today_habits`` al modelo de dominio.
 
     Enruta ``type == "Real"`` a ``RealHabit`` (con ``goal``/``step``/``unit``) y
     todo lo demas -- incluido ``"Boolean"`` y tipos desconocidos -- a
     ``BooleanHabit``. El ``order`` se toma de ``sort_order`` (0 si falta).
 
     Args:
-        data: Fila del habito devuelta por PostgREST.
+        data: Fila del habito devuelta por la vista, con el progreso de hoy
+            ya incluido en ``current_value``.
 
     Returns:
         La instancia de ``Habit`` correspondiente al tipo del habito.
@@ -84,6 +80,7 @@ def build_habit(data: dict[str, Any]) -> Habit:
     name = data["name"]
     emoji = _extract_emoji_icon(str(data.get("icon_res") or ""))
     order = int(data.get("sort_order") or 0)
+    current_value = float(data.get("current_value") or 0.0)
 
     if data.get("type") == "Real":
         return RealHabit(
@@ -91,11 +88,12 @@ def build_habit(data: dict[str, Any]) -> Habit:
             name=name,
             emoji=emoji,
             order=order,
+            current_value=current_value,
             goal=float(data.get("goal", 1.0)),
             step=float(data.get("step", 1.0)),
             unit=str(data.get("unit") or ""),
         )
-    return BooleanHabit(id=id, name=name, emoji=emoji, order=order)
+    return BooleanHabit(id=id, name=name, emoji=emoji, order=order, current_value=current_value)
 
 
 class SupabaseProvider(HabitProvider):
@@ -122,19 +120,26 @@ class SupabaseProvider(HabitProvider):
     def _check_status(resp: requests.Response, what: str) -> None:
         """Traduce un status HTTP no exitoso a la excepcion agnostica adecuada."""
         if resp.status_code in (401, 403):
-            raise ProviderAuthError(f"Clave invalida o sin permiso ({resp.status_code})")
+            raise ProviderAuthError(
+                f"Clave invalida o sin permiso ({resp.status_code}); "
+                "revisa tambien si falta un GRANT del contrato para este objeto"
+            )
         if resp.status_code not in (200, 201, 204):
             raise ProviderDataError(f"{what} -> status {resp.status_code}: {resp.text}")
 
     def get_habits(self) -> list[Habit]:
-        """Devuelve los habitos activos del usuario, ya mapeados a dominio."""
+        """Devuelve los habitos de hoy, ya mapeados a dominio.
+
+        Una sola peticion a ``v_today_habits``: la vista ya filtra los habitos
+        activos y trae el progreso de hoy, asi que no hace falta filtrar por
+        estado ni encadenar una segunda consulta de progreso.
+        """
         try:
             resp = requests.get(
-                f"{self._base}/habits",
+                f"{self._base}/v_today_habits",
                 headers=self._headers(Accept="application/json"),
                 params={
-                    "select": "id,name,icon_res,type,goal,step,unit,sort_order",
-                    "status": f"eq.{_ACTIVE_STATUS}",
+                    "select": "id,name,icon_res,type,goal,step,unit,sort_order,current_value",
                     "order": "sort_order",
                 },
                 timeout=10,
@@ -142,75 +147,27 @@ class SupabaseProvider(HabitProvider):
         except requests.RequestException as exc:
             raise ProviderNetworkError(str(exc)) from exc
 
-        self._check_status(resp, "GET habits")
+        self._check_status(resp, "GET v_today_habits")
         try:
             raw = resp.json()
         except ValueError as exc:
-            raise ProviderDataError("GET habits -> respuesta no es JSON valido") from exc
+            raise ProviderDataError("GET v_today_habits -> respuesta no es JSON valido") from exc
         return [build_habit(h) for h in raw]
 
-    def get_progress(self, habit_ids: list[str], day: date) -> dict[str, Progress]:
-        """Devuelve el progreso de cada habito en ``day``.
-
-        Consulta ``habit_checkins`` filtrando por los ids dados y por la fecha
-        exacta (``checkin_date`` es un ``date``).
-        """
-        if not habit_ids:
-            return {}
-
-        try:
-            resp = requests.get(
-                f"{self._base}/habit_checkins",
-                headers=self._headers(Accept="application/json"),
-                params={
-                    "select": "habit_id,value,goal",
-                    "habit_id": f"in.({','.join(habit_ids)})",
-                    "checkin_date": f"eq.{day.isoformat()}",
-                },
-                timeout=10,
-            )
-        except requests.RequestException as exc:
-            raise ProviderNetworkError(str(exc)) from exc
-
-        self._check_status(resp, "GET habit_checkins")
-        try:
-            rows = resp.json()
-        except ValueError as exc:
-            raise ProviderDataError("GET habit_checkins -> respuesta no es JSON valido") from exc
-
-        return {
-            row["habit_id"]: Progress(
-                value=float(row.get("value", 0.0)),
-                goal=float(row.get("goal", 1.0)),
-            )
-            for row in rows
-        }
-
-    def checkin(self, habit: Habit, day: date, value: float) -> None:
-        """Registra el progreso total (``value``) de ``habit`` en ``day``.
-
-        Hace un upsert por ``(habit_id, checkin_date)``: si ya existe la fila del
-        dia se actualiza (``resolution=merge-duplicates`` sobre el indice unico),
-        y si no se inserta. El checkin no es incremental: ``value`` es el total
-        ya calculado por el llamador (via ``habit.next_value``).
-        """
-        payload = {
-            "habit_id": habit.id,
-            "checkin_date": day.isoformat(),
-            "value": value,
-            "goal": habit.goal,
-        }
+    def step(self, habit: Habit) -> float:
+        """Avanza un paso ``habit`` via ``rpc/habit_step`` y devuelve el nuevo total."""
         try:
             resp = requests.post(
-                f"{self._base}/habit_checkins",
-                headers=self._headers(
-                    **{"Content-Type": "application/json", "Prefer": "resolution=merge-duplicates"}
-                ),
-                params={"on_conflict": "habit_id,checkin_date"},
-                json=payload,
+                f"{self._base}/rpc/habit_step",
+                headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
+                json={"p_habit_id": habit.id},
                 timeout=10,
             )
         except requests.RequestException as exc:
             raise ProviderNetworkError(str(exc)) from exc
 
-        self._check_status(resp, "POST habit_checkins")
+        self._check_status(resp, "POST rpc/habit_step")
+        try:
+            return float(resp.json())
+        except ValueError as exc:
+            raise ProviderDataError("POST rpc/habit_step -> respuesta no es un numero valido") from exc
