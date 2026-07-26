@@ -8,20 +8,21 @@ en particular:
 - Jerarquia de excepciones agnostica (``ProviderError`` y subclases).
 - El modelo de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``),
   construido desde campos ya parseados -- nunca desde el JSON crudo de un backend.
-- ``Progress``: el progreso (value/goal) de un habito en un dia.
+
+La logica de negocio (que dia es hoy, cual es el siguiente valor de un habito)
+vive en la base de datos; este puerto y sus adaptadores son un renderizador
+tonto sobre lo que la base ya calculo.
 
 Para sustituir de backend basta con escribir un adaptador nuevo que implemente
-``HabitProvider`` devolviendo objetos ``Habit``/``Progress`` de este modulo y
-traduciendo sus fallos a las excepciones ``Provider*`` de aqui; el resto del
-proyecto no necesita cambiar (ver ``provider/supabase.py`` como ejemplo de
-adaptador concreto).
+``HabitProvider`` devolviendo objetos ``Habit`` de este modulo y traduciendo sus
+fallos a las excepciones ``Provider*`` de aqui; el resto del proyecto no
+necesita cambiar (ver ``provider/supabase.py`` como ejemplo de adaptador
+concreto).
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from datetime import date
 
 
 class ProviderError(Exception):
@@ -40,20 +41,6 @@ class ProviderDataError(ProviderError):
     """El proveedor respondio algo distinto de lo esperado (status/JSON)."""
 
 
-@dataclass(frozen=True)
-class Progress:
-    """Progreso de un habito en un dia concreto.
-
-    Attributes:
-        value: Progreso acumulado registrado ese dia.
-        goal: Objetivo vigente cuando se registro ese progreso (no
-            necesariamente el objetivo actual del habito).
-    """
-
-    value: float
-    goal: float
-
-
 class Habit(ABC):
     """Habito de seguimiento, agnostico del backend que lo origino.
 
@@ -68,77 +55,47 @@ class Habit(ABC):
         order: Pista de orden para asignar teclas de forma estable (los
             habitos nuevos reclaman teclas en este orden). El adaptador la
             rellena desde el campo de orden que use su backend.
+        current_value: Progreso acumulado hoy, ya calculado por el proveedor.
+            Puede superar ``goal`` (p.ej. ``10.0`` con un objetivo de ``8.0``):
+            es un estado valido, no un error.
     """
 
-    def __init__(self, id: str, name: str, emoji: str = "", order: int = 0) -> None:
+    def __init__(self, id: str, name: str, emoji: str = "", order: int = 0, current_value: float = 0.0) -> None:
         self.id = id
         self.name = name
         self.emoji = emoji
         self.order = order
+        self.current_value = current_value
 
     @property
     def goal(self) -> float:
         """Objetivo diario del habito. Por defecto ``1.0`` (habito booleano)."""
         return 1.0
 
-    def is_done_today(self, done_ids: set[str]) -> bool:
-        """Indica si el habito esta completado hoy.
+    @property
+    def is_done(self) -> bool:
+        """Indica si el habito alcanzo hoy su objetivo (``current_value >= goal``).
 
-        Args:
-            done_ids: Ids de habitos con progreso completado hoy.
+        No implica que la tecla deje de aceptar pulsaciones: un habito
+        cuantificable sigue sumando progreso por encima del objetivo.
         """
-        return self.id in done_ids
-
-    def is_locked(self, done_ids: set[str]) -> bool:
-        """Indica si la tecla debe ignorar nuevas pulsaciones hoy.
-
-        Por defecto nunca se bloquea: los habitos booleanos siguen aceptando
-        pulsaciones repetidas (el checkin es idempotente). Los habitos que
-        acumulan progreso (``RealHabit``) lo sobrescriben para bloquear la
-        tecla al alcanzar el objetivo.
-
-        Args:
-            done_ids: Ids de habitos con progreso completado hoy.
-        """
-        return False
-
-    def display_label(self, current_value: float | None = None) -> str:
-        """Texto a mostrar en la tecla (aparte del emoji, ver ``emoji``).
-
-        Por defecto el nombre del habito. Los habitos cuantificables lo
-        sobrescriben para mostrar el progreso en vez del nombre (p.ej.
-        ``"3/8 Cups"``).
-
-        Args:
-            current_value: Progreso acumulado hoy, si se conoce.
-        """
-        return self.name
+        return self.current_value >= self.goal
 
     @abstractmethod
-    def next_value(self, current_value: float = 0.0) -> float:
-        """Valor TOTAL que tendria el habito hoy tras una pulsacion.
-
-        El dominio decide el valor objetivo (p.ej. sumar un paso hasta el
-        goal); el adaptador de proveedor lo traduce a la llamada concreta de
-        su API. El orquestador lo usa tanto para el checkin como para la
-        actualizacion optimista de la tecla.
-
-        Args:
-            current_value: Progreso acumulado hoy antes de esta pulsacion
-                (0.0 si aun no hay checkin). Los habitos booleanos lo ignoran.
-        """
+    def display_label(self) -> str:
+        """Texto a mostrar en la tecla (aparte del emoji, ver ``emoji``)."""
 
 
 class BooleanHabit(Habit):
     """Habito booleano: hecho o no hecho, sin cantidad. Objetivo siempre cumplido."""
 
-    def next_value(self, current_value: float = 0.0) -> float:
-        """Siempre ``1.0``: pulsar marca el habito como cumplido ese dia."""
-        return 1.0
+    def display_label(self) -> str:
+        """El nombre del habito (no hay progreso cuantificable que mostrar)."""
+        return self.name
 
 
 class RealHabit(Habit):
-    """Habito cuantificable: acumula ``step`` con cada pulsacion hasta ``goal``.
+    """Habito cuantificable: acumula ``step`` con cada pulsacion, sin tope.
 
     Attributes:
         step: Cantidad que suma cada pulsacion (p.ej. ``1.0`` vaso).
@@ -151,11 +108,12 @@ class RealHabit(Habit):
         name: str,
         emoji: str = "",
         order: int = 0,
+        current_value: float = 0.0,
         goal: float = 1.0,
         step: float = 1.0,
         unit: str = "",
     ) -> None:
-        super().__init__(id, name, emoji, order)
+        super().__init__(id, name, emoji, order, current_value)
         self._goal = goal
         self.step = step
         self.unit = unit
@@ -165,26 +123,17 @@ class RealHabit(Habit):
         """Objetivo diario del habito (p.ej. ``8.0`` vasos)."""
         return self._goal
 
-    def is_locked(self, done_ids: set[str]) -> bool:
-        """Bloquea la tecla una vez alcanzado el objetivo (no se supera el goal)."""
-        return self.is_done_today(done_ids)
-
-    def display_label(self, current_value: float | None = None) -> str:
+    def display_label(self) -> str:
         """Progreso acumulado hoy, sin el nombre (p.ej. ``"3/8 Cups"``).
 
         El nombre se omite a proposito: el emoji del habito ya identifica de
         que habito se trata, y en la tecla apenas hay sitio para nombre +
-        progreso legibles.
+        progreso legibles. Puede superar el objetivo (p.ej. ``"10/8 Cups"``).
         """
-        value = current_value if current_value is not None else 0.0
-        progress = f"{_format_number(value)}/{_format_number(self.goal)}"
+        progress = f"{_format_number(self.current_value)}/{_format_number(self.goal)}"
         if self.unit:
             progress = f"{progress} {self.unit}"
         return progress
-
-    def next_value(self, current_value: float = 0.0) -> float:
-        """Suma ``step`` al progreso actual, sin superar ``goal``."""
-        return min(current_value + self.step, self.goal)
 
 
 def _format_number(value: float) -> str:
@@ -196,14 +145,14 @@ class HabitProvider(ABC):
     """Puerto: contrato que debe implementar cualquier backend de habitos.
 
     El orquestador depende solo de esta interfaz y de los tipos agnosticos de
-    este modulo (``Habit``, ``Progress``, ``Provider*Error``). Sustituir de
-    proveedor es implementar esta clase y cambiar una linea de construccion en
-    el orquestador.
+    este modulo (``Habit``, ``Provider*Error``). Sustituir de proveedor es
+    implementar esta clase y cambiar una linea de construccion en el
+    orquestador.
     """
 
     @abstractmethod
     def get_habits(self) -> list[Habit]:
-        """Devuelve la lista de habitos del usuario.
+        """Devuelve los habitos del usuario con su progreso de hoy ya incluido.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.
@@ -212,31 +161,18 @@ class HabitProvider(ABC):
         """
 
     @abstractmethod
-    def get_progress(self, habit_ids: list[str], day: date) -> dict[str, Progress]:
-        """Devuelve el progreso de cada habito en un dia concreto.
+    def step(self, habit: Habit) -> float:
+        """Avanza un paso el progreso de hoy de ``habit``.
 
-        Un habito sin progreso registrado ese dia simplemente no aparece en el
-        resultado (progreso 0 implicito).
-
-        Args:
-            habit_ids: Ids de los habitos a consultar.
-            day: Dia a consultar.
-
-        Raises:
-            ProviderAuthError: Si las credenciales son invalidas o caducaron.
-            ProviderNetworkError: Si falla la conexion con el proveedor.
-            ProviderDataError: Si la respuesta no tiene el formato esperado.
-        """
-
-    @abstractmethod
-    def checkin(self, habit: Habit, day: date, value: float) -> None:
-        """Registra el progreso total (``value``) de un habito en un dia.
+        El proveedor decide el nuevo valor (booleano -> salta a ``goal``,
+        cuantificable -> suma ``step`` sin tope); este metodo solo lo ejecuta
+        y devuelve el resultado para que el llamador repinte la tecla.
 
         Args:
-            habit: El habito sobre el que se registra el progreso.
-            day: Dia del checkin.
-            value: Progreso TOTAL acumulado a registrar ese dia (ya calculado
-                por el llamador via ``habit.next_value``).
+            habit: El habito sobre el que avanzar.
+
+        Returns:
+            El nuevo valor TOTAL acumulado hoy.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.
