@@ -11,7 +11,9 @@ COLOR_HABIT_DONE = (55, 55, 55)        # gris oscuro apagado: hoy hecho, pasa de
 COLOR_ERROR = (200, 40, 40)            # rojo: fallo al enviar
 COLOR_RESERVED = (25, 25, 25)
 COLOR_EMPTY = (0, 0, 0)
+COLOR_SHUTDOWN = (120, 15, 15)          # rojo oscuro de aviso: accion destructiva (apagar la Pi)
 
 COLOR_TEXT_HABIT_PENDING = (0, 0, 0)        # texto negro sobre fondo blanco
 COLOR_TEXT_HABIT_DONE = (110, 110, 110)     # texto tambien atenuado, refuerza el bajo contraste
+COLOR_TEXT_SHUTDOWN = (255, 255, 255)
 FONT_SIZE_HABIT_PENDING = 16                # texto mas grande para resaltar lo pendiente

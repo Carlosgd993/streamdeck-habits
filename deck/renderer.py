@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from config import RESERVED_KEYS
+from config import KEY_SHUTDOWN, RESERVED_KEYS
 from deck.primitives import solid_tile, text_tile
 from deck.style import (
     COLOR_EMPTY,
@@ -12,8 +12,10 @@ from deck.style import (
     COLOR_HABIT_DONE,
     COLOR_HABIT_PENDING,
     COLOR_RESERVED,
+    COLOR_SHUTDOWN,
     COLOR_TEXT_HABIT_DONE,
     COLOR_TEXT_HABIT_PENDING,
+    COLOR_TEXT_SHUTDOWN,
     FONT_SIZE_HABIT_PENDING,
 )
 from provider.base import Habit
@@ -62,9 +64,27 @@ def render_reserved(deck: Any, key: int) -> None:
     deck.set_key_image(key, solid_tile(deck, COLOR_RESERVED))
 
 
+def render_shutdown(deck: Any, key: int) -> None:
+    """Pinta la tecla de apagado: fondo rojo de aviso, texto y un icono
+    representativo, para distinguirla a simple vista del resto de teclas
+    reservadas (accion destructiva, no un simple placeholder)."""
+    deck.set_key_image(key, text_tile(deck, COLOR_SHUTDOWN, "APAGAR", text_color=COLOR_TEXT_SHUTDOWN, emoji="🔴"))
+
+
 def render_empty(deck: Any, key: int) -> None:
     """Pinta una tecla vacia (negra)."""
     deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
+
+
+def render_reserved_key(deck: Any, key: int) -> None:
+    """Pinta una tecla reservada segun cual sea: ``KEY_SHUTDOWN`` con su aviso
+    propio (``render_shutdown``), el resto con el gris generico
+    (``render_reserved``). Punto unico usado tanto por el pintado inicial de
+    reservadas como por ``render_all``, para que no diverjan entre si."""
+    if key == KEY_SHUTDOWN:
+        render_shutdown(deck, key)
+    else:
+        render_reserved(deck, key)
 
 
 def render_all(deck: Any, mapping: dict[str, int], habits_by_id: dict[str, Habit]) -> None:
@@ -79,7 +99,7 @@ def render_all(deck: Any, mapping: dict[str, int], habits_by_id: dict[str, Habit
     key_to_habit_id = {k: hid for hid, k in mapping.items()}
     for key in range(deck.key_count()):
         if key in RESERVED_KEYS:
-            render_reserved(deck, key)
+            render_reserved_key(deck, key)
             continue
         habit_id = key_to_habit_id.get(key)
         habit = habits_by_id.get(habit_id) if habit_id else None

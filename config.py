@@ -15,6 +15,7 @@ DEVICE_LOG = os.path.join(BASE_DIR, "device_errors.log")
 
 RESERVED_KEYS = {0, 5, 10}
 KEY_REFRESH = 0  # tecla reservada que fuerza un refresco inmediato desde el proveedor
+KEY_SHUTDOWN = 10  # tecla reservada que apaga la Raspberry Pi
 ALL_KEYS = set(range(15))
 AVAILABLE_KEYS = sorted(ALL_KEYS - RESERVED_KEYS)
 
