@@ -19,25 +19,26 @@ from deck.style import (
 from provider.base import Habit
 
 
-def render_habit(deck: Any, key: int, habit: Habit | None, done: bool, current_value: float | None = None) -> None:
+def render_habit(deck: Any, key: int, habit: Habit | None) -> None:
     """Pinta una tecla de habito.
 
-    Pendiente: fondo blanco y texto negro grande, para resaltar sobre el
-    resto. Hecho hoy: fondo gris oscuro y texto atenuado, para pasar
-    desapercibido. Si ``habit`` es ``None`` la tecla se pinta vacia (negra).
-    El texto lo decide ``habit.display_label`` (nombre sin emoji para
-    booleanos, solo progreso para habitos cuantificables); el emoji del icono
-    (``habit.emoji``), si tiene, se pinta aparte como icono a color.
+    Objetivo no alcanzado: fondo blanco y texto negro grande, para resaltar
+    sobre el resto. Objetivo alcanzado hoy (``habit.is_done``): fondo gris
+    oscuro y texto atenuado, para pasar desapercibido -- es una senal de
+    "ya llegaste", no de "deshabilitado": la tecla se sigue pudiendo pulsar y
+    un habito cuantificable sigue sumando por encima del objetivo (se veria
+    p.ej. "10/8 Cups" en gris). Si ``habit`` es ``None`` la tecla se pinta
+    vacia (negra).
 
-    Args:
-        current_value: Progreso acumulado hoy, si se conoce (solo relevante
-            para habitos cuantificables).
+    El texto lo decide ``habit.display_label()`` (nombre para booleanos, solo
+    progreso para habitos cuantificables); el emoji del icono (``habit.emoji``),
+    si tiene, se pinta aparte como icono a color.
     """
     if habit is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
-    label = habit.display_label(current_value)
-    if done:
+    label = habit.display_label()
+    if habit.is_done:
         image = text_tile(deck, COLOR_HABIT_DONE, label, text_color=COLOR_TEXT_HABIT_DONE, emoji=habit.emoji)
     else:
         image = text_tile(
@@ -66,22 +67,14 @@ def render_empty(deck: Any, key: int) -> None:
     deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
 
 
-def render_all(
-    deck: Any,
-    mapping: dict[str, int],
-    habits_by_id: dict[str, Habit],
-    done_ids: set[str],
-    values_by_id: dict[str, float],
-) -> None:
-    """Repinta las 15 teclas segun el mapeo, los habitos y los checkins de hoy.
+def render_all(deck: Any, mapping: dict[str, int], habits_by_id: dict[str, Habit]) -> None:
+    """Repinta las 15 teclas segun el mapeo y los habitos actuales.
 
     Args:
         deck: El dispositivo Stream Deck.
         mapping: Mapeo habito -> tecla.
-        habits_by_id: Objetos ``Habit`` indexados por id.
-        done_ids: Ids de habitos con checkin completado hoy.
-        values_by_id: Progreso acumulado hoy por habito (habitos
-            cuantificables sin checkin hoy simplemente no aparecen).
+        habits_by_id: Objetos ``Habit`` indexados por id, con su progreso de
+            hoy ya incluido (``habit.current_value``).
     """
     key_to_habit_id = {k: hid for hid, k in mapping.items()}
     for key in range(deck.key_count()):
@@ -90,14 +83,12 @@ def render_all(
             continue
         habit_id = key_to_habit_id.get(key)
         habit = habits_by_id.get(habit_id) if habit_id else None
-        done = habit.is_done_today(done_ids) if habit else False
-        current_value = values_by_id.get(habit_id) if habit_id else None
-        render_habit(deck, key, habit, done, current_value)
+        render_habit(deck, key, habit)
 
 
 def render_error_all(deck: Any, mapping: dict[str, int], code: str) -> None:
     """Pinta con el codigo de error corto todas las teclas actualmente
-    mapeadas a un habito (se usa cuando falla la lectura de habitos o de
-    checkins, para no dejar informacion potencialmente obsoleta en pantalla)."""
+    mapeadas a un habito (se usa cuando falla la lectura de habitos, para no
+    dejar informacion potencialmente obsoleta en pantalla)."""
     for key in mapping.values():
         render_checkin_error(deck, key, code)
