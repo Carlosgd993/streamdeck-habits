@@ -83,10 +83,12 @@ El codigo esta organizado en tres capas por carpetas, con una regla de
 dependencia clara:
 
 - **`provider/`** — la API, aislada tras un puerto abstracto (`base.py`:
-  interfaz `HabitProvider`, modelo de dominio `Habit`/`Progress` y excepciones
+  interfaz `HabitProvider`, modelo de dominio `Habit` y excepciones
   agnosticas). Supabase es solo un adaptador (`supabase.py`) detras del puerto;
   sustituirlo por otra API es escribir otro adaptador y cambiar una linea en
-  `orchestrator.py`.
+  `orchestrator.py`. La logica de negocio (que dia es hoy, cual es el
+  siguiente valor de un habito) vive en la base de datos, no aqui: el daemon
+  es un renderizador tonto sobre un contrato de vistas y funciones.
 - **`deck/`** — todo lo de la Stream Deck (hardware y pintado): `session`,
   `primitives`, `renderer`, `keys`, `style`. No sabe nada del proveedor de datos.
 - **`core/`** — dominio/orquestacion agnosticos: `key_map`, `health`,
