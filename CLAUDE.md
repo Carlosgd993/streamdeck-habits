@@ -122,14 +122,14 @@ De las 15 teclas, `RESERVED_KEYS = {0, 5, 10}` no se asignan a hábitos; quedan 
 
 ### Apagado desde la tecla 10
 
-`KEY_SHUTDOWN` ejecuta `sudo -n shutdown -h now` (`deck/keys.py::_shutdown_pi`). El servicio corre como `admin` **sin sudo**, así que hace falta una regla `NOPASSWD` en la Pi para que el comando no se quede pidiendo contraseña (el `-n` hace que falle rápido en vez de bloquear si la regla no está). Como cualquier cambio de sudoers requiere contraseña interactiva, no se puede aplicar por SSH no interactivo desde esta máquina — hay que ejecutarlo a mano en la Pi (o por SSH interactivo):
+`KEY_SHUTDOWN` ejecuta `sudo -n shutdown -h now` (`deck/keys.py::_shutdown_pi`). El servicio corre como `admin` **sin sudo**, así que hace falta una regla `NOPASSWD` en la Pi para que el comando no se quede pidiendo contraseña (el `-n` hace que falle rápido en vez de bloquear si la regla no está):
 
 ```bash
 echo 'admin ALL=(root) NOPASSWD: /usr/sbin/shutdown -h now' | sudo tee /etc/sudoers.d/streamdeck-habits-shutdown
 sudo chmod 440 /etc/sudoers.d/streamdeck-habits-shutdown
 ```
 
-Si falta la regla, la pulsación no apaga nada y el fallo queda solo en `device_errors.log` — la tecla no da ninguna señal, igual que el resto de errores de dispositivo.
+**Regla ya aplicada en la Pi desplegada: el botón apaga sin problema.** Si algún día hay que reinstalar la Pi desde cero o mover el servicio a otra máquina, hay que reaplicar esta regla a mano (requiere contraseña interactiva, no se puede por SSH no interactivo desde aquí) o el botón fallará silenciosamente y quedará solo en `device_errors.log`, sin señal en la tecla, igual que el resto de errores de dispositivo.
 
 ## Operar la Raspberry Pi
 
@@ -175,8 +175,10 @@ Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear
 
 3. **Observar** que arranca limpio: PID nuevo estable, sin errores en el journal ni en `checkin_failures.log`/`device_errors.log`, y comportamiento correcto en el hardware.
 
-4. **Si va bien** → commit + push a `main`; luego en la Pi `git -C /opt/streamdeck-habits fetch && git -C /opt/streamdeck-habits reset --hard origin/main` (deja `main` limpio con LF) y despliegue normal.
+4. **Si va bien** → commit + push a `main`; luego despliegue normal (`deploy/deploy.sh` sin `--test`, ver abajo) para que la Pi quede en `origin/main` con el árbol limpio.
    **Si va mal** → en la Pi `git -C /opt/streamdeck-habits checkout -- .` (restaura `main`) y `deploy/deploy.sh --test`. Si el código de prueba llegó a crashear en bucle y systemd lo dejó parado, arrancarlo de nuevo sí necesita sudo: `sudo systemctl start streamdeck-habits.service`.
+
+**No dejes el paso 4 a medias.** Un `--test` que "fue bien" pero nunca se cerró con el despliegue normal deja la Pi con el árbol sucio y por detrás de `origin/main` indefinidamente — el servicio sigue corriendo con lo que haya en disco (puede coincidir con `main` por casualidad, o no) y nadie se entera hasta que alguien compara `git status`/`git log` a mano. Verificarlo cuesta un comando: `ssh admin@RP3-MotoComm-1.local 'cd /opt/streamdeck-habits && git status --short && git log --oneline -1'` debe salir vacío y en el mismo commit que `origin/main`.
 
 ### Despliegue
 
