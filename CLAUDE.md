@@ -180,6 +180,36 @@ Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear
 
 **No dejes el paso 4 a medias.** Un `--test` que "fue bien" pero nunca se cerró con el despliegue normal deja la Pi con el árbol sucio y por detrás de `origin/main` indefinidamente — el servicio sigue corriendo con lo que haya en disco (puede coincidir con `main` por casualidad, o no) y nadie se entera hasta que alguien compara `git status`/`git log` a mano. Verificarlo cuesta un comando: `ssh admin@RP3-MotoComm-1.local 'cd /opt/streamdeck-habits && git status --short && git log --oneline -1'` debe salir vacío y en el mismo commit que `origin/main`.
 
+### Cambiar de proyecto Supabase (main / test)
+
+Hay dos proyectos Supabase activos, cada uno con su propia base (esquema
+identico, datos independientes):
+
+| Alias | Proyecto | ref | URL |
+|---|---|---|---|
+| `main` | `habits-core` (produccion) | `ufyzpixnhrsltoxdqihn` | `https://ufyzpixnhrsltoxdqihn.supabase.co` |
+| `test` | `habits-core-test` | `dkomeqbvhobkaulogibw` | `https://dkomeqbvhobkaulogibw.supabase.co` |
+
+El `.env` de la Pi trae las credenciales de **los dos** proyectos a la vez:
+`SUPABASE_URL`/`SUPABASE_PUBLISHABLE_KEY` para `main` (sin sufijo, es el caso
+normal) y `SUPABASE_URL_TEST`/`SUPABASE_PUBLISHABLE_KEY_TEST` para `test` (ver
+`.env.example`). `SUPABASE_ENV` (`main` o `test`) dice cual de las dos lee
+`provider/supabase.py`.
+Cambiar de proyecto es cambiar esa variable y reiniciar el servicio, nada mas
+— no hay script ni fichero nuevo:
+
+```bash
+ssh admin@RP3-MotoComm-1.local "sed -i 's/^SUPABASE_ENV=.*/SUPABASE_ENV=test/' /opt/streamdeck-habits/.env"
+ssh admin@RP3-MotoComm-1.local 'kill -9 $(systemctl show -p MainPID --value streamdeck-habits.service)'
+```
+
+(cambia `test` por `main` para volver a produccion). El `kill -9` es intencional:
+systemd relanza el proceso por `Restart=on-failure` y ahi relee el `.env`
+actualizado — es la misma tecnica que usa `deploy.sh`. **Cuando el usuario
+diga "apunta la pi a test" o "a main/produccion", es literalmente esos dos
+comandos** — no hace falta preguntar cual proyecto es cual, ya esta en la
+tabla de arriba.
+
 ### Despliegue
 
 ```bash
@@ -195,7 +225,7 @@ ssh admin@RP3-MotoComm-1.local "bash /opt/streamdeck-habits/deploy/deploy.sh"
 
 `config.py` fija `BASE_DIR = "/opt/streamdeck-habits"` y el shebang de `orchestrator.py` apunta a `/opt/streamdeck-habits/venv/bin/python` (Python 3.13.5). **No hay override por variable de entorno: trata `BASE_DIR` como fijo.** Junto al código se espera (todo gitignored salvo `.env.example`):
 
-- `.env` — `SUPABASE_URL` y `SUPABASE_PUBLISHABLE_KEY` (cargados vía `python-dotenv` en `SupabaseProvider.__init__`)
+- `.env` — credenciales de **ambos** proyectos (`SUPABASE_URL`/`SUPABASE_PUBLISHABLE_KEY` para main, `_TEST` para test) más `SUPABASE_ENV` para elegir cuál usa `SupabaseProvider.__init__` (vía `python-dotenv`) — ver [Cambiar de proyecto Supabase](#cambiar-de-proyecto-supabase-main--test)
 - `habit_key_map.json` — mapeo `habit_id -> key_index`, se crea y actualiza solo
 - `checkin_failures.log` — JSON-lines de checkins fallidos hacia Supabase (errores de API, tecla en rojo)
 - `device_errors.log` — texto plano de fallos del propio dispositivo (nunca se muestran en tecla)

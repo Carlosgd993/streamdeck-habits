@@ -40,13 +40,25 @@ from provider.base import (
 
 URL_ENV_VAR = "SUPABASE_URL"
 KEY_ENV_VAR = "SUPABASE_PUBLISHABLE_KEY"
+ACTIVE_ENV_VAR = "SUPABASE_ENV"
+DEFAULT_ACTIVE_ENV = "main"
 _ICON_TEXT_PREFIX = "txt_"  # prefijo de icon_res cuando el icono elegido es un emoji
 
 
 def _load_config() -> tuple[str | None, str | None]:
-    """Carga el ``.env`` y devuelve ``(url, publishable_key)`` de Supabase."""
+    """Carga el ``.env`` y devuelve ``(url, publishable_key)`` del entorno activo.
+
+    El ``.env`` trae las credenciales de los dos proyectos a la vez:
+    ``SUPABASE_URL``/``SUPABASE_PUBLISHABLE_KEY`` para ``main`` (sin sufijo,
+    es el caso normal) y ``SUPABASE_URL_TEST``/``SUPABASE_PUBLISHABLE_KEY_TEST``
+    para ``test``. ``SUPABASE_ENV`` (``main`` o ``test``, por defecto ``main``)
+    elige cual de las dos usar. Cambiar de proyecto es cambiar ``SUPABASE_ENV``
+    en el ``.env`` y reiniciar el servicio -- nada mas.
+    """
     load_dotenv(ENV_FILE)
-    return os.environ.get(URL_ENV_VAR), os.environ.get(KEY_ENV_VAR)
+    active = os.environ.get(ACTIVE_ENV_VAR, DEFAULT_ACTIVE_ENV).strip().lower()
+    suffix = "" if active == DEFAULT_ACTIVE_ENV else f"_{active.upper()}"
+    return os.environ.get(f"{URL_ENV_VAR}{suffix}"), os.environ.get(f"{KEY_ENV_VAR}{suffix}")
 
 
 def _extract_emoji_icon(icon_res: str) -> str:
@@ -108,7 +120,12 @@ class SupabaseProvider(HabitProvider):
         """
         url, key = _load_config()
         if not url or not key:
-            raise ProviderAuthError(f"Faltan {URL_ENV_VAR}/{KEY_ENV_VAR} en {ENV_FILE}")
+            active = os.environ.get(ACTIVE_ENV_VAR, DEFAULT_ACTIVE_ENV).strip().lower()
+            suffix = "" if active == DEFAULT_ACTIVE_ENV else f"_{active.upper()}"
+            raise ProviderAuthError(
+                f"Faltan {URL_ENV_VAR}{suffix}/{KEY_ENV_VAR}{suffix} en {ENV_FILE} "
+                f"({ACTIVE_ENV_VAR}={active})"
+            )
         self._base = f"{url.rstrip('/')}/rest/v1"
         self._key = key
 
