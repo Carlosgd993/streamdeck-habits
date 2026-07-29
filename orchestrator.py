@@ -1,35 +1,38 @@
 #!/opt/streamdeck-habits/venv/bin/python
 """Punto de entrada del daemon: bucle de refresco que sincroniza los habitos y
 las tareas pendientes del proveedor con las teclas del Stream Deck, y gestiona
-los pasos y los cierres al pulsar.
+la navegacion por menu, la paginacion y los pasos/cierres al pulsar.
 
 El orquestador depende solo de los puertos abstractos de ``provider.base``
 (interfaces ``HabitProvider``/``TaskProvider``, modelos ``Habit``/``Task`` y
-excepciones ``Provider*``); la unica linea acoplada a un backend concreto es la
-construccion del proveedor (``SupabaseProvider()``). Sustituir de API = escribir
-otro adaptador que implemente esos puertos y cambiar esa linea.
+excepciones ``Provider*``) y del registro de pantallas de ``core.screens``; la
+unica linea acoplada a un backend concreto es la construccion del proveedor
+(``SupabaseProvider()``). Sustituir de API = escribir otro adaptador que
+implemente esos puertos y cambiar esa linea.
 """
 
 from __future__ import annotations
 
 import sys
 import threading
+import time
 from collections.abc import Callable
-from threading import Event
 from typing import Any
 
 import core.health as health
 import core.key_map as key_map
+import core.screens as screens
 import deck.keys as deck_keys
 import deck.renderer as renderer
-from config import REFRESH_SECONDS
+from config import AUTO_RETURN_SECONDS, REFRESH_SECONDS
 from core.error_codes import CODES
 from deck.session import DeckSession
 from provider.base import Habit, HabitProvider, ProviderError, Task, TaskProvider
 from provider.supabase import SupabaseProvider
 
 state_lock = threading.Lock()
-pending_requests: set[str] = set()  # ids (habito o tarea) con peticion en vuelo, para no duplicar por doble pulsacion
+pending_requests: set[str] = set()  # ids (habito, tarea o el centinela de navegacion) con peticion en vuelo
+_NAV_SENTINEL = "__nav__"  # clave de _claim/_release para no duplicar una entrada a vista por doble toque
 
 
 def _claim(item_id: str) -> bool:
@@ -64,50 +67,97 @@ def _safe_render(render: Callable[[], None]) -> None:
         health.log_device_error(str(device_exc))
 
 
+class _AutoReturnTimer:
+    """Temporizador reiniciable: cada pulsacion lo reprograma; si nadie pulsa
+    nada durante ``seconds``, dispara ``callback`` una vez.
+
+    Usa ``threading.Timer`` con su propio lock interno, independiente de
+    ``screen_lock``, para que reprogramarlo (que ocurre en el hilo de
+    callbacks del Stream Deck en cada pulsacion) nunca compita con un
+    repintado en curso en otro hilo.
+    """
+
+    def __init__(self, seconds: float, callback: Callable[[], None]) -> None:
+        self._seconds = seconds
+        self._callback = callback
+        self._lock = threading.Lock()
+        self._timer: threading.Timer | None = None
+
+    def reset(self) -> None:
+        """Cancela el temporizador pendiente (si lo hay) y arma uno nuevo."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self._seconds, self._callback)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def cancel(self) -> None:
+        """Para el temporizador pendiente sin programar uno nuevo (cierre del daemon)."""
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+
+
 def make_key_callback(
     deck: Any,
     provider: HabitProvider,
     task_provider: TaskProvider,
     mapping: dict[str, int],
-    task_keys: dict[str, int],
     habits_ref: dict[str, dict[str, Habit]],
     tasks_ref: dict[str, dict[str, Task]],
-    refresh_event: Event,
+    screen: screens.ScreenState,
+    screen_lock: threading.Lock,
+    auto_return_timer: _AutoReturnTimer,
+    dispatch_navigation: Callable[[screens.PressAction], None],
+    repaint: Callable[[], None],
 ) -> Callable[[Any, int, bool], None]:
-    """Crea el callback de pulsacion de tecla para los mapeos actuales.
+    """Crea el callback de pulsacion de tecla para el estado actual.
 
-    El closure resultante gestiona la tecla de refresco, ignora teclas sin nada
-    asignado, evita peticiones duplicadas (``pending_requests`` + ``state_lock``)
-    y actua segun lo que haya en la tecla:
+    El closure resultante reprograma el temporizador de auto-retorno en
+    cualquier pulsacion, resuelve que tecla es (habito, tarea o accion de
+    navegacion) contra la pagina vigente y actua en consecuencia:
 
-    - **Habito**: pide al proveedor que avance un paso y repinta la tecla al
-      momento con el nuevo total (sin esperar al proximo ciclo) -- exito en
-      blanco/gris segun si alcanza el objetivo, fallo en rojo con codigo. Una
-      tecla con el objetivo ya alcanzado hoy se sigue pudiendo pulsar: es la
-      base quien decide el nuevo valor (``habit_step``), y un habito
-      cuantificable sigue sumando sin tope.
+    - **Habito**: pide al proveedor que avance un paso y, si tiene exito,
+      repinta la **pantalla entera** (``repaint``, no solo esta tecla): en
+      "Hoy" un habito que queda ``is_done`` desaparece de la lista y lo que
+      quede se recoloca sin dejar hueco (ver ``core.screens._today_items``),
+      asi que hace falta recalcular toda la pagina, no solo esta tecla. En
+      "Habitos" el efecto visible es el de siempre (blanco/gris segun
+      objetivo), porque esa vista no oculta nada. Fallo → tecla en rojo con
+      codigo, sin tocar el resto. Una tecla con el objetivo ya alcanzado hoy
+      se sigue pudiendo pulsar: es la base quien decide el nuevo valor
+      (``habit_step``), y un habito cuantificable sigue sumando sin tope.
     - **Tarea**: la pinta en verde de acuse de recibo, pide cerrarla y, solo
-      cuando la base lo confirma, apaga la tecla y saca la tarea de
-      ``tasks_ref`` (una segunda pulsacion ya no encuentra nada). Las demas
-      teclas **no se mueven**: las tareas restantes se recolocan en el
-      siguiente ciclo, no bajo el dedo.
+      cuando la base lo confirma, la saca de ``tasks_ref`` y repinta la
+      pantalla entera (``repaint``) para que las tareas restantes se
+      recoloquen sin hueco, por el mismo motivo que un habito.
+    - **Navegacion** (menu, submenu Sistema, cambiar de vista, paginar,
+      apagar): se delega entera en ``dispatch_navigation``, definido en
+      ``main()`` porque necesita mutar el estado de pantalla compartido.
 
     Args:
         deck: El dispositivo Stream Deck.
         provider: Proveedor de habitos (puerto abstracto).
         task_provider: Proveedor de tareas (puerto abstracto).
         mapping: Mapeo habito -> tecla vigente para este ciclo.
-        task_keys: Mapeo tarea -> tecla vigente para este ciclo.
         habits_ref: Wrapper de un solo campo ``{"value": {id: Habit}}`` para
             que el closure observe actualizaciones de ciclos posteriores.
         tasks_ref: Idem para las tareas pendientes.
-        refresh_event: Evento que despierta el bucle principal (refresco manual).
+        screen: Pantalla activa (menu, sistema o vista con su pagina).
+        screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
+            ``mapping`` frente al ciclo de refresco.
+        auto_return_timer: Temporizador de auto-retorno a "Hoy" tras inactividad.
+        dispatch_navigation: Ejecuta cualquier ``PressAction`` que no sea de
+            habito o tarea.
+        repaint: Repinta la pantalla activa entera bajo ``screen_lock``. La
+            usan los pasos de habito/tarea con exito, para reflejar de
+            inmediato un cambio que puede desplazar otros items.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
     """
-    key_to_habit_id = {k: hid for hid, k in mapping.items()}
-    key_to_task_id = {k: tid for tid, k in task_keys.items()}
 
     def press_habit(deck: Any, key: int, habit_id: str) -> None:
         habit = habits_ref["value"].get(habit_id)
@@ -122,7 +172,7 @@ def make_key_callback(
             print(f"Paso FALLO [{code}]: {habit_id}", flush=True)
         else:
             habit.current_value = new_value
-            _safe_render(lambda: renderer.render_habit(deck, key, habit))
+            _safe_render(repaint)
             print(f"Paso OK: {habit.name} -> {new_value}", flush=True)
 
     def press_task(deck: Any, key: int, task_id: str) -> None:
@@ -139,32 +189,36 @@ def make_key_callback(
             print(f"Cierre FALLO [{code}]: {task_id}", flush=True)
         else:
             # Confirmado por la base: la tarea deja de existir para el deck. Se
-            # quita de tasks_ref para que otra pulsacion no reintente cerrarla.
+            # quita de tasks_ref para que otra pulsacion no reintente cerrarla,
+            # y se repinta la pantalla entera para que lo que quede se recoloque.
             tasks_ref["value"].pop(task_id, None)
-            _safe_render(lambda: renderer.render_empty(deck, key))
+            _safe_render(repaint)
             print(f"Tarea completada: {task.title}", flush=True)
 
     def on_key_change(deck: Any, key: int, pressed: bool) -> None:
         if not pressed:
             return
-        if deck_keys.handle_key_press(key, refresh_event):
-            return  # tecla reservada (p.ej. refresco manual), ya gestionada
+        auto_return_timer.reset()  # cualquier pulsacion, en cualquier pantalla, reprograma el auto-retorno
 
-        habit_id = key_to_habit_id.get(key)
-        task_id = key_to_task_id.get(key)
-        item_id = habit_id if habit_id is not None else task_id
-        if item_id is None:
-            return  # tecla sin habito ni tarea asignados
+        with screen_lock:
+            habits_list = list(habits_ref["value"].values())
+            tasks_list = list(tasks_ref["value"].values())
+            resolved = screens.resolve_page(screen, habits_list, tasks_list, mapping)
+            action = screens.resolve_press(screen, key, resolved)
 
-        if not _claim(item_id):
-            return  # ya hay una peticion en vuelo para este elemento
-        try:
-            if habit_id is not None:
-                press_habit(deck, key, habit_id)
-            else:
-                press_task(deck, key, item_id)
-        finally:
-            _release(item_id)
+        if action.kind in ("habit", "task"):
+            item_id = action.payload
+            if not _claim(item_id):
+                return  # ya hay una peticion en vuelo para este elemento
+            try:
+                if action.kind == "habit":
+                    press_habit(deck, key, item_id)
+                else:
+                    press_task(deck, key, item_id)
+            finally:
+                _release(item_id)
+        elif action.kind != "noop":
+            dispatch_navigation(action)
 
     return on_key_change
 
@@ -172,9 +226,8 @@ def make_key_callback(
 def main() -> None:
     """Arranca el daemon: construye el proveedor, abre el deck y corre el bucle.
 
-    Cada iteracion ejecuta ``refresh_cycle`` y luego espera ``REFRESH_SECONDS``
-    o hasta que se active ``refresh_event`` (refresco manual). Cualquier
-    excepcion ajena a los proveedores de datos se trata como error de
+    Cada iteracion ejecuta ``refresh_cycle`` y luego duerme ``REFRESH_SECONDS``.
+    Cualquier excepcion ajena a los proveedores de datos se trata como error de
     dispositivo y dispara una reconexion.
     """
     try:
@@ -190,83 +243,172 @@ def main() -> None:
     session.open()
 
     mapping = key_map.load_map()
-    task_keys: dict[str, int] = {}  # task_id -> tecla; volatil, se recalcula cada ciclo
     habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
     tasks_ref: dict[str, dict[str, Task]] = {"value": {}}  # task_id -> objeto Task, actualizado cada ciclo
-    refresh_event = threading.Event()  # se activa por el timer o al pulsar KEY_REFRESH
 
-    def refresh_cycle() -> None:
-        nonlocal mapping, task_keys
+    screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
+    screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
+    last_habits_code: str | None = None  # ultimo codigo de error de habitos, para pintarlo tras navegar sin refetch
+    last_tasks_code: str | None = None  # idem para tareas
+
+    def _paint_current_screen() -> None:
+        """Resuelve la pantalla activa contra los datos vigentes, la pinta y
+        re-registra el callback de tecla.
+
+        PRECONDICION: se llama siempre con ``screen_lock`` ya adquirido por
+        el llamador (nunca lo adquiere el mismo).
+        """
         deck = session.deck
-        deck_keys.render_reserved_keys(deck)
+        resolved = screens.resolve_page(
+            screen, list(habits_ref["value"].values()), list(tasks_ref["value"].values()), mapping
+        )
+        _safe_render(lambda: renderer.render_page(deck, resolved))
 
-        # Habitos y tareas se leen por separado y fallan por separado: un fallo
-        # leyendo tareas acaba pintando su codigo solo en las teclas de tarea y
-        # deja los habitos intactos, y al reves. La lectura que falla no toca su
-        # mapeo ni sus datos (se conservan los del ciclo anterior), y desde
-        # luego no toca los de la otra.
-        habits_code: str | None = None
-        try:
-            habits = habit_provider.get_habits()
-        except ProviderError as exc:
-            _, habits_code = health.classify(exc)
-            print(f"[{habits_code}] {CODES[habits_code]} (habitos): {exc}", flush=True)
-        else:
-            mapping = key_map.update_mapping(habits, mapping)
-            habits_ref["value"] = {h.id: h for h in habits}
+        # Los codigos de error se pintan DESPUES del repintado general, para
+        # que tapen los datos viejos de la parte que fallo, y solo si la
+        # pantalla visible los usa (un fallo de tareas no debe teñir "Sistema").
+        is_view = screen.kind is screens.ScreenKind.VIEW
+        if last_habits_code is not None and is_view and screen.view_id in ("today", "habits"):
+            code = last_habits_code
+            _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
+        if last_tasks_code is not None and is_view and screen.view_id in ("today", "tasks"):
+            code = last_tasks_code
+            _safe_render(lambda: renderer.render_error_all(deck, resolved.key_task.keys(), code))
 
-        tasks_code: str | None = None
-        try:
-            tasks = task_provider.get_tasks()
-        except ProviderError as exc:
-            _, tasks_code = health.classify(exc)
-            print(f"[{tasks_code}] {CODES[tasks_code]} (tareas): {exc}", flush=True)
-        else:
-            # Las teclas de tarea salen de las que los habitos dejan libres, asi
-            # que se reparten con el mapeo de habitos ya reconciliado.
-            task_keys = key_map.assign_task_keys(tasks, mapping)
-            tasks_ref["value"] = {t.id: t for t in tasks}
-            if tasks:
-                # A diferencia de los habitos, las teclas de tarea se rehacen
-                # cada ciclo: sin esta linea no queda rastro de que mostraba el
-                # deck en un momento dado.
-                print(f"{len(tasks)} tarea(s) pendientes -> teclas {sorted(task_keys.values())}", flush=True)
-
-        renderer.render_all(deck, mapping, habits_ref["value"], task_keys, tasks_ref["value"])
-        # Los codigos de error se pintan DESPUES del repintado general, para que
-        # tapen los datos viejos de la parte que fallo en vez de que el
-        # repintado los borre a ellos.
-        if habits_code is not None:
-            renderer.render_error_all(deck, mapping, habits_code)
-        if tasks_code is not None:
-            renderer.render_error_all(deck, task_keys, tasks_code)
         deck.set_key_callback(
             make_key_callback(
                 deck,
                 habit_provider,
                 task_provider,
                 mapping,
-                task_keys,
                 habits_ref,
                 tasks_ref,
-                refresh_event,
+                screen,
+                screen_lock,
+                auto_return_timer,
+                _dispatch_navigation,
+                _repaint_locked,
             )
         )
+
+    def _repaint_locked() -> None:
+        """Repinta la pantalla activa adquiriendo ``screen_lock`` (a
+        diferencia de ``_paint_current_screen``, que asume el lock ya
+        adquirido). La usa ``make_key_callback`` tras un paso de habito o un
+        cierre de tarea con exito, fuera de cualquier ``with screen_lock``
+        en curso, para reflejar de inmediato un cambio que puede desplazar
+        otros items (p.ej. recolocar "Hoy" sin dejar hueco)."""
+        with screen_lock:
+            _paint_current_screen()
+
+    def refresh_cycle() -> None:
+        nonlocal mapping, last_habits_code, last_tasks_code
+        with screen_lock:
+            # Habitos y tareas se leen por separado y fallan por separado: un
+            # fallo leyendo tareas deja su codigo aparte y no toca los
+            # habitos, y al reves. La lectura que falla no toca su mapeo ni
+            # sus datos (se conservan los del ciclo anterior).
+            try:
+                habits = habit_provider.get_habits()
+            except ProviderError as exc:
+                _, last_habits_code = health.classify(exc)
+                print(f"[{last_habits_code}] {CODES[last_habits_code]} (habitos): {exc}", flush=True)
+            else:
+                last_habits_code = None
+                mapping = key_map.update_mapping(habits, mapping)
+                habits_ref["value"] = {h.id: h for h in habits}
+
+            try:
+                tasks = task_provider.get_tasks()
+            except ProviderError as exc:
+                _, last_tasks_code = health.classify(exc)
+                print(f"[{last_tasks_code}] {CODES[last_tasks_code]} (tareas): {exc}", flush=True)
+            else:
+                last_tasks_code = None
+                tasks_ref["value"] = {t.id: t for t in tasks}
+                if tasks:
+                    print(f"{len(tasks)} tarea(s) pendientes", flush=True)
+
+            _paint_current_screen()
+
+    def _enter_menu() -> None:
+        with screen_lock:
+            screen.kind, screen.page = screens.ScreenKind.MENU, 0
+            _paint_current_screen()
+
+    def _enter_system() -> None:
+        with screen_lock:
+            screen.kind, screen.page = screens.ScreenKind.SYSTEM, 0
+            _paint_current_screen()
+
+    def _change_page(delta: int) -> None:
+        with screen_lock:
+            screen.page += delta
+            _paint_current_screen()
+
+    def _enter_view(view_id: str) -> None:
+        """Cambia a ``view_id`` en pagina 0 y fuerza un refresco completo
+        (refetch + repintado): entrar en una vista desde el menu siempre
+        pide datos frescos antes de pintarla."""
+        if not _claim(_NAV_SENTINEL):
+            return  # ya hay una entrada a vista en vuelo (doble toque en el menu)
+        try:
+            with screen_lock:
+                screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, view_id, 0
+            refresh_cycle()
+        finally:
+            _release(_NAV_SENTINEL)
+
+    def _on_auto_return_timeout() -> None:
+        """Vuelve a "Hoy" tras ``AUTO_RETURN_SECONDS`` sin pulsaciones fuera
+        de esa vista. Repinta con los datos ya cacheados del ultimo ciclo,
+        sin disparar un fetch nuevo: nunca hace I/O de red desde el hilo del
+        temporizador, el ciclo periodico ya se encarga de mantenerlo fresco.
+        """
+        with screen_lock:
+            at_home = (
+                screen.kind is screens.ScreenKind.VIEW
+                and screen.view_id == screens.DEFAULT_VIEW_ID
+                and screen.page == 0
+            )
+            if at_home:
+                return
+            screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, screens.DEFAULT_VIEW_ID, 0
+            _paint_current_screen()
+
+    def _dispatch_navigation(action: screens.PressAction) -> None:
+        """Ejecuta cualquier ``PressAction`` que no sea de habito o tarea."""
+        if action.kind == "open_menu":
+            _enter_menu()
+        elif action.kind == "open_system":
+            _enter_system()
+        elif action.kind == "select_view":
+            _enter_view(action.payload)
+        elif action.kind == "page_prev":
+            _change_page(-1)
+        elif action.kind == "page_next":
+            _change_page(1)
+        elif action.kind == "shutdown":
+            deck_keys.shutdown_pi()
+
+    auto_return_timer = _AutoReturnTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)
+    auto_return_timer.reset()  # armado desde el arranque
 
     try:
         while True:
             try:
                 refresh_cycle()
             except Exception as exc:
-                # Cualquier fallo que no sea del proveedor de habitos (esos ya se
-                # gestionan dentro de refresh_cycle) se trata como error de
-                # dispositivo: nunca se muestra en tecla, solo a fichero.
+                # Cualquier fallo que no sea del proveedor de habitos/tareas
+                # (esos ya se gestionan dentro de refresh_cycle) se trata
+                # como error de dispositivo: nunca se muestra en tecla, solo
+                # a fichero.
                 health.log_device_error(str(exc))
                 print(f"Error de dispositivo, intentando reconectar: {exc}", flush=True)
                 session.reconnect()
-            refresh_event.wait(timeout=REFRESH_SECONDS)
-            refresh_event.clear()
+            time.sleep(REFRESH_SECONDS)
     finally:
+        auto_return_timer.cancel()
         session.close()
 
 

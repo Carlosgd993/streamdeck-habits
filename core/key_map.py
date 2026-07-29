@@ -1,14 +1,23 @@
-"""Reparto de teclas: el mapeo habito -> tecla persistido en habit_key_map.json
-y el mapeo tarea -> tecla, que es volatil y se recalcula en cada ciclo."""
+"""Reparto de teclas: el mapeo habito -> tecla persistido en habit_key_map.json,
+que usa la vista "Habitos" para que cada habito conserve su tecla entre ciclos.
+
+Tambien vive aqui ``paginate()``, la pieza de paginacion generica que usa
+``core.screens`` para trocear en paginas de ``PAGE_SIZE`` cualquier lista de
+items -- el sobrante que no cupo en el mapeo persistido (antes se descartaba
+sin mas como ``KFUL``), o la lista completa de una vista que no reserva nada
+(p.ej. "Hoy" o "Tareas": ver ``core.screens._flat_page_builder``)."""
 
 from __future__ import annotations
 
 import json
 import os
+from typing import TypeVar
 
 from config import AVAILABLE_KEYS, MAP_FILE
 from core.error_codes import CODES
-from provider.base import Habit, Task
+from provider.base import Habit
+
+T = TypeVar("T")
 
 
 def load_map() -> dict[str, int]:
@@ -74,32 +83,25 @@ def update_mapping(habits: list[Habit], mapping: dict[str, int]) -> dict[str, in
     return mapping
 
 
-def assign_task_keys(tasks: list[Task], habit_mapping: dict[str, int]) -> dict[str, int]:
-    """Reparte entre las tareas las teclas que los habitos dejan libres.
+def paginate(items: list[T], page: int, page_size: int) -> tuple[list[T], int]:
+    """Recorta ``items`` a la pagina pedida, de tamano ``page_size``.
 
-    A diferencia del mapeo de habitos, este **no se persiste ni se reconcilia**:
-    las tareas son volatiles (nacen y se cierran a lo largo del dia), asi que
-    cada ciclo se reparten de cero en el orden en que llegan -- el proveedor ya
-    las devuelve por prioridad. Los habitos tienen preferencia: una tarea nunca
-    ocupa una tecla asignada a un habito, aunque ese habito lleve dias sin usarse.
-
-    Las tareas que no caben simplemente no reciben tecla (codigo ``KFUL``), igual
-    que un habito nuevo cuando el deck esta lleno.
+    ``page`` se satura al rango valido (nunca da un indice fuera de rango,
+    ni siquiera con ``items`` vacio): pedir una pagina negativa devuelve la
+    primera, pedir una mas alla de la ultima devuelve la ultima. Siempre hay
+    al menos una pagina, aunque este vacia, para que la pantalla que llame a
+    esto siempre tenga donde aterrizar.
 
     Args:
-        tasks: Tareas pendientes, en el orden en que deben ocupar las teclas.
-        habit_mapping: Mapeo habito -> tecla vigente, cuyas teclas quedan vetadas.
+        items: Lista completa ya ordenada (el orden decide que sale en cada
+            pagina, esta funcion no reordena nada).
+        page: Indice de pagina pedido, 0-indexado.
+        page_size: Items maximos por pagina.
 
     Returns:
-        Un mapeo nuevo ``task_id -> tecla`` con las tareas que cupieron.
+        Tupla ``(items_de_la_pagina, total_de_paginas)``.
     """
-    used_keys = set(habit_mapping.values())
-    free_keys = [k for k in AVAILABLE_KEYS if k not in used_keys]
-
-    task_keys: dict[str, int] = {}
-    for task in tasks:
-        if not free_keys:
-            print(f"[KFUL] {CODES['KFUL']}: tarea '{task.title}'", flush=True)
-            continue
-        task_keys[task.id] = free_keys.pop(0)
-    return task_keys
+    total_pages = max(1, -(-len(items) // page_size))  # ceil(len/page_size), min 1
+    page = max(0, min(page, total_pages - 1))
+    start = page * page_size
+    return items[start : start + page_size], total_pages

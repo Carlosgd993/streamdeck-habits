@@ -9,9 +9,17 @@ from __future__ import annotations
 COLOR_HABIT_PENDING = (255, 255, 255)  # blanco: hoy no hecho, resalta sobre el resto
 COLOR_HABIT_DONE = (55, 55, 55)        # gris oscuro apagado: hoy hecho, pasa desapercibido
 COLOR_ERROR = (200, 40, 40)            # rojo: fallo al enviar
-COLOR_RESERVED = (25, 25, 25)
 COLOR_EMPTY = (0, 0, 0)
 COLOR_SHUTDOWN = (120, 15, 15)          # rojo oscuro de aviso: accion destructiva (apagar la Pi)
+
+# --- Navegacion (menu, submenu Sistema, paginacion) --------------------------
+COLOR_MENU = (25, 25, 25)              # tecla 0: aspecto fijo en cualquier pantalla
+COLOR_NEUTRAL = (25, 25, 25)           # teclas 5/10 cuando no hace falta paginar
+COLOR_NAV = (40, 90, 150)              # boton generico de menu/submenu (azul, distinto de habitos/tareas)
+COLOR_TEXT_NAV = (255, 255, 255)
+COLOR_ARROW = (55, 55, 90)             # flecha de paginacion activa: distinto de COLOR_NEUTRAL
+COLOR_TEXT_ARROW = (255, 255, 255)     # a proposito, para notar que hay mas paginas
+FONT_SIZE_NAV = 14
 
 COLOR_TEXT_HABIT_PENDING = (0, 0, 0)        # texto negro sobre fondo blanco
 COLOR_TEXT_HABIT_DONE = (110, 110, 110)     # texto tambien atenuado, refuerza el bajo contraste

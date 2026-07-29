@@ -2,24 +2,32 @@
 
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, Literal
 
-from config import KEY_SHUTDOWN, RESERVED_KEYS
+from config import KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV
+from core.screens import MenuEntry, ResolvedPage
 from deck.primitives import solid_tile, text_tile
 from deck.style import (
+    COLOR_ARROW,
     COLOR_EMPTY,
     COLOR_ERROR,
     COLOR_HABIT_DONE,
     COLOR_HABIT_PENDING,
-    COLOR_RESERVED,
+    COLOR_MENU,
+    COLOR_NAV,
+    COLOR_NEUTRAL,
     COLOR_SHUTDOWN,
     COLOR_TASK_BY_PRIORITY,
     COLOR_TASK_SENDING,
+    COLOR_TEXT_ARROW,
     COLOR_TEXT_HABIT_DONE,
     COLOR_TEXT_HABIT_PENDING,
+    COLOR_TEXT_NAV,
     COLOR_TEXT_SHUTDOWN,
     COLOR_TEXT_TASK_BY_PRIORITY,
     FONT_SIZE_HABIT_PENDING,
+    FONT_SIZE_NAV,
     FONT_SIZE_TASK,
 )
 from provider.base import Habit, Task
@@ -98,76 +106,76 @@ def render_checkin_error(deck: Any, key: int, code: str) -> None:
     deck.set_key_image(key, text_tile(deck, COLOR_ERROR, code))
 
 
-def render_reserved(deck: Any, key: int) -> None:
-    """Pinta una tecla reservada con su color gris apagado."""
-    deck.set_key_image(key, solid_tile(deck, COLOR_RESERVED))
-
-
-def render_shutdown(deck: Any, key: int) -> None:
-    """Pinta la tecla de apagado: fondo rojo de aviso, texto y un icono
-    representativo, para distinguirla a simple vista del resto de teclas
-    reservadas (accion destructiva, no un simple placeholder)."""
-    deck.set_key_image(key, text_tile(deck, COLOR_SHUTDOWN, "APAGAR", text_color=COLOR_TEXT_SHUTDOWN, emoji="🔴"))
-
-
 def render_empty(deck: Any, key: int) -> None:
     """Pinta una tecla vacia (negra)."""
     deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
 
 
-def render_reserved_key(deck: Any, key: int) -> None:
-    """Pinta una tecla reservada segun cual sea: ``KEY_SHUTDOWN`` con su aviso
-    propio (``render_shutdown``), el resto con el gris generico
-    (``render_reserved``). Punto unico usado tanto por el pintado inicial de
-    reservadas como por ``render_all``, para que no diverjan entre si."""
-    if key == KEY_SHUTDOWN:
-        render_shutdown(deck, key)
+def render_menu_key(deck: Any, key: int) -> None:
+    """Pinta la tecla de menu (``config.KEY_MENU``, fija en toda pantalla)."""
+    deck.set_key_image(key, text_tile(deck, COLOR_MENU, "Menu", text_color=COLOR_TEXT_NAV, emoji="🧭"))
+
+
+def render_arrow(deck: Any, key: int, direction: Literal["prev", "next"], *, enabled: bool) -> None:
+    """Pinta la flecha de paginacion (5 = anterior, 10 = siguiente).
+
+    El icono se pinta siempre, activa o no la paginacion, para que la tecla
+    se reconozca de un vistazo igual que la de menu; lo que distingue si
+    hace algo es el fondo: ``COLOR_ARROW`` cuando hay mas de una pagina,
+    ``COLOR_NEUTRAL`` (el mismo gris apagado de antes) cuando no.
+    """
+    color = COLOR_ARROW if enabled else COLOR_NEUTRAL
+    emoji = "◀️" if direction == "prev" else "▶️"
+    deck.set_key_image(key, text_tile(deck, color, "", text_color=COLOR_TEXT_ARROW, emoji=emoji))
+
+
+def render_nav_entry(deck: Any, key: int, entry: MenuEntry) -> None:
+    """Pinta un boton de menu o de submenu Sistema.
+
+    El boton "Apagar" usa el rojo de aviso (``COLOR_SHUTDOWN``) para seguir
+    distinguiendose como accion destructiva, igual que antes cuando era una
+    tecla reservada fija; el resto usa el azul generico de navegacion."""
+    if entry.action == "shutdown":
+        color, text_color = COLOR_SHUTDOWN, COLOR_TEXT_SHUTDOWN
     else:
-        render_reserved(deck, key)
+        color, text_color = COLOR_NAV, COLOR_TEXT_NAV
+    image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_NAV, emoji=entry.emoji)
+    deck.set_key_image(key, image)
 
 
-def render_all(
-    deck: Any,
-    mapping: dict[str, int],
-    habits_by_id: dict[str, Habit],
-    task_keys: dict[str, int] | None = None,
-    tasks_by_id: dict[str, Task] | None = None,
-) -> None:
-    """Repinta las 15 teclas segun los mapeos y los datos actuales.
+def render_page(deck: Any, resolved: ResolvedPage) -> None:
+    """Repinta las 15 teclas segun la pagina ya resuelta por ``core.screens``.
 
-    Cada tecla se resuelve en orden: reservada, habito, tarea y, si no es
-    ninguna de las tres, vacia. Los dos mapeos nunca se solapan (las tareas solo
-    reciben teclas que los habitos dejaron libres), asi que el orden no oculta
-    nada: solo fija quien manda si alguna vez lo hicieran.
+    Cada tecla se resuelve en orden: menu (fija), flecha de paginacion o
+    neutra, entrada de menu/sistema, habito, tarea y, si no es nada de eso,
+    vacia. ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo
+    pinta.
 
     Args:
         deck: El dispositivo Stream Deck.
-        mapping: Mapeo habito -> tecla.
-        habits_by_id: Objetos ``Habit`` indexados por id, con su progreso de
-            hoy ya incluido (``habit.current_value``).
-        task_keys: Mapeo tarea -> tecla de este ciclo (volatil, no persistido).
-        tasks_by_id: Objetos ``Task`` pendientes indexados por id.
+        resolved: La pagina activa, resuelta con ``core.screens.resolve_page``.
     """
-    key_to_habit_id = {k: hid for hid, k in mapping.items()}
-    key_to_task_id = {k: tid for tid, k in (task_keys or {}).items()}
-    tasks_by_id = tasks_by_id or {}
     for key in range(deck.key_count()):
-        if key in RESERVED_KEYS:
-            render_reserved_key(deck, key)
-            continue
-        habit_id = key_to_habit_id.get(key)
-        if habit_id is not None:
-            render_habit(deck, key, habits_by_id.get(habit_id))
-            continue
-        task_id = key_to_task_id.get(key)
-        render_task(deck, key, tasks_by_id.get(task_id) if task_id else None)
+        if key == KEY_MENU:
+            render_menu_key(deck, key)
+        elif key in (KEY_PAGE_PREV, KEY_PAGE_NEXT):
+            direction = "prev" if key == KEY_PAGE_PREV else "next"
+            render_arrow(deck, key, direction, enabled=resolved.total_pages > 1)
+        elif key in resolved.key_nav:
+            render_nav_entry(deck, key, resolved.key_nav[key])
+        elif key in resolved.key_habit:
+            render_habit(deck, key, resolved.key_habit[key])
+        elif key in resolved.key_task:
+            render_task(deck, key, resolved.key_task[key])
+        else:
+            render_empty(deck, key)
 
 
-def render_error_all(deck: Any, mapping: dict[str, int], code: str) -> None:
-    """Pinta con el codigo de error corto todas las teclas de un mapeo (se usa
-    cuando falla una lectura, para no dejar informacion potencialmente obsoleta
-    en pantalla). Se le pasa el mapeo de habitos o el de tareas segun cual haya
-    fallado: un fallo leyendo tareas no debe borrar los habitos de la pantalla,
-    ni al reves."""
-    for key in mapping.values():
+def render_error_all(deck: Any, keys: Iterable[int], code: str) -> None:
+    """Pinta con el codigo de error corto todas las ``keys`` dadas (se usa
+    cuando falla una lectura, para no dejar informacion potencialmente
+    obsoleta en pantalla). Se le pasan las teclas de la pagina de habitos o de
+    tareas segun cual haya fallado: un fallo leyendo tareas no debe borrar los
+    habitos de la pantalla, ni al reves."""
+    for key in keys:
         render_checkin_error(deck, key, code)

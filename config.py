@@ -14,9 +14,12 @@ FAIL_LOG = os.path.join(BASE_DIR, "checkin_failures.log")
 DEVICE_LOG = os.path.join(BASE_DIR, "device_errors.log")
 
 RESERVED_KEYS = {0, 5, 10}
-KEY_REFRESH = 0  # tecla reservada que fuerza un refresco inmediato desde el proveedor
-KEY_SHUTDOWN = 10  # tecla reservada que apaga la Raspberry Pi
+KEY_MENU = 0  # tecla reservada que abre el menu principal desde cualquier pantalla
+KEY_PAGE_PREV = 5  # tecla reservada: flecha "<-" cuando la pantalla activa pagina
+KEY_PAGE_NEXT = 10  # tecla reservada: flecha "->" cuando la pantalla activa pagina
 ALL_KEYS = set(range(15))
 AVAILABLE_KEYS = sorted(ALL_KEYS - RESERVED_KEYS)
+PAGE_SIZE = len(AVAILABLE_KEYS)  # items por pagina en cualquier pantalla (menu, sistema o vista)
 
 REFRESH_SECONDS = 900  # 15 min
+AUTO_RETURN_SECONDS = 300  # 5 min sin pulsar fuera de la vista "Hoy" -> vuelve sola a "Hoy"
