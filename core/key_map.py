@@ -1,4 +1,5 @@
-"""Persistencia del mapeo habito -> tecla en habit_key_map.json."""
+"""Reparto de teclas: el mapeo habito -> tecla persistido en habit_key_map.json
+y el mapeo tarea -> tecla, que es volatil y se recalcula en cada ciclo."""
 
 from __future__ import annotations
 
@@ -7,7 +8,7 @@ import os
 
 from config import AVAILABLE_KEYS, MAP_FILE
 from core.error_codes import CODES
-from provider.base import Habit
+from provider.base import Habit, Task
 
 
 def load_map() -> dict[str, int]:
@@ -71,3 +72,34 @@ def update_mapping(habits: list[Habit], mapping: dict[str, int]) -> dict[str, in
     if changed:
         save_map(mapping)
     return mapping
+
+
+def assign_task_keys(tasks: list[Task], habit_mapping: dict[str, int]) -> dict[str, int]:
+    """Reparte entre las tareas las teclas que los habitos dejan libres.
+
+    A diferencia del mapeo de habitos, este **no se persiste ni se reconcilia**:
+    las tareas son volatiles (nacen y se cierran a lo largo del dia), asi que
+    cada ciclo se reparten de cero en el orden en que llegan -- el proveedor ya
+    las devuelve por prioridad. Los habitos tienen preferencia: una tarea nunca
+    ocupa una tecla asignada a un habito, aunque ese habito lleve dias sin usarse.
+
+    Las tareas que no caben simplemente no reciben tecla (codigo ``KFUL``), igual
+    que un habito nuevo cuando el deck esta lleno.
+
+    Args:
+        tasks: Tareas pendientes, en el orden en que deben ocupar las teclas.
+        habit_mapping: Mapeo habito -> tecla vigente, cuyas teclas quedan vetadas.
+
+    Returns:
+        Un mapeo nuevo ``task_id -> tecla`` con las tareas que cupieron.
+    """
+    used_keys = set(habit_mapping.values())
+    free_keys = [k for k in AVAILABLE_KEYS if k not in used_keys]
+
+    task_keys: dict[str, int] = {}
+    for task in tasks:
+        if not free_keys:
+            print(f"[KFUL] {CODES['KFUL']}: tarea '{task.title}'", flush=True)
+            continue
+        task_keys[task.id] = free_keys.pop(0)
+    return task_keys

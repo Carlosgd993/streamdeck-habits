@@ -1,20 +1,26 @@
-"""Puerto abstracto del proveedor de habitos, agnostico de la API concreta.
+"""Puertos abstractos de los proveedores de datos, agnosticos de la API concreta.
 
 Este modulo define TODO lo que el resto del proyecto (orquestador, dominio,
-deck) necesita saber sobre "la API de habitos", sin acoplarse a ningun backend
-en particular:
+deck) necesita saber sobre "la API", sin acoplarse a ningun backend en
+particular:
 
-- ``HabitProvider``: la interfaz (puerto) que cualquier backend debe implementar.
-- Jerarquia de excepciones agnostica (``ProviderError`` y subclases).
-- El modelo de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``),
-  construido desde campos ya parseados -- nunca desde el JSON crudo de un backend.
+- ``HabitProvider``: el puerto de habitos que cualquier backend debe implementar.
+- ``TaskProvider``: el puerto de tareas, deliberadamente **separado** del
+  anterior: un backend de habitos no tiene por que servir tambien tareas, y al
+  reves. Un adaptador concreto puede implementar los dos (es lo que hace
+  ``provider/supabase.py``, porque ambos salen del mismo contrato).
+- Jerarquia de excepciones agnostica (``ProviderError`` y subclases), compartida
+  por los dos puertos.
+- Los modelos de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``)
+  y ``Task``, construidos desde campos ya parseados -- nunca desde el JSON crudo
+  de un backend.
 
-La logica de negocio (que dia es hoy, cual es el siguiente valor de un habito)
-vive en la base de datos; este puerto y sus adaptadores son un renderizador
-tonto sobre lo que la base ya calculo.
+La logica de negocio (que dia es hoy, cual es el siguiente valor de un habito,
+que tareas estan pendientes) vive en la base de datos; estos puertos y sus
+adaptadores son un renderizador tonto sobre lo que la base ya calculo.
 
 Para sustituir de backend basta con escribir un adaptador nuevo que implemente
-``HabitProvider`` devolviendo objetos ``Habit`` de este modulo y traduciendo sus
+el puerto correspondiente devolviendo objetos de este modulo y traduciendo sus
 fallos a las excepciones ``Provider*`` de aqui; el resto del proyecto no
 necesita cambiar (ver ``provider/supabase.py`` como ejemplo de adaptador
 concreto).
@@ -141,6 +147,62 @@ def _format_number(value: float) -> str:
     return str(int(value)) if value == int(value) else f"{value:g}"
 
 
+TITLE_MAX_CHARS = 32
+"""Longitud maxima del titulo de una tarea en una tecla.
+
+A partir de ahi el texto ya no cabe (el pintado envuelve en lineas cortas) y lo
+que sobra se recorta con una elipsis en vez de desbordarse en silencio."""
+
+
+class Task:
+    """Ocurrencia de tarea pendiente, agnostica del backend que la origino.
+
+    A diferencia de ``Habit`` no es abstracta ni tiene subtipos: una tarea solo
+    esta pendiente o deja de existir, no hay un estado "hecha" que pintar.
+
+    Attributes:
+        id: Identificador unico de la ocurrencia en el proveedor. Es el que hay
+            que enviar para cerrarla.
+        title: Titulo legible de la tarea, ya sin el emoji si lo llevaba.
+        emoji: Emoji del titulo para usar como icono, o cadena vacia. Las tareas
+            no tienen campo de icono propio (al contrario que los habitos), pero
+            es habitual escribirlo dentro del titulo: el adaptador lo separa
+            para que se pinte como icono a color en vez de como un cuadro vacio
+            con la fuente de texto.
+        priority: Prioridad declarada. Los valores no son contiguos:
+            ``0`` (ninguna), ``1`` (baja), ``3`` (media), ``5`` (alta). Decide
+            el color de la tecla.
+        overdue: Si la tarea ya vencio y arrastra de un dia anterior.
+        due_day: Dia de vencimiento en formato ``YYYY-MM-DD``, ya normalizado a
+            la zona horaria correcta por el proveedor. Vacio si no lo trae.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        title: str,
+        emoji: str = "",
+        priority: int = 0,
+        overdue: bool = False,
+        due_day: str = "",
+    ) -> None:
+        self.id = id
+        self.title = title
+        self.emoji = emoji
+        self.priority = priority
+        self.overdue = overdue
+        self.due_day = due_day
+
+    def display_label(self) -> str:
+        """Texto a mostrar en la tecla: el titulo, recortado si no cabe.
+
+        El emoji va aparte (ver ``emoji``), como en los habitos.
+        """
+        if len(self.title) <= TITLE_MAX_CHARS:
+            return self.title
+        return self.title[: TITLE_MAX_CHARS - 1].rstrip() + "…"
+
+
 class HabitProvider(ABC):
     """Puerto: contrato que debe implementar cualquier backend de habitos.
 
@@ -173,6 +235,48 @@ class HabitProvider(ABC):
 
         Returns:
             El nuevo valor TOTAL acumulado hoy.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+
+class TaskProvider(ABC):
+    """Puerto: contrato que debe implementar cualquier backend de tareas.
+
+    Separado a proposito de ``HabitProvider``: son dos capacidades distintas y
+    un adaptador puede ofrecer una sin la otra. Comparten, eso si, la misma
+    jerarquia de excepciones ``Provider*``, de modo que ``core.health.classify``
+    y el pintado de errores en tecla sirven igual para ambos.
+    """
+
+    @abstractmethod
+    def get_tasks(self) -> list[Task]:
+        """Devuelve las tareas pendientes que tocan hoy, ya ordenadas.
+
+        El orden lo decide el proveedor (el llamador reparte las teclas en el
+        orden en que las recibe), y la lista solo contiene tareas pendientes:
+        una tarea cerrada simplemente deja de aparecer.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def complete_task(self, task: Task) -> None:
+        """Marca ``task`` como completada.
+
+        No devuelve nada: la tarea deja de estar pendiente, no pasa a un estado
+        que el cliente deba pintar. Es idempotente, asi que reintentar es
+        seguro. Que se vuelva a abrir el siguiente ciclo (tareas periodicas) lo
+        decide el proveedor, no el llamador.
+
+        Args:
+            task: La tarea a cerrar.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.

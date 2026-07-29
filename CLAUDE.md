@@ -4,34 +4,36 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Qué es esto
 
-Un daemon Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos. Corre 24/7 como servicio systemd en una Raspberry Pi 3, sondea la base de datos vía PostgREST cada 15 minutos, pinta cada tecla en blanco (pendiente) o gris oscuro (hecho hoy), y registra un checkin al pulsarla.
+Un daemon Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos y tareas. Corre 24/7 como servicio systemd en una Raspberry Pi 3, sondea la base de datos vía PostgREST cada 15 minutos y pinta cada tecla: los **hábitos** en blanco (pendiente) o gris oscuro (hecho hoy), registrando un checkin al pulsarlos; las **tareas** pendientes en el color de su prioridad, cerrándose al pulsarlas.
 
-La base de datos vive en el repo hermano `../habits-core` (repositorio Git independiente). Este daemon es deliberadamente **tonto**: no calcula qué día es hoy, ni el siguiente valor de un hábito, ni si algo está bloqueado. Todo eso lo decide la base. Ver [../CLAUDE.md](../CLAUDE.md) para el contexto que atraviesa ambos repos.
+La base de datos vive en el repo hermano `../habits-core` (repositorio Git independiente). Este daemon es deliberadamente **tonto**: no calcula qué día es hoy, ni el siguiente valor de un hábito, ni qué tareas tocan, ni si algo está bloqueado. Todo eso lo decide la base. Ver [../CLAUDE.md](../CLAUDE.md) para el contexto que atraviesa ambos repos.
 
 **No hay tests automatizados ni lockfile de dependencias, y nada de esto se ejecuta en la máquina de desarrollo**: no tiene Python usable (solo el stub de la Microsoft Store) ni el hardware. Todo se verifica en la Pi por SSH — ver [Operar la Raspberry Pi](#operar-la-raspberry-pi).
 
 ## Mapa del código
 
-Son ~1.100 líneas en total: leer un módulo entero es barato, la duda suele ser cuál.
+Son ~1.500 líneas en total: leer un módulo entero es barato, la duda suele ser cuál.
 
 ```
-orchestrator.py   170  Punto de entrada (ExecStart de systemd). Bucle y callbacks de tecla.
+orchestrator.py   269  Punto de entrada (ExecStart de systemd). Bucle y callbacks de tecla.
 config.py          22  Rutas, teclas reservadas, intervalo de refresco.
 
-provider/              LA API, aislada tras un puerto. No sabe nada del deck.
-  base.py         181  El puerto: HabitProvider, Habit/BooleanHabit/RealHabit, excepciones.
-  supabase.py     173  El adaptador: PostgREST, build_habit(). Único sitio con detalles de Supabase.
+provider/              LA API, aislada tras dos puertos. No sabe nada del deck.
+  base.py         269  Los puertos: HabitProvider y TaskProvider; Habit/BooleanHabit/RealHabit,
+                       Task, excepciones.
+  supabase.py     266  El adaptador (implementa ambos): PostgREST, build_habit(), build_task().
+                       Único sitio con detalles de Supabase.
 
 deck/                  EL HARDWARE. No sabe nada del proveedor de datos.
   session.py       76  Abrir/cerrar/reconectar el dispositivo, brillo.
-  renderer.py     103  Pintado de alto nivel: render_habit, render_all, render_error_all…
+  renderer.py     170  Pintado de alto nivel: render_habit, render_task, render_all…
   primitives.py   128  Pillow de bajo nivel: solid_tile, text_tile, fuente de emoji.
-  keys.py          53  Teclas reservadas y qué hace cada una.
-  style.py         19  Colores y tamaños de fuente. Nada más.
+  keys.py          50  Teclas reservadas y qué hace cada una.
+  style.py         42  Colores y tamaños de fuente. Nada más.
 
 core/                  DOMINIO. Agnóstico de ambos lados.
-  key_map.py       73  Asignación persistente hábito → tecla.
-  health.py        47  Clasificar un fallo: ¿tecla en rojo o solo log?
+  key_map.py      105  Asignación persistente hábito → tecla y volátil tarea → tecla.
+  health.py        56  Clasificar un fallo: ¿tecla en rojo o solo log?
   error_codes.py   14  AUTH / NET / API / KFUL.
   emoji.py         40  extract_emoji(): separa el primer emoji de una cadena.
 
@@ -43,76 +45,97 @@ scripts/               Dos smoke tests de hardware. Requieren un deck conectado.
 | Si vas a cambiar… | Toca | Ojo con |
 |---|---|---|
 | El aspecto de una tecla (color, tamaño) | `deck/style.py` | Nada más; el resto solo consume esas constantes |
-| Qué texto o icono muestra un hábito | `provider/base.py` → `display_label()` | Es del dominio, no del pintado |
+| Los colores de prioridad de las tareas | `deck/style.py` → `COLOR_TASK_BY_PRIORITY` | Solo existen las prioridades 0/1/3/5; el resto cae a la 0 |
+| Qué texto o icono muestra un hábito o una tarea | `provider/base.py` → `display_label()` | Es del dominio, no del pintado |
 | Qué hace una tecla reservada | `config.py` + `deck/keys.py` | Ver [Teclas reservadas](#teclas-reservadas) |
 | Cómo se habla con la base | `provider/supabase.py` **y solo ahí** | Si tocas otro sitio, has roto el aislamiento |
-| Qué campos trae un hábito | `provider/supabase.py::build_habit` + `provider/base.py` | La columna debe existir ya en la vista de `habits-core` |
+| Qué campos trae un hábito o una tarea | `provider/supabase.py::build_habit`/`build_task` + `provider/base.py` | La columna debe existir ya en la vista de `habits-core` |
 | Cuándo se refresca o qué pasa al pulsar | `orchestrator.py` | Ver [El bucle principal](#el-bucle-principal) |
+| Cómo se reparten las teclas | `core/key_map.py` | Los hábitos persisten su tecla, las tareas no. Ver [Reparto de teclas](#reparto-de-teclas) |
 | Qué se muestra al fallar algo | `core/health.py` + `core/error_codes.py` | Los fallos de dispositivo nunca van a tecla |
-| Añadir una capacidad nueva (tareas, undo…) | **Primero** el contrato en `../habits-core` | El daemon no inventa lógica |
+| Añadir una capacidad nueva (undo, omitir…) | **Primero** el contrato en `../habits-core` | El daemon no inventa lógica |
 
 ## Arquitectura
 
 Tres capas por carpeta, con una regla de dependencia estricta: **`provider/` no sabe nada del Stream Deck; `deck/` no sabe nada del proveedor de datos; `core/` y `orchestrator.py` orquestan ambos hablando solo con abstracciones.** `orchestrator.py` y `config.py` viven en la raíz porque los comparten las tres capas (el primero es además el `ExecStart` de systemd).
 
-El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` define el puerto abstracto y Supabase es solo un adaptador detrás de él. Cambiar de backend = escribir otro `HabitProvider` y tocar **una línea** en `orchestrator.main()` (`SupabaseProvider()`); ni `core/`, ni `deck/`, ni el resto del orquestador cambian.
+El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` define los puertos abstractos y Supabase es solo un adaptador detrás de ellos. Cambiar de backend = escribir otro `HabitProvider`/`TaskProvider` y tocar **una línea** en `orchestrator.main()` (`SupabaseProvider()`); ni `core/`, ni `deck/`, ni el resto del orquestador cambian.
 
-### `provider/` — la API tras un puerto
+### `provider/` — la API tras dos puertos
 
-- **`base.py`** — el **puerto**. Contiene todo lo que el resto del proyecto necesita saber de "la API", sin acoplarse a ningún backend:
+- **`base.py`** — los **puertos**. Contiene todo lo que el resto del proyecto necesita saber de "la API", sin acoplarse a ningún backend:
   - **`HabitProvider`** (ABC): `get_habits() -> list[Habit]` (ya trae el progreso de hoy) y `step(habit) -> float` (avanza un paso, devuelve el nuevo total).
-  - **Excepciones agnósticas**: `ProviderError` → `ProviderAuthError`, `ProviderNetworkError`, `ProviderDataError`.
+  - **`TaskProvider`** (ABC): `get_tasks() -> list[Task]` (solo pendientes, **ya ordenadas** por el proveedor) y `complete_task(task) -> None`. Está **separado a propósito** de `HabitProvider`: son dos capacidades distintas y un backend puede ofrecer una sin la otra. `SupabaseProvider` implementa las dos porque salen del mismo contrato.
+  - **Excepciones agnósticas**: `ProviderError` → `ProviderAuthError`, `ProviderNetworkError`, `ProviderDataError`. Compartidas por ambos puertos, así que `core.health` y el pintado de errores sirven igual para los dos.
   - **`Habit`** (ABC), construido desde campos ya parseados, **no** desde JSON crudo: `id`, `name`, `emoji`, `order` (pista para asignar teclas), `current_value` (progreso de hoy, **puede superar `goal`** — 10/8 es válido); propiedades `goal` (default `1.0`) e `is_done` (`current_value >= goal`, que **solo decide el color de la tecla, no bloquea nada**); `display_label()` abstracto. `BooleanHabit` → muestra el nombre. `RealHabit` (cuantificables, con `goal`/`step`/`unit`) → muestra solo el progreso (`"3/8 Cups"`, o `"10/8 Cups"` por encima del objetivo, sin decimales feos en enteros).
+  - **`Task`** — concreta y sin subtipos, al revés que `Habit`: una tarea está pendiente o deja de existir, no tiene estado "hecha" que pintar. Campos: `id` (el de la **ocurrencia**, es lo que se envía para cerrarla), `title`, `priority` (solo `0`/`1`/`3`/`5`, no son contiguos), `overdue` (arrastra de un día anterior), `due_day`. `display_label()` devuelve el título recortado a `TITLE_MAX_CHARS` con elipsis. **No tiene emoji**: las tareas no guardan icono, se distinguen por el color de su prioridad.
 - **`supabase.py`** — el **adaptador**; concentra todo lo específico del backend:
   - Lee `SUPABASE_URL` y `SUPABASE_PUBLISHABLE_KEY` del `.env`; `__init__` lanza `ProviderAuthError` si falta alguna. Base PostgREST `<url>/rest/v1`, cabeceras `apikey` + `Authorization: Bearer`.
   - `get_habits`: **una sola petición** a `v_today_habits` (la vista ya filtra activos y trae el progreso), con `order=sort_order` porque la vista no ordena por sí sola.
   - `step`: `POST /rpc/habit_step` con `{"p_habit_id": habit.id}`. Atómico en la base (Boolean → salta a `goal`; Real → suma `step` sin tope). Devuelve el nuevo total.
+  - `get_tasks`: **una sola petición** a `v_today_tasks`, que ya excluye completadas y omitidas y arrastra las vencidas. Tampoco ordena por sí sola: el orden va explícito en `_TASKS_ORDER` (`priority.desc,due_date.asc`).
+  - `complete_task`: `POST /rpc/complete_task` con `{"p_task_id": task.id}`. La función devuelve `void`, así que responde **204 sin cuerpo**: no hay JSON que parsear y el status es toda la confirmación. Es idempotente en la base, reintentar es seguro.
   - Traduce `RequestException` / 401-403 / no-2xx / JSON inválido a las excepciones `Provider*`. Un 401/403 puede ser clave inválida **o** un `GRANT` que falta en el contrato; el mensaje lo insinúa.
-  - `build_habit(data)`: parsea `icon_res` (`"txt_<emoji>"` → emoji vía `core.emoji.extract_emoji`; los predefinidos tipo `"habit_water"` dan emoji vacío), enruta `type == "Real"` a `RealHabit` y todo lo demás (incluido `"Boolean"` y valores desconocidos) a `BooleanHabit`, toma `order` de `sort_order`.
-  - Las tablas (`habits`, `habit_checkins`, …) están cerradas con RLS y no son accesibles con la clave publishable: este adaptador nunca las menciona. El contrato está en `../habits-core/docs/contrato.md`; hay un resumen orientado a cliente en `.claude/tables-doc.md`, el porqué de la regla en `.claude/estructura-bd.md` y peticiones de ejemplo en `.claude/supabase.http`.
+  - `build_habit(data)`: parsea `icon_res` (`"txt_<emoji>"` → emoji vía `core.emoji.extract_emoji`; los predefinidos tipo `"habit_water"` dan emoji vacío), enruta `type == "Real"` a `RealHabit` y todo lo demás (incluido `"Boolean"` y valores desconocidos) a `BooleanHabit`, toma `order` de `sort_order`. `build_task(data)` es el equivalente para tareas, sin ramas: la vista solo devuelve pendientes.
+  - Las tablas (`habits`, `habit_checkins`, `tasks`, …) están cerradas con RLS y no son accesibles con la clave publishable: este adaptador nunca las menciona. El contrato está en `../habits-core/docs/contrato.md`; hay un resumen orientado a cliente en `.claude/tables-doc.md`, el porqué de la regla en `.claude/estructura-bd.md` y peticiones de ejemplo en `.claude/supabase.http`.
 
 ### `deck/` — hardware y pintado
 
 - **`session.py`** — `DeckSession`: apertura (30 reintentos cada 2s; `sys.exit(1)` si no aparece), cierre, `reconnect()` y brillo (`BRIGHTNESS = 60`). `reconnect()` solo se usa tras un fallo en marcha, nunca en el arranque inicial.
-- **`renderer.py`** — alto nivel, sobre una tecla o el deck completo: `render_habit` (usa `display_label()`, `emoji` e `is_done` para elegir blanco/pendiente o gris/hecho — solo color, sin bloquear nada), `render_checkin_error`, `render_reserved`, `render_shutdown` (fondo rojo de aviso, "APAGAR" e icono 🔴, para distinguirla de una reservada normal), `render_empty`, `render_all` (repinta las 15), `render_error_all` (pinta el código de error en todas las teclas mapeadas cuando falla una lectura, para no dejar información obsoleta en pantalla).
+- **`renderer.py`** — alto nivel, sobre una tecla o el deck completo: `render_habit` (usa `display_label()`, `emoji` e `is_done` para elegir blanco/pendiente o gris/hecho — solo color, sin bloquear nada), `render_task` (color de fondo según `priority`; una prioridad desconocida cae a la 0 en vez de fallar), `render_task_sending` (verde vivo + ✔, el acuse de recibo de la pulsación), `render_checkin_error`, `render_reserved`, `render_shutdown` (fondo rojo de aviso, "APAGAR" e icono 🔴, para distinguirla de una reservada normal), `render_empty`, `render_all` (repinta las 15 resolviendo cada tecla como reservada → hábito → tarea → vacía), `render_error_all` (pinta el código de error en las teclas de **un** mapeo, el de hábitos o el de tareas según cuál haya fallado, para no dejar información obsoleta en pantalla).
 - **`primitives.py`** — Pillow de bajo nivel vía `PILHelper`: `solid_tile` (color plano) y `text_tile` (texto envuelto/centrado más un `emoji` opcional como icono a color en la mitad superior, o la tecla entera si `text` es vacío). El emoji usa `_emoji_font()` (`NotoColorEmoji.ttf`, probando los tamaños de "strike" conocidos porque es una fuente CBDT/CBLC de mapa de bits) y `_emoji_glyph()` (`embedded_color=True`, reescalado).
 - **`keys.py`** — ver [Teclas reservadas](#teclas-reservadas).
-- **`style.py`** — todos los colores (`COLOR_*`) y tamaños de fuente (`FONT_SIZE_*`). Es la capa de pintado: no sabe de hábitos ni del proveedor.
+- **`style.py`** — todos los colores (`COLOR_*`) y tamaños de fuente (`FONT_SIZE_*`). Es la capa de pintado: no sabe de hábitos ni del proveedor. Incluye `COLOR_TASK_BY_PRIORITY` / `COLOR_TEXT_TASK_BY_PRIORITY` (dicts indexados por las prioridades `0`/`1`/`3`/`5`) y `COLOR_TASK_SENDING`. Ojo: el rojo de prioridad 5 es **distinto** de `COLOR_ERROR` a propósito, para que una tarea urgente no se confunda con una tecla en error; y una tarea de prioridad 0 es blanca, igual que un hábito pendiente.
 
 ### `core/` — dominio agnóstico
 
-- **`key_map.py`** — persiste el mapeo hábito→tecla en `habit_key_map.json`. Recibe `list[Habit]`, no JSON. Los hábitos nuevos reclaman la tecla libre más baja en orden `(order, id)` y **nunca se reasignan**; los que desaparecen liberan su tecla; sin teclas libres se registra `KFUL` y se omite. **`update_mapping` solo debe llamarse tras un `get_habits()` exitoso** — llamarlo tras un fallo liberaría las teclas de hábitos que siguen existiendo.
-- **`health.py`** — `classify(exc)` decide el destino de un fallo: `"key"` (excepciones `Provider*` → `AUTH`/`NET`/`API`, se pintan en rojo) o `"file"` (fallos del propio Stream Deck, solo a fichero). `log_failure` → `checkin_failures.log` (JSON-lines); `log_device_error` → `device_errors.log` (texto plano).
+- **`key_map.py`** — dos repartos con reglas opuestas:
+  - `update_mapping` persiste el mapeo hábito→tecla en `habit_key_map.json`. Recibe `list[Habit]`, no JSON. Los hábitos nuevos reclaman la tecla libre más baja en orden `(order, id)` y **nunca se reasignan**; los que desaparecen liberan su tecla; sin teclas libres se registra `KFUL` y se omite. **Solo debe llamarse tras un `get_habits()` exitoso** — llamarlo tras un fallo liberaría las teclas de hábitos que siguen existiendo.
+  - `assign_task_keys` reparte entre las tareas las teclas que los hábitos dejan libres. **No persiste nada y no reconcilia**: las tareas son volátiles (nacen y se cierran durante el día), así que cada ciclo se reparten de cero en el orden en que llegan del proveedor. Los hábitos siempre tienen preferencia. Ver [Reparto de teclas](#reparto-de-teclas).
+- **`health.py`** — `classify(exc)` decide el destino de un fallo: `"key"` (excepciones `Provider*` → `AUTH`/`NET`/`API`, se pintan en rojo) o `"file"` (fallos del propio Stream Deck, solo a fichero, sin código). `log_failure(item_id, detail, kind)` → `checkin_failures.log` (JSON-lines; `kind` es `"habit"` o `"task"`); `log_device_error` → `device_errors.log` (texto plano).
 - **`error_codes.py`** — `CODES`: los cuatro códigos cortos que caben en una tecla.
 - **`emoji.py`** — `extract_emoji(text) -> (emoji, resto)`, cubriendo variation selectors y ZWJ. Sin dependencias de Pillow ni de ningún proveedor, para poder usarse desde cualquier adaptador.
 
 ## El bucle principal
 
-`main()` construye el proveedor (`sys.exit(1)` si falla), abre la sesión del deck, carga el mapeo y entra en un bucle infinito de `refresh_cycle()` separados por `refresh_event.wait(timeout=REFRESH_SECONDS)` (900s).
+`main()` construye el proveedor (`sys.exit(1)` si falla), abre la sesión del deck, carga el mapeo y entra en un bucle infinito de `refresh_cycle()` separados por `refresh_event.wait(timeout=REFRESH_SECONDS)` (900s). El mismo `SupabaseProvider` se usa por sus dos puertos (`habit_provider` / `task_provider`), solo para dejar explícito qué capacidad usa cada llamada.
 
 **Cada ciclo (`refresh_cycle`):**
 
 1. Pinta las teclas reservadas.
-2. `provider.get_habits()` — una sola petición; ya trae el progreso de hoy en `current_value`, no hay ninguna fecha que decidir en el cliente. Si lanza `ProviderError`: pinta el código en todas las teclas mapeadas y **sale del ciclo sin tocar el mapeo**.
-3. `key_map.update_mapping()` → `renderer.render_all()`.
-4. **Re-registra** `deck.set_key_callback(...)` con un closure fresco sobre el mapeo actual.
+2. `get_habits()` — una sola petición; ya trae el progreso de hoy en `current_value`, no hay ninguna fecha que decidir en el cliente. Éxito → `key_map.update_mapping()`.
+3. `get_tasks()` — otra sola petición; solo pendientes y ya ordenadas. Éxito → `key_map.assign_task_keys()` con el mapeo de hábitos **ya reconciliado**, porque las teclas de tarea salen de las que los hábitos dejan libres.
+4. `renderer.render_all()` con ambos mapeos.
+5. Los códigos de error de las lecturas que fallaron se pintan **después** de `render_all`, para que tapen los datos viejos en vez de que el repintado los borre a ellos.
+6. **Re-registra** `deck.set_key_callback(...)` con un closure fresco sobre los mapeos actuales.
 
-El estado que ve el callback es un wrapper dict de una entrada (`habits_ref = {"value": {id: Habit}}`) precisamente para que el closure observe las actualizaciones de ciclos posteriores. Aun así, **el mapeo tecla→hábito solo es tan reciente como el último ciclo.**
+**Las dos lecturas fallan por separado.** Un fallo leyendo tareas pinta su código solo en las teclas de tarea y deja los hábitos intactos, y al revés: la lectura que falla no toca su mapeo ni sus datos (se conservan los del ciclo anterior), y desde luego no toca los de la otra. El ciclo **siempre** llega a `render_all` y a re-registrar el callback, de modo que lo pintado y lo que hace cada tecla nunca se desincronizan.
+
+El estado que ve el callback son wrappers dict de una entrada (`habits_ref`/`tasks_ref = {"value": {id: obj}}`) precisamente para que el closure observe las actualizaciones de ciclos posteriores. Aun así, **el mapeo tecla→elemento solo es tan reciente como el último ciclo.**
 
 **Al pulsar una tecla (`make_key_callback`):**
 
 1. Si es reservada → `deck.keys.handle_key_press` y fin.
-2. `pending_requests` + `state_lock` descartan una segunda pulsación del mismo hábito mientras hay una en vuelo. Si `habit is None` (caso defensivo entre ciclos), se ignora.
-3. `provider.step(habit)` — **sin comprobar si ya alcanzó el objetivo**: la tecla nunca se bloquea, es la base quien decide el nuevo valor.
-4. Éxito → `habit.current_value = new_value` (mutación directa del objeto compartido con `habits_ref`) y repintado inmediato, optimista, sin refetch.
+2. Se resuelve la tecla a un hábito o a una tarea (nunca a ambos: los mapeos no se solapan). `pending_requests` + `state_lock` (vía `_claim`/`_release`) descartan una segunda pulsación del mismo elemento mientras hay una en vuelo.
+3. **Hábito** → `provider.step(habit)`, **sin comprobar si ya alcanzó el objetivo**: la tecla nunca se bloquea, es la base quien decide el nuevo valor. Éxito → `habit.current_value = new_value` (mutación directa del objeto compartido con `habits_ref`) y repintado inmediato, optimista, sin refetch.
+4. **Tarea** → primero `render_task_sending` (verde vivo + ✔, acuse de recibo inmediato), luego `complete_task(task)`. Solo cuando la base **confirma** (204), la tecla se apaga y la tarea sale de `tasks_ref` para que otra pulsación no reintente cerrarla. Las demás teclas **no se mueven**: las tareas restantes se recolocan en el siguiente ciclo, nunca bajo el dedo.
 5. `ProviderError` → tecla en rojo con el código + entrada en `checkin_failures.log`.
-6. Cualquier otra excepción → se trata como fallo de dispositivo: **nunca se muestra en tecla**, se registra en `device_errors.log` y dispara `session.reconnect()`.
+6. Cualquier otra excepción → se trata como fallo de dispositivo: **nunca se muestra en tecla**, se registra en `device_errors.log` y dispara `session.reconnect()`. Los repintados van envueltos en `_safe_render` justo por esto.
 
 Pulsar la tecla de refresco activa el `Event` desde el hilo de callbacks y despierta el bucle para un ciclo inmediato: el proveedor sigue siendo la única fuente de verdad, solo cambia *cuándo* se le pregunta. `Event.set()` es idempotente.
 
-## Teclas reservadas
+## Reparto de teclas
 
-De las 15 teclas, `RESERVED_KEYS = {0, 5, 10}` no se asignan a hábitos; quedan 12 para hábitos (`AVAILABLE_KEYS`).
+De las 15 teclas, `RESERVED_KEYS = {0, 5, 10}` no se asignan a nada; quedan 12 (`AVAILABLE_KEYS`) que **comparten hábitos y tareas**, con reglas deliberadamente distintas:
+
+- **Los hábitos van primero** y su tecla es estable: se persiste en `habit_key_map.json` y no se reasigna nunca mientras el hábito exista.
+- **Las tareas ocupan lo que quede**, de menor a mayor índice, recalculado en cada ciclo. Una tarea nunca pisa la tecla de un hábito. Lo que no cabe se registra como `KFUL` y no se pinta.
+
+Con los 5 hábitos actuales eso deja los hábitos en las teclas 1-4 y 6, y las tareas a partir de la 7.
+
+Las tareas se pintan con el color de su prioridad (`deck/style.py`): **0 blanca, 1 verde, 3 amarilla, 5 roja**. No llevan icono, así que una tarea de prioridad 0 se ve igual que un hábito booleano pendiente — es una consecuencia asumida del esquema de color elegido, no un descuido.
+
+## Teclas reservadas
 
 | Tecla | Constante | Acción |
 |---|---|---|
@@ -227,7 +250,7 @@ ssh admin@RP3-MotoComm-1.local "bash /opt/streamdeck-habits/deploy/deploy.sh"
 
 - `.env` — credenciales de **ambos** proyectos (`SUPABASE_URL`/`SUPABASE_PUBLISHABLE_KEY` para main, `_TEST` para test) más `SUPABASE_ENV` para elegir cuál usa `SupabaseProvider.__init__` (vía `python-dotenv`) — ver [Cambiar de proyecto Supabase](#cambiar-de-proyecto-supabase-main--test)
 - `habit_key_map.json` — mapeo `habit_id -> key_index`, se crea y actualiza solo
-- `checkin_failures.log` — JSON-lines de checkins fallidos hacia Supabase (errores de API, tecla en rojo)
+- `checkin_failures.log` — JSON-lines de escrituras fallidas hacia Supabase, checkins de hábito y cierres de tarea (errores de API, tecla en rojo); el campo `kind` distingue `"habit"` de `"task"`
 - `device_errors.log` — texto plano de fallos del propio dispositivo (nunca se muestran en tecla)
 
 ## Ejecutar y dependencias

@@ -1,14 +1,16 @@
-"""Adaptador de Supabase: implementa el puerto ``HabitProvider`` contra el
-contrato publico de la base de datos, expuesto via PostgREST (``<url>/rest/v1``).
+"""Adaptador de Supabase: implementa los puertos ``HabitProvider`` y
+``TaskProvider`` contra el contrato publico de la base de datos, expuesto via
+PostgREST (``<url>/rest/v1``).
 
 Concentra TODO lo especifico de Supabase/PostgREST, aislado del resto del
 proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
-- Las llamadas HTTP (``requests``) contra la vista ``v_today_habits`` y la
-  funcion ``rpc/habit_step`` del contrato.
+- Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits`` y
+  ``v_today_tasks`` y las funciones ``rpc/habit_step`` y ``rpc/complete_task``
+  del contrato.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
-  (``provider.base.Habit`` y subtipos).
+  (``provider.base.Habit`` y subtipos, ``provider.base.Task``).
 - La traduccion de cualquier fallo (``requests``, status, JSON) a la jerarquia
   de excepciones agnostica ``Provider*Error``.
 
@@ -36,6 +38,8 @@ from provider.base import (
     ProviderDataError,
     ProviderNetworkError,
     RealHabit,
+    Task,
+    TaskProvider,
 )
 
 URL_ENV_VAR = "SUPABASE_URL"
@@ -43,6 +47,7 @@ KEY_ENV_VAR = "SUPABASE_PUBLISHABLE_KEY"
 ACTIVE_ENV_VAR = "SUPABASE_ENV"
 DEFAULT_ACTIVE_ENV = "main"
 _ICON_TEXT_PREFIX = "txt_"  # prefijo de icon_res cuando el icono elegido es un emoji
+_TASKS_ORDER = "priority.desc,due_date.asc"  # v_today_tasks no ordena por si sola: lo mas urgente primero
 
 
 def _load_config() -> tuple[str | None, str | None]:
@@ -108,8 +113,41 @@ def build_habit(data: dict[str, Any]) -> Habit:
     return BooleanHabit(id=id, name=name, emoji=emoji, order=order, current_value=current_value)
 
 
-class SupabaseProvider(HabitProvider):
-    """Adaptador del puerto ``HabitProvider`` para Supabase via PostgREST."""
+def build_task(data: dict[str, Any]) -> Task:
+    """Mapea una fila cruda de ``v_today_tasks`` al modelo de dominio.
+
+    La vista solo devuelve tareas pendientes, asi que no hay ningun estado que
+    interpretar: basta con parsear los campos que se pintan en la tecla.
+
+    Las tareas no tienen columna de icono, pero es habitual escribir el emoji
+    dentro del propio titulo (``"Bano 🚽"``): se separa aqui para pintarlo como
+    icono a color, igual que el ``icon_res`` de un habito.
+
+    Args:
+        data: Fila de la tarea devuelta por la vista.
+
+    Returns:
+        La instancia de ``Task`` correspondiente.
+    """
+    emoji, title = extract_emoji(str(data["title"]))
+    return Task(
+        id=data["id"],
+        title=title,
+        emoji=emoji,
+        priority=int(data.get("priority") or 0),
+        overdue=bool(data.get("overdue")),
+        due_day=str(data.get("due_day") or ""),
+    )
+
+
+class SupabaseProvider(HabitProvider, TaskProvider):
+    """Adaptador de los puertos ``HabitProvider`` y ``TaskProvider`` para
+    Supabase via PostgREST.
+
+    Implementa los dos porque habitos y tareas salen del mismo contrato y de la
+    misma conexion; el resto del proyecto sigue dependiendo de los puertos por
+    separado.
+    """
 
     def __init__(self) -> None:
         """Carga la URL y la clave del ``.env`` y prepara el cliente.
@@ -188,3 +226,47 @@ class SupabaseProvider(HabitProvider):
             return float(resp.json())
         except ValueError as exc:
             raise ProviderDataError("POST rpc/habit_step -> respuesta no es un numero valido") from exc
+
+    def get_tasks(self) -> list[Task]:
+        """Devuelve las tareas pendientes de hoy, ya mapeadas a dominio.
+
+        Una sola peticion a ``v_today_tasks``: la vista ya excluye las
+        completadas y las omitidas, y arrastra las vencidas de dias anteriores
+        (``overdue``). No ordena por si sola, asi que el orden va explicito en
+        la peticion (``_TASKS_ORDER``).
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_today_tasks",
+                headers=self._headers(Accept="application/json"),
+                params={"select": "id,title,priority,overdue,due_day", "order": _TASKS_ORDER},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_today_tasks")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_today_tasks -> respuesta no es JSON valido") from exc
+        return [build_task(t) for t in raw]
+
+    def complete_task(self, task: Task) -> None:
+        """Cierra ``task`` via ``rpc/complete_task``.
+
+        La funcion devuelve ``void``, asi que PostgREST responde 204 sin cuerpo:
+        no hay JSON que parsear y el propio status es toda la confirmacion. Es
+        idempotente en la base, de modo que un reintento no duplica nada.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/complete_task",
+                headers=self._headers(**{"Content-Type": "application/json"}),
+                json={"p_task_id": task.id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/complete_task")
