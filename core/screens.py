@@ -77,12 +77,16 @@ class MenuEntry:
             Sistema, asi que un boton "Atras" seria redundante.
         view_id: Id de la vista a la que lleva, solo si ``action`` es
             "select_view".
+        key: Tecla fija dentro de la pagina 0 (p.ej. "Sistema" siempre en la
+            14), o ``None`` para repartirse automaticamente entre las que
+            sobren, en el orden en que aparece en la lista.
     """
 
     label: str
     emoji: str
     action: str
     view_id: str = ""
+    key: int | None = None
 
 
 # PageBuilder: (habitos, tareas, mapeo_habito->tecla, pagina)
@@ -209,10 +213,10 @@ VIEWS: dict[str, ViewSpec] = {
 DEFAULT_VIEW_ID = "today"
 
 MENU_ENTRIES: list[MenuEntry] = [
-    MenuEntry(VIEWS["habits"].menu_label, VIEWS["habits"].menu_emoji, "select_view", view_id="habits"),
+    MenuEntry(VIEWS["today"].menu_label, VIEWS["today"].menu_emoji, "select_view", view_id="today", key=1),
+    MenuEntry(VIEWS["habits"].menu_label, VIEWS["habits"].menu_emoji, "select_view", view_id="habits", key=2),
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
-    MenuEntry(VIEWS["today"].menu_label, VIEWS["today"].menu_emoji, "select_view", view_id="today"),
-    MenuEntry("Sistema", "⚙️", "open_system"),
+    MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
 SYSTEM_ENTRIES: list[MenuEntry] = [
@@ -236,8 +240,20 @@ def _clamp_page(page: int, total_pages: int) -> int:
 
 
 def _nav_page(entries: list[MenuEntry], page: int) -> tuple[dict[int, MenuEntry], int]:
-    page_entries, total_pages = paginate(entries, page, PAGE_SIZE)
-    return dict(zip(AVAILABLE_KEYS, page_entries, strict=False)), total_pages
+    """Reparte ``entries`` entre las teclas de la pagina.
+
+    Las que traen ``key`` fijo (ver ``MenuEntry.key``) van siempre ahi, y solo
+    en la pagina 0; el resto se reparte por las teclas restantes en el orden
+    en que aparecen en la lista.
+    """
+    fixed = {entry.key: entry for entry in entries if entry.key is not None}
+    auto_entries = [entry for entry in entries if entry.key is None]
+    free_keys = [key for key in AVAILABLE_KEYS if key not in fixed]
+    auto_page, total_pages = paginate(auto_entries, page, len(free_keys))
+    key_nav = dict(zip(free_keys, auto_page, strict=False))
+    if page == 0:
+        key_nav.update(fixed)
+    return key_nav, total_pages
 
 
 def resolve_page(
