@@ -40,7 +40,8 @@ core/                  DOMINIO. Agnóstico de ambos lados.
   error_codes.py      AUTH / NET / API / KFUL.
   emoji.py            extract_emoji(): separa el primer emoji de una cadena.
 
-deploy/deploy.sh       Despliegue en la Pi (normal y --test).
+deploy/deploy.sh       Despliegue en la Pi: normal (git pull + reinicio) o --test (reinicio a secas,
+                       sin git pull). No tiene nada que ver con el proyecto Supabase de test.
 deploy/*.service       Unit de systemd. No se instala sola.
 scripts/               Dos smoke tests de hardware. Requieren un deck conectado.
 ```
@@ -212,6 +213,8 @@ tar cf - $(find . -name '*.py' -not -path './venv/*') | ssh admin@RP3-MotoComm-1
 
 Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear/mergear a `main`**, sin que `git pull` machaque el código de prueba:
 
+> **`--test` es un modo de despliegue, no una base de datos.** Lo único que significa es "reinicia con el código que ya hay en disco, sin `git pull`". La Pi sigue leyendo el proyecto Supabase que diga `SUPABASE_ENV` — normalmente `main`, o sea **producción**, y así debe quedarse. Son dos ejes independientes: `deploy.sh --test` ≠ `SUPABASE_ENV=test`. Ver [Cambiar de proyecto Supabase](#cambiar-de-proyecto-supabase-main--test) para cuándo (no) tocar el otro eje.
+
 1. **Copiar** el árbol de trabajo (solo versionado + nuevos no ignorados; nunca `.env`, `venv/`, logs ni `habit_key_map.json`) sobre `/opt/streamdeck-habits`:
 
    ```bash
@@ -231,11 +234,22 @@ Para validar en la Pi un cambio del árbol de trabajo local **antes de commitear
 4. **Si va bien** → commit + push a `main`; luego despliegue normal (`deploy/deploy.sh` sin `--test`, ver abajo) para que la Pi quede en `origin/main` con el árbol limpio.
    **Si va mal** → en la Pi `git -C /opt/streamdeck-habits checkout -- .` (restaura `main`) y `deploy/deploy.sh --test`. Si el código de prueba llegó a crashear en bucle y systemd lo dejó parado, arrancarlo de nuevo sí necesita sudo: `sudo systemctl start streamdeck-habits.service`.
 
-> **El paso 4 lo autoriza el usuario, siempre.** Esta sección describe el procedimiento; **no** es permiso para ejecutarlo. **Nunca hagas `git commit` ni `git push` sin que el usuario lo pida explícitamente en ese momento**, por muy terminado y verificado que esté el trabajo. Que un plan aprobado liste "commit + push" entre sus pasos tampoco cuenta: aprobar el plan aprueba el trabajo, no la publicación. Al acabar, deja los cambios en el árbol de trabajo, resume qué cambió y pregunta.
+> **El paso 4 lo autoriza el usuario, siempre.** Esta sección describe el procedimiento; **no** es permiso para ejecutarlo. **Nunca hagas `git commit` ni `git push` sin que el usuario lo pida explícitamente en ese momento**, por muy terminado y verificado que esté el trabajo. Que un plan aprobado liste "commit + push" entre sus pasos tampoco cuenta: aprobar el plan aprueba el trabajo, no la publicación. Al acabar, deja los cambios en el árbol de trabajo, resume qué cambió y pregunta. Si el usuario contesta algo asi como "despligue final" se ejecutará el paso 4: codigo a main y despliegue en la pi con el codigo limpio recien traido de lo que acaba de llegar a main.
 
 **No dejes el paso 4 a medias.** Un `--test` que "fue bien" pero nunca se cerró con el despliegue normal deja la Pi con el árbol sucio y por detrás de `origin/main` indefinidamente — el servicio sigue corriendo con lo que haya en disco (puede coincidir con `main` por casualidad, o no) y nadie se entera hasta que alguien compara `git status`/`git log` a mano. Verificarlo cuesta un comando: `ssh admin@RP3-MotoComm-1.local 'cd /opt/streamdeck-habits && git status --short && git log --oneline -1'` debe salir vacío y en el mismo commit que `origin/main`. Si el usuario no autoriza el commit, **avisa de que la Pi queda así** en vez de resolverlo publicando por tu cuenta.
 
 ### Cambiar de proyecto Supabase (main / test)
+
+Esto es **otra cosa** que el [despliegue en modo `--test`](#probar-código-sin-mergear-deploysh---test): aquel elige *qué código* corre en la Pi, este elige *contra qué base* habla. Se combinan libremente y lo normal es probar código nuevo (`--test`) contra `main`.
+
+**Cuándo apuntar la Pi a `test`:**
+
+- Cuando el cambio **toca la base**: una migración nueva en `../habits-core`, una vista o una RPC modificada, un `grant` que falta… Ahí sí propón al usuario probar primero contra `test` antes de aplicar nada a producción.
+- Cuando el usuario lo pida explícitamente.
+
+**Cuándo no** (o sea, casi siempre): si el cambio es solo de funcionalidad del daemon — una vista nueva, un color, otra forma de repartir teclas, una pulsación que llama a una RPC **que ya existe y ya tiene su `grant`** —, no hay nada del contrato que validar y se prueba contra `main` como cualquier otro uso normal del deck. No cambies `SUPABASE_ENV` por tu cuenta ni lo ofrezcas como paso previo "por seguridad": escribir en producción es exactamente lo que hace el usuario cada vez que pulsa una tecla.
+
+Si acabas apuntando a `test`, **devuélvela a `main` al terminar**: es fácil dejarla ahí y que el deck siga pintando datos de mentira días después.
 
 Hay dos proyectos Supabase activos, cada uno con su propia base (esquema
 identico, datos independientes):
@@ -250,8 +264,7 @@ El `.env` de la Pi trae las credenciales de **los dos** proyectos a la vez:
 normal) y `SUPABASE_URL_TEST`/`SUPABASE_PUBLISHABLE_KEY_TEST` para `test` (ver
 `.env.example`). `SUPABASE_ENV` (`main` o `test`) dice cual de las dos lee
 `provider/supabase.py`.
-Cambiar de proyecto es cambiar esa variable y reiniciar el servicio, nada mas
-— no hay script ni fichero nuevo:
+Cambiar de proyecto es cambiar esa variable y reiniciar el servicio, nada mas.
 
 ```bash
 ssh admin@RP3-MotoComm-1.local "sed -i 's/^SUPABASE_ENV=.*/SUPABASE_ENV=test/' /opt/streamdeck-habits/.env"
