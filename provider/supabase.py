@@ -7,8 +7,8 @@ proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
 - Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits`` y
-  ``v_today_tasks`` y las funciones ``rpc/habit_step`` y ``rpc/complete_task``
-  del contrato.
+  ``v_today_tasks`` y las funciones ``rpc/habit_step``, ``rpc/habit_undo`` y
+  ``rpc/complete_task`` del contrato.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
   (``provider.base.Habit`` y subtipos, ``provider.base.Task``).
 - La traduccion de cualquier fallo (``requests``, status, JSON) a la jerarquia
@@ -226,6 +226,29 @@ class SupabaseProvider(HabitProvider, TaskProvider):
             return float(resp.json())
         except ValueError as exc:
             raise ProviderDataError("POST rpc/habit_step -> respuesta no es un numero valido") from exc
+
+    def undo(self, habit: Habit) -> float:
+        """Retrocede ``habit`` via ``rpc/habit_undo`` y devuelve el nuevo total.
+
+        Simetrica de ``step``: la base decide el valor nuevo (booleano -> ``0``,
+        cuantificable -> ``value - step`` sin bajar de ``0``) y devuelve ``0`` si
+        hoy no habia checkin, asi que repetirla es seguro.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/habit_undo",
+                headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
+                json={"p_habit_id": habit.id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/habit_undo")
+        try:
+            return float(resp.json())
+        except ValueError as exc:
+            raise ProviderDataError("POST rpc/habit_undo -> respuesta no es un numero valido") from exc
 
     def get_tasks(self) -> list[Task]:
         """Devuelve las tareas pendientes de hoy, ya mapeadas a dominio.

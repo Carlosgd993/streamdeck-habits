@@ -1,7 +1,7 @@
 #!/opt/streamdeck-habits/venv/bin/python
 """Punto de entrada del daemon: bucle de refresco que sincroniza los habitos y
 las tareas pendientes del proveedor con las teclas del Stream Deck, y gestiona
-la navegacion por menu, la paginacion y los pasos/cierres al pulsar.
+la navegacion por menu, la paginacion y los pasos/deshaceres/cierres al pulsar.
 
 El orquestador depende solo de los puertos abstractos de ``provider.base``
 (interfaces ``HabitProvider``/``TaskProvider``, modelos ``Habit``/``Task`` y
@@ -112,6 +112,7 @@ def make_key_callback(
     auto_return_timer: _AutoReturnTimer,
     dispatch_navigation: Callable[[screens.PressAction], None],
     repaint: Callable[[], None],
+    refresh: Callable[[], None],
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el estado actual.
 
@@ -129,6 +130,14 @@ def make_key_callback(
       codigo, sin tocar el resto. Una tecla con el objetivo ya alcanzado hoy
       se sigue pudiendo pulsar: es la base quien decide el nuevo valor
       (``habit_step``), y un habito cuantificable sigue sumando sin tope.
+    - **Deshacer un habito**: la misma tecla, cuando ``core.screens``
+      resuelve la pulsacion como "habit_undo" (un booleano ya hecho, en una
+      vista que lo permita — hoy solo "Habitos"). Pide ``undo`` al proveedor
+      y, si tiene exito, dispara un **refresco completo** (``refresh``) en vez
+      del repintado optimista: el valor que devuelve la base es el del dia y
+      en un habito ``weekly_quota`` la vista pinta el contador de la semana,
+      asi que el unico estado fiable es el que se relee. Fallo → tecla en rojo
+      con codigo, igual que un paso.
     - **Tarea**: la pinta en verde de acuse de recibo, pide cerrarla y, solo
       cuando la base lo confirma, la saca de ``tasks_ref`` y repinta la
       pantalla entera (``repaint``) para que las tareas restantes se
@@ -154,26 +163,37 @@ def make_key_callback(
         repaint: Repinta la pantalla activa entera bajo ``screen_lock``. La
             usan los pasos de habito/tarea con exito, para reflejar de
             inmediato un cambio que puede desplazar otros items.
+        refresh: Ciclo de refresco completo (refetch + repintado), el mismo
+            que corre periodicamente. Lo usa el deshacer de un habito, que
+            necesita releer el estado real en vez de fiarse del valor
+            devuelto.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
     """
 
-    def press_habit(deck: Any, key: int, habit_id: str) -> None:
+    def press_habit(deck: Any, key: int, habit_id: str, *, undo: bool = False) -> None:
         habit = habits_ref["value"].get(habit_id)
         if habit is None:
             return  # habito desconocido (caso defensivo entre ciclos): se ignora
+        what = "Deshacer" if undo else "Paso"
         try:
-            new_value = provider.step(habit)
+            new_value = provider.undo(habit) if undo else provider.step(habit)
         except ProviderError as exc:
             _, code = health.classify(exc)
             health.log_failure(habit_id, str(exc), kind="habit")
             _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
-            print(f"Paso FALLO [{code}]: {habit_id}", flush=True)
+            print(f"{what} FALLO [{code}]: {habit_id}", flush=True)
         else:
+            # La mutacion optimista va siempre, tambien al deshacer: si el
+            # refresco posterior falla, la tecla queda pintada con el estado
+            # nuevo en vez de con el viejo.
             habit.current_value = new_value
-            _safe_render(repaint)
-            print(f"Paso OK: {habit.name} -> {new_value}", flush=True)
+            if undo:
+                refresh()  # relee el estado real; ver el docstring de make_key_callback
+            else:
+                _safe_render(repaint)
+            print(f"{what} OK: {habit.name} -> {new_value}", flush=True)
 
     def press_task(deck: Any, key: int, task_id: str) -> None:
         task = tasks_ref["value"].get(task_id)
@@ -206,15 +226,17 @@ def make_key_callback(
             resolved = screens.resolve_page(screen, habits_list, tasks_list, mapping)
             action = screens.resolve_press(screen, key, resolved)
 
-        if action.kind in ("habit", "task"):
+        if action.kind in ("habit", "habit_undo", "task"):
+            # Un habito reserva su id sea cual sea la operacion, asi que un
+            # paso y un deshacer del mismo habito tampoco pueden solaparse.
             item_id = action.payload
             if not _claim(item_id):
                 return  # ya hay una peticion en vuelo para este elemento
             try:
-                if action.kind == "habit":
-                    press_habit(deck, key, item_id)
-                else:
+                if action.kind == "task":
                     press_task(deck, key, item_id)
+                else:
+                    press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
                 _release(item_id)
         elif action.kind != "noop":
@@ -288,6 +310,7 @@ def main() -> None:
                 auto_return_timer,
                 _dispatch_navigation,
                 _repaint_locked,
+                refresh_cycle,
             )
         )
 
@@ -302,6 +325,13 @@ def main() -> None:
             _paint_current_screen()
 
     def refresh_cycle() -> None:
+        """Refetch + repintado de la pantalla activa.
+
+        La llama el bucle principal cada ``REFRESH_SECONDS``, pero tambien el
+        hilo de callbacks del deck: al entrar en una vista desde el menu
+        (``_enter_view``) y al deshacer un habito. Adquiere ``screen_lock``
+        ella misma, asi que solo puede llamarse SIN el lock ya adquirido.
+        """
         nonlocal mapping, last_habits_code, last_tasks_code
         with screen_lock:
             # Habitos y tareas se leen por separado y fallan por separado: un

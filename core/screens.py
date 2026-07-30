@@ -24,7 +24,7 @@ from enum import Enum, auto
 
 from config import AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.key_map import paginate
-from provider.base import Habit, Task
+from provider.base import BooleanHabit, Habit, Task
 
 
 class ScreenKind(Enum):
@@ -95,12 +95,26 @@ PageBuilder = Callable[
 
 @dataclass(frozen=True)
 class ViewSpec:
-    """Una vista de datos registrada, tal y como aparece en el menu."""
+    """Una vista de datos registrada, tal y como aparece en el menu.
+
+    Attributes:
+        id: Id de la vista, la clave con la que se registra en ``VIEWS``.
+        menu_label: Texto de su boton en el menu principal.
+        menu_emoji: Icono de ese boton.
+        build_page: Como reparte sus items entre las teclas de una pagina.
+        allows_undo: Si pulsar en esta vista un habito **booleano** ya hecho
+            hoy lo deshace en vez de repetir el paso. Lo declara cada vista, no
+            se hereda: una vista nueva no deshace nada salvo que lo pida. Solo
+            lo usa "Habitos", que es la que muestra los habitos hechos (en
+            gris) y sirve por tanto para repasarlos y corregir una pulsacion
+            erronea; "Hoy" los oculta, asi que ahi no hay nada que deshacer.
+    """
 
     id: str
     menu_label: str
     menu_emoji: str
     build_page: PageBuilder
+    allows_undo: bool = False
 
 
 def _place_items(items: list[ViewItem]) -> tuple[dict[int, Habit], dict[int, Task]]:
@@ -187,7 +201,7 @@ def _today_items(habits: list[Habit], tasks: list[Task]) -> list[ViewItem]:
 
 VIEWS: dict[str, ViewSpec] = {
     "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
-    "habits": ViewSpec("habits", "Habitos", "✅", _tiered_page_builder()),
+    "habits": ViewSpec("habits", "Habitos", "✅", _tiered_page_builder(), allows_undo=True),
     "tasks": ViewSpec(
         "tasks", "Tareas", "🗒️", _flat_page_builder(lambda habits, tasks: [ViewItem("task", t) for t in tasks])
     ),
@@ -259,14 +273,27 @@ class PressAction:
     """Que hacer tras pulsar una tecla, ya resuelta contra la pagina activa.
 
     Attributes:
-        kind: "habit" | "task" | "open_menu" | "open_system" |
+        kind: "habit" | "habit_undo" | "task" | "open_menu" | "open_system" |
             "select_view" | "shutdown" | "page_prev" | "page_next" | "noop".
-        payload: Id del habito/tarea si ``kind`` es "habit"/"task", o el
-            ``view_id`` destino si ``kind`` es "select_view". Vacio en el resto.
+        payload: Id del habito/tarea si ``kind`` es "habit"/"habit_undo"/"task",
+            o el ``view_id`` destino si ``kind`` es "select_view". Vacio en el
+            resto.
     """
 
     kind: str
     payload: str = ""
+
+
+def _undoes(screen: ScreenState, habit: Habit) -> bool:
+    """Decide si pulsar ``habit`` en ``screen`` deshace en vez de avanzar.
+
+    Solo deshace un habito **booleano** ya hecho hoy, y solo en una vista que
+    lo declare (``ViewSpec.allows_undo``). Un habito cuantificable nunca
+    deshace al pulsarlo: sigue sumando ``step`` aunque ya haya pasado su
+    objetivo (10/8 -> 11/8), que es justo lo que su tecla en gris significa.
+    """
+    spec = VIEWS.get(screen.view_id)
+    return bool(spec and spec.allows_undo) and isinstance(habit, BooleanHabit) and habit.is_done
 
 
 def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAction:
@@ -301,7 +328,7 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
 
     habit = page.key_habit.get(key)
     if habit is not None:
-        return PressAction("habit", habit.id)
+        return PressAction("habit_undo" if _undoes(screen, habit) else "habit", habit.id)
     task = page.key_task.get(key)
     if task is not None:
         return PressAction("task", task.id)

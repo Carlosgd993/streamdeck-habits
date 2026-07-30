@@ -242,6 +242,28 @@ class HabitProvider(ABC):
             ProviderDataError: Si la respuesta no tiene el formato esperado.
         """
 
+    @abstractmethod
+    def undo(self, habit: Habit) -> float:
+        """Retrocede el progreso de hoy de ``habit`` (pulsacion erronea).
+
+        Es la operacion inversa de ``step`` y, como aquella, el valor nuevo lo
+        decide el proveedor (booleano -> vuelve a ``0``, cuantificable ->
+        resta ``step`` sin bajar de ``0``); este metodo solo lo ejecuta y
+        devuelve el resultado para que el llamador repinte la tecla.
+
+        Args:
+            habit: El habito sobre el que retroceder.
+
+        Returns:
+            El nuevo valor TOTAL acumulado hoy, o ``0.0`` si hoy no habia
+            ningun progreso que deshacer (deshacer es seguro de repetir).
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
 
 class TaskProvider(ABC):
     """Puerto: contrato que debe implementar cualquier backend de tareas.
