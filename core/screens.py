@@ -1,19 +1,20 @@
 """Registro extensible de pantallas: menu principal, submenu "Sistema" y las
-vistas de datos (Hoy/Habitos/Tareas...), todas resueltas con la misma pareja
-de funciones puras.
+vistas de datos (Hoy/Habitos/Tareas/Crear...), todas resueltas con la misma
+pareja de funciones puras.
 
-Una pantalla resuelta en su pagina actual reparte las 15 teclas en tres
-cubos -- habito, tarea o entrada de menu -- mas un total de paginas. Menu y
-Sistema son listas fijas de ``MenuEntry`` paginadas con ``core.key_map.paginate``;
-cada vista de datos se resuelve con la funcion ``build_page`` que registra su
-``ViewSpec`` en ``VIEWS``. Anadir una vista nueva es registrar una entrada mas
-en ``VIEWS`` (con un ``_tiered_page_builder``/``_flat_page_builder``, o uno
-propio) y un boton mas en ``MENU_ENTRIES``; nada mas del sistema cambia.
+Una pantalla resuelta en su pagina actual reparte las 15 teclas en cuatro
+cubos -- habito, tarea, plantilla o entrada de menu -- mas un total de paginas.
+Menu y Sistema son listas fijas de ``MenuEntry`` paginadas con
+``core.key_map.paginate``; cada vista de datos se resuelve con la funcion
+``build_page`` que registra su ``ViewSpec`` en ``VIEWS``. Anadir una vista nueva
+es registrar una entrada mas en ``VIEWS`` (con un
+``_tiered_page_builder``/``_flat_page_builder``, o uno propio) y un boton mas en
+``MENU_ENTRIES``; nada mas del sistema cambia.
 
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
-(``paginate``) y ``provider.base`` (``Habit``/``Task``), igual que el resto de
-``core/``.
+(``paginate``) y ``provider.base`` (``Habit``/``Task``/``Template``), igual que
+el resto de ``core/``.
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ from enum import Enum, auto
 
 from config import AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.key_map import paginate
-from provider.base import BooleanHabit, Habit, Task
+from provider.base import BooleanHabit, Habit, Task, Template
 
 
 class ScreenKind(Enum):
@@ -56,11 +57,12 @@ class ScreenState:
 
 @dataclass(frozen=True)
 class ViewItem:
-    """Un habito o una tarea, envuelto para poder mezclarlos en una sola
-    lista paginable (p.ej. el sobrante que no cupo en el mapeo estable)."""
+    """Un habito, una tarea o una plantilla, envuelto para poder mezclarlos en
+    una sola lista paginable (p.ej. el sobrante que no cupo en el mapeo estable,
+    o la lista de "Hoy" que alterna habitos y tareas)."""
 
-    kind: str  # "habit" | "task"
-    obj: Habit | Task
+    kind: str  # "habit" | "task" | "template"
+    obj: Habit | Task | Template
 
 
 @dataclass(frozen=True)
@@ -89,12 +91,19 @@ class MenuEntry:
     key: int | None = None
 
 
-# PageBuilder: (habitos, tareas, mapeo_habito->tecla, pagina)
-#   -> (habito_por_tecla, tarea_por_tecla, total_de_paginas)
+# PageBuilder: (habitos, tareas, plantillas, mapeo_habito->tecla, pagina)
+#   -> (habito_por_tecla, tarea_por_tecla, plantilla_por_tecla, total_de_paginas)
+#
+# Todos los builders reciben los tres conjuntos de datos aunque casi ninguno los
+# use enteros: es lo que permite que una vista nueva los cruce (p.ej. "Crear"
+# necesita las tareas para saber que plantillas ya tienen ocurrencia abierta).
 PageBuilder = Callable[
-    [list[Habit], list[Task], dict[str, int], int],
-    tuple[dict[int, Habit], dict[int, Task], int],
+    [list[Habit], list[Task], list[Template], dict[str, int], int],
+    tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int],
 ]
+
+# La firma de la funcion de items que envuelve ``_flat_page_builder``.
+ItemsFn = Callable[[list[Habit], list[Task], list[Template]], list[ViewItem]]
 
 
 @dataclass(frozen=True)
@@ -121,17 +130,20 @@ class ViewSpec:
     allows_undo: bool = False
 
 
-def _place_items(items: list[ViewItem]) -> tuple[dict[int, Habit], dict[int, Task]]:
+def _place_items(items: list[ViewItem]) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template]]:
     """Reparte ``items`` (ya recortados a una pagina) entre las teclas
     disponibles, en el orden en que llegan."""
     key_habit: dict[int, Habit] = {}
     key_task: dict[int, Task] = {}
+    key_template: dict[int, Template] = {}
     for key, item in zip(AVAILABLE_KEYS, items, strict=False):
         if isinstance(item.obj, Habit):
             key_habit[key] = item.obj
+        elif isinstance(item.obj, Template):
+            key_template[key] = item.obj
         else:
             key_task[key] = item.obj
-    return key_habit, key_task
+    return key_habit, key_task, key_template
 
 
 def _overflow_items(habits: list[Habit], habit_mapping: dict[str, int]) -> list[ViewItem]:
@@ -152,8 +164,12 @@ def _tiered_page_builder() -> PageBuilder:
     """
 
     def build(
-        habits: list[Habit], tasks: list[Task], habit_mapping: dict[str, int], page: int
-    ) -> tuple[dict[int, Habit], dict[int, Task], int]:
+        habits: list[Habit],
+        tasks: list[Task],
+        templates: list[Template],
+        habit_mapping: dict[str, int],
+        page: int,
+    ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int]:
         overflow = _overflow_items(habits, habit_mapping)
         overflow_pages = paginate(overflow, 0, PAGE_SIZE)[1] if overflow else 0
         total_pages = 1 + overflow_pages
@@ -162,32 +178,36 @@ def _tiered_page_builder() -> PageBuilder:
         if page == 0:
             habits_by_id = {h.id: h for h in habits}
             key_habit = {key: habits_by_id[hid] for hid, key in habit_mapping.items() if hid in habits_by_id}
-            return key_habit, {}, total_pages
+            return key_habit, {}, {}, total_pages
 
         page_items, _ = paginate(overflow, page - 1, PAGE_SIZE)
-        key_habit, key_task = _place_items(page_items)
-        return key_habit, key_task, total_pages
+        key_habit, key_task, key_template = _place_items(page_items)
+        return key_habit, key_task, key_template, total_pages
 
     return build
 
 
-def _flat_page_builder(items_fn: Callable[[list[Habit], list[Task]], list[ViewItem]]) -> PageBuilder:
+def _flat_page_builder(items_fn: ItemsFn) -> PageBuilder:
     """Constructor de pagina generico para una vista sin reparto especial:
     pagina la lista completa que devuelva ``items_fn`` sin reservar nada para
     habitos. Es el que usa una vista nueva por defecto (p.ej. "por proyecto")
     salvo que necesite reutilizar el mapeo estable de habitos."""
 
     def build(
-        habits: list[Habit], tasks: list[Task], habit_mapping: dict[str, int], page: int
-    ) -> tuple[dict[int, Habit], dict[int, Task], int]:
-        page_items, total_pages = paginate(items_fn(habits, tasks), page, PAGE_SIZE)
-        key_habit, key_task = _place_items(page_items)
-        return key_habit, key_task, total_pages
+        habits: list[Habit],
+        tasks: list[Task],
+        templates: list[Template],
+        habit_mapping: dict[str, int],
+        page: int,
+    ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int]:
+        page_items, total_pages = paginate(items_fn(habits, tasks, templates), page, PAGE_SIZE)
+        key_habit, key_task, key_template = _place_items(page_items)
+        return key_habit, key_task, key_template, total_pages
 
     return build
 
 
-def _today_items(habits: list[Habit], tasks: list[Task]) -> list[ViewItem]:
+def _today_items(habits: list[Habit], tasks: list[Task], templates: list[Template]) -> list[ViewItem]:
     """Items de la vista "Hoy": habitos pendientes (sin los ya completados
     hoy -- ``is_done``, booleano marcado o cuantificable que alcanzo su
     objetivo -- ordenados por ``(order, id)``, igual que un reparto de
@@ -203,12 +223,40 @@ def _today_items(habits: list[Habit], tasks: list[Task]) -> list[ViewItem]:
     return [ViewItem("habit", h) for h in pending_habits] + [ViewItem("task", t) for t in tasks]
 
 
+def _tasks_items(habits: list[Habit], tasks: list[Task], templates: list[Template]) -> list[ViewItem]:
+    """Items de la vista "Tareas": solo las tareas pendientes, en el orden que
+    ya trae el proveedor."""
+    return [ViewItem("task", t) for t in tasks]
+
+
+def _create_items(habits: list[Habit], tasks: list[Task], templates: list[Template]) -> list[ViewItem]:
+    """Items de la vista "Crear": las plantillas de creacion rapida, todas, en
+    el orden que trae el proveedor.
+
+    Aqui vive la unica logica anti-duplicado del daemon. ``instantiate_task`` no
+    es idempotente (dos pulsaciones, dos tareas), asi que antes de ofrecer el
+    boton se marca cada plantilla que ya tiene una ocurrencia pendiente:
+    ``resolve_press`` la convierte en ``noop`` y el renderer la pinta en gris.
+
+    El cruce se hace con las tareas que ya estan en memoria (``template_id`` de
+    ``v_today_tasks``), sin ninguna peticion extra. Es tan reciente como el
+    ultimo ciclo: una ocurrencia creada desde otro cliente hace un minuto no se
+    ve todavia, y eso es aceptable -- el aviso es una red, no un candado.
+
+    A diferencia de "Hoy", las plantillas usadas **no desaparecen**: siguen ahi
+    en gris para la proxima vez que toquen.
+    """
+    pending_template_ids = {t.template_id for t in tasks if t.template_id}
+    for template in templates:
+        template.has_pending = template.id in pending_template_ids
+    return [ViewItem("template", tpl) for tpl in templates]
+
+
 VIEWS: dict[str, ViewSpec] = {
     "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
     "habits": ViewSpec("habits", "Habitos", "✅", _tiered_page_builder(), allows_undo=True),
-    "tasks": ViewSpec(
-        "tasks", "Tareas", "🗒️", _flat_page_builder(lambda habits, tasks: [ViewItem("task", t) for t in tasks])
-    ),
+    "tasks": ViewSpec("tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items)),
+    "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
 }
 DEFAULT_VIEW_ID = "today"
 
@@ -216,6 +264,7 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry(VIEWS["today"].menu_label, VIEWS["today"].menu_emoji, "select_view", view_id="today", key=1),
     MenuEntry(VIEWS["habits"].menu_label, VIEWS["habits"].menu_emoji, "select_view", view_id="habits", key=2),
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
+    MenuEntry(VIEWS["create"].menu_label, VIEWS["create"].menu_emoji, "select_view", view_id="create"),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
@@ -230,6 +279,7 @@ class ResolvedPage:
 
     key_habit: dict[int, Habit] = field(default_factory=dict)
     key_task: dict[int, Task] = field(default_factory=dict)
+    key_template: dict[int, Template] = field(default_factory=dict)
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
     page: int = 0
     total_pages: int = 1
@@ -257,7 +307,11 @@ def _nav_page(entries: list[MenuEntry], page: int) -> tuple[dict[int, MenuEntry]
 
 
 def resolve_page(
-    screen: ScreenState, habits: list[Habit], tasks: list[Task], habit_mapping: dict[str, int]
+    screen: ScreenState,
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    habit_mapping: dict[str, int],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
 
@@ -265,6 +319,7 @@ def resolve_page(
         screen: Pantalla activa (menu, sistema o una vista con su pagina).
         habits: Habitos del ultimo ``get_habits()`` exitoso.
         tasks: Tareas del ultimo ``get_tasks()`` exitoso.
+        templates: Plantillas del ultimo ``get_templates()`` exitoso.
         habit_mapping: Mapeo persistido habito -> tecla vigente.
 
     Returns:
@@ -278,9 +333,15 @@ def resolve_page(
         return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
-    key_habit, key_task, total_pages = spec.build_page(habits, tasks, habit_mapping, screen.page)
+    key_habit, key_task, key_template, total_pages = spec.build_page(
+        habits, tasks, templates, habit_mapping, screen.page
+    )
     return ResolvedPage(
-        key_habit=key_habit, key_task=key_task, page=_clamp_page(screen.page, total_pages), total_pages=total_pages
+        key_habit=key_habit,
+        key_task=key_task,
+        key_template=key_template,
+        page=_clamp_page(screen.page, total_pages),
+        total_pages=total_pages,
     )
 
 
@@ -289,11 +350,12 @@ class PressAction:
     """Que hacer tras pulsar una tecla, ya resuelta contra la pagina activa.
 
     Attributes:
-        kind: "habit" | "habit_undo" | "task" | "open_menu" | "open_system" |
-            "select_view" | "shutdown" | "page_prev" | "page_next" | "noop".
-        payload: Id del habito/tarea si ``kind`` es "habit"/"habit_undo"/"task",
-            o el ``view_id`` destino si ``kind`` es "select_view". Vacio en el
-            resto.
+        kind: "habit" | "habit_undo" | "task" | "template" | "open_menu" |
+            "open_system" | "select_view" | "shutdown" | "page_prev" |
+            "page_next" | "noop".
+        payload: Id del habito/tarea/plantilla si ``kind`` es
+            "habit"/"habit_undo"/"task"/"template", o el ``view_id`` destino si
+            ``kind`` es "select_view". Vacio en el resto.
     """
 
     kind: str
@@ -348,4 +410,12 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     task = page.key_task.get(key)
     if task is not None:
         return PressAction("task", task.id)
+    template = page.key_template.get(key)
+    if template is not None:
+        # Con una ocurrencia ya abierta la tecla no crea nada: instantiate_task
+        # no es idempotente y crearia un duplicado silencioso. El gris de la
+        # tecla es el aviso; esto es lo que lo hace efectivo.
+        if template.has_pending:
+            return PressAction("noop")
+        return PressAction("template", template.id)
     return PressAction("noop")

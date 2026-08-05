@@ -1,16 +1,18 @@
-"""Adaptador de Supabase: implementa los puertos ``HabitProvider`` y
-``TaskProvider`` contra el contrato publico de la base de datos, expuesto via
-PostgREST (``<url>/rest/v1``).
+"""Adaptador de Supabase: implementa los puertos ``HabitProvider``,
+``TaskProvider`` y ``TemplateProvider`` contra el contrato publico de la base de
+datos, expuesto via PostgREST (``<url>/rest/v1``).
 
 Concentra TODO lo especifico de Supabase/PostgREST, aislado del resto del
 proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
-- Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits`` y
-  ``v_today_tasks`` y las funciones ``rpc/habit_step``, ``rpc/habit_undo`` y
-  ``rpc/complete_task`` del contrato.
+- Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits``,
+  ``v_today_tasks`` y ``v_templates``, y las funciones ``rpc/habit_step``,
+  ``rpc/habit_undo``, ``rpc/complete_task`` e ``rpc/instantiate_task`` del
+  contrato.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
-  (``provider.base.Habit`` y subtipos, ``provider.base.Task``).
+  (``provider.base.Habit`` y subtipos, ``provider.base.Task``,
+  ``provider.base.Template``).
 - La traduccion de cualquier fallo (``requests``, status, JSON) a la jerarquia
   de excepciones agnostica ``Provider*Error``.
 
@@ -40,6 +42,8 @@ from provider.base import (
     RealHabit,
     Task,
     TaskProvider,
+    Template,
+    TemplateProvider,
 )
 
 URL_ENV_VAR = "SUPABASE_URL"
@@ -48,6 +52,7 @@ ACTIVE_ENV_VAR = "SUPABASE_ENV"
 DEFAULT_ACTIVE_ENV = "main"
 _ICON_TEXT_PREFIX = "txt_"  # prefijo de icon_res cuando el icono elegido es un emoji
 _TASKS_ORDER = "priority.desc,due_date.asc"  # v_today_tasks no ordena por si sola: lo mas urgente primero
+_TEMPLATES_ORDER = "title"  # v_templates si ordena por dentro, pero el orden va explicito como en el resto
 
 
 def _load_config() -> tuple[str | None, str | None]:
@@ -137,16 +142,41 @@ def build_task(data: dict[str, Any]) -> Task:
         priority=int(data.get("priority") or 0),
         overdue=bool(data.get("overdue")),
         due_day=str(data.get("due_day") or ""),
+        template_id=str(data.get("template_id") or ""),
     )
 
 
-class SupabaseProvider(HabitProvider, TaskProvider):
-    """Adaptador de los puertos ``HabitProvider`` y ``TaskProvider`` para
-    Supabase via PostgREST.
+def build_template(data: dict[str, Any]) -> Template:
+    """Mapea una fila cruda de ``v_templates`` al modelo de dominio.
 
-    Implementa los dos porque habitos y tareas salen del mismo contrato y de la
-    misma conexion; el resto del proyecto sigue dependiendo de los puertos por
-    separado.
+    Mismo criterio de emoji que ``build_task``: las plantillas tampoco tienen
+    columna de icono, asi que se saca del propio titulo.
+
+    ``has_pending`` NO se rellena aqui: no sale de esta vista, lo calcula
+    ``core.screens`` cruzando plantillas con tareas pendientes.
+
+    Args:
+        data: Fila de la plantilla devuelta por la vista.
+
+    Returns:
+        La instancia de ``Template`` correspondiente.
+    """
+    emoji, title = extract_emoji(str(data["title"]))
+    return Template(
+        id=data["id"],
+        title=title,
+        emoji=emoji,
+        priority=int(data.get("priority") or 0),
+    )
+
+
+class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
+    """Adaptador de los puertos ``HabitProvider``, ``TaskProvider`` y
+    ``TemplateProvider`` para Supabase via PostgREST.
+
+    Implementa los tres porque habitos, tareas y plantillas salen del mismo
+    contrato y de la misma conexion; el resto del proyecto sigue dependiendo de
+    los puertos por separado.
     """
 
     def __init__(self) -> None:
@@ -262,7 +292,7 @@ class SupabaseProvider(HabitProvider, TaskProvider):
             resp = requests.get(
                 f"{self._base}/v_today_tasks",
                 headers=self._headers(Accept="application/json"),
-                params={"select": "id,title,priority,overdue,due_day", "order": _TASKS_ORDER},
+                params={"select": "id,title,priority,overdue,due_day,template_id", "order": _TASKS_ORDER},
                 timeout=10,
             )
         except requests.RequestException as exc:
@@ -293,3 +323,60 @@ class SupabaseProvider(HabitProvider, TaskProvider):
             raise ProviderNetworkError(str(exc)) from exc
 
         self._check_status(resp, "POST rpc/complete_task")
+
+    def get_templates(self) -> list[Template]:
+        """Devuelve las plantillas de creacion rapida, ya mapeadas a dominio.
+
+        Una sola peticion a ``v_templates``, filtrando por ``show_in_deck``: la
+        vista devuelve TODAS las plantillas activas (tambien las que se
+        materializan solas, que aqui no pintamos), y el filtro es del cliente a
+        proposito -- asi otros clientes siguen viendo la lista completa con el
+        mismo ``grant``.
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_templates",
+                headers=self._headers(Accept="application/json"),
+                params={
+                    "select": "id,title,priority",
+                    "show_in_deck": "eq.true",
+                    "order": _TEMPLATES_ORDER,
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_templates")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_templates -> respuesta no es JSON valido") from exc
+        return [build_template(t) for t in raw]
+
+    def create_task(self, template: Template) -> str:
+        """Crea una ocurrencia desde ``template`` via ``rpc/instantiate_task``.
+
+        No manda ninguna fecha: sin ``p_due`` la base hace vencer la ocurrencia
+        ahora, que es lo que la hace aparecer en ``v_today_tasks`` (regla del
+        contrato: ningun cliente envia fechas).
+
+        A diferencia de ``complete_task``, esta RPC devuelve el ``uuid`` de la
+        ocurrencia nueva, o sea 200 con un string JSON -- hay cuerpo que parsear.
+        Y **no es idempotente**: dos llamadas crean dos tareas.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/instantiate_task",
+                headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
+                json={"p_template_id": template.id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/instantiate_task")
+        try:
+            return str(resp.json())
+        except ValueError as exc:
+            raise ProviderDataError("POST rpc/instantiate_task -> respuesta no es JSON valido") from exc

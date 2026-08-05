@@ -20,17 +20,22 @@ from deck.style import (
     COLOR_SHUTDOWN,
     COLOR_TASK_BY_PRIORITY,
     COLOR_TASK_SENDING,
+    COLOR_TEMPLATE,
+    COLOR_TEMPLATE_PENDING,
     COLOR_TEXT_ARROW,
     COLOR_TEXT_HABIT_DONE,
     COLOR_TEXT_HABIT_PENDING,
     COLOR_TEXT_NAV,
     COLOR_TEXT_SHUTDOWN,
     COLOR_TEXT_TASK_BY_PRIORITY,
+    COLOR_TEXT_TEMPLATE,
+    COLOR_TEXT_TEMPLATE_PENDING,
     FONT_SIZE_HABIT_PENDING,
     FONT_SIZE_NAV,
     FONT_SIZE_TASK,
+    FONT_SIZE_TEMPLATE,
 )
-from provider.base import Habit, Task
+from provider.base import Habit, Task, Template
 
 _DEFAULT_PRIORITY = 0  # al que cae una prioridad que no este en los diccionarios de estilo
 
@@ -91,6 +96,36 @@ def render_task(deck: Any, key: int, task: Task | None) -> None:
     deck.set_key_image(key, image)
 
 
+def render_template(deck: Any, key: int, template: Template | None) -> None:
+    """Pinta una tecla de plantilla de creacion rapida (vista "Crear").
+
+    Morado si la plantilla esta lista para usarse, y gris apagado -- el mismo de
+    un habito ya hecho -- si ya tiene una ocurrencia pendiente
+    (``template.has_pending``). Aqui el gris **si** significa "deshabilitada", al
+    reves que en un habito: pulsarla no hace nada, porque crear otra ocurrencia
+    seria un duplicado silencioso (ver ``core.screens.resolve_press``).
+
+    No hay variante "creada": una plantilla nunca desaparece de la vista, se
+    reutiliza. Si ``template`` es ``None`` la tecla se pinta vacia.
+    """
+    if template is None:
+        deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
+        return
+    if template.has_pending:
+        color, text_color = COLOR_TEMPLATE_PENDING, COLOR_TEXT_TEMPLATE_PENDING
+    else:
+        color, text_color = COLOR_TEMPLATE, COLOR_TEXT_TEMPLATE
+    image = text_tile(
+        deck,
+        color,
+        template.display_label(),
+        text_color=text_color,
+        font_size=FONT_SIZE_TEMPLATE,
+        emoji=template.emoji,
+    )
+    deck.set_key_image(key, image)
+
+
 def render_task_sending(deck: Any, key: int) -> None:
     """Pinta el acuse de recibo de una pulsacion de tarea: verde vivo y un check.
 
@@ -147,9 +182,9 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
     """Repinta las 15 teclas segun la pagina ya resuelta por ``core.screens``.
 
     Cada tecla se resuelve en orden: menu (fija), flecha de paginacion o
-    neutra, entrada de menu/sistema, habito, tarea y, si no es nada de eso,
-    vacia. ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo
-    pinta.
+    neutra, entrada de menu/sistema, habito, tarea, plantilla y, si no es nada
+    de eso, vacia. ``resolved`` ya trae listo que hay en cada tecla; esta
+    funcion solo pinta.
 
     Args:
         deck: El dispositivo Stream Deck.
@@ -167,6 +202,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
             render_habit(deck, key, resolved.key_habit[key])
         elif key in resolved.key_task:
             render_task(deck, key, resolved.key_task[key])
+        elif key in resolved.key_template:
+            render_template(deck, key, resolved.key_template[key])
         else:
             render_empty(deck, key)
 

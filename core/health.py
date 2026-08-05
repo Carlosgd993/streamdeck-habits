@@ -37,9 +37,11 @@ def log_failure(item_id: str, detail: str, kind: str = "habit") -> None:
     """Anade una linea JSON a checkin_failures.log con lo que fallo y el detalle.
 
     Args:
-        item_id: Id del habito o de la tarea sobre el que fallo la escritura.
+        item_id: Id del habito, de la tarea o de la plantilla sobre el que
+            fallo la escritura.
         detail: Mensaje de la excepcion.
-        kind: ``"habit"`` o ``"task"``, para saber a que se refiere ``item_id``.
+        kind: ``"habit"``, ``"task"`` o ``"template"``, para saber a que se
+            refiere ``item_id``.
     """
     with open(FAIL_LOG, "a") as f:
         f.write(json.dumps({

@@ -1,14 +1,15 @@
 #!/opt/streamdeck-habits/venv/bin/python
-"""Punto de entrada del daemon: bucle de refresco que sincroniza los habitos y
-las tareas pendientes del proveedor con las teclas del Stream Deck, y gestiona
-la navegacion por menu, la paginacion y los pasos/deshaceres/cierres al pulsar.
+"""Punto de entrada del daemon: bucle de refresco que sincroniza los habitos,
+las tareas pendientes y las plantillas de creacion rapida del proveedor con las
+teclas del Stream Deck, y gestiona la navegacion por menu, la paginacion y los
+pasos/deshaceres/cierres/creaciones al pulsar.
 
 El orquestador depende solo de los puertos abstractos de ``provider.base``
-(interfaces ``HabitProvider``/``TaskProvider``, modelos ``Habit``/``Task`` y
-excepciones ``Provider*``) y del registro de pantallas de ``core.screens``; la
-unica linea acoplada a un backend concreto es la construccion del proveedor
-(``SupabaseProvider()``). Sustituir de API = escribir otro adaptador que
-implemente esos puertos y cambiar esa linea.
+(interfaces ``HabitProvider``/``TaskProvider``/``TemplateProvider``, modelos
+``Habit``/``Task``/``Template`` y excepciones ``Provider*``) y del registro de
+pantallas de ``core.screens``; la unica linea acoplada a un backend concreto es
+la construccion del proveedor (``SupabaseProvider()``). Sustituir de API =
+escribir otro adaptador que implemente esos puertos y cambiar esa linea.
 """
 
 from __future__ import annotations
@@ -27,11 +28,19 @@ import deck.renderer as renderer
 from config import AUTO_RETURN_SECONDS, REFRESH_SECONDS
 from core.error_codes import CODES
 from deck.session import DeckSession
-from provider.base import Habit, HabitProvider, ProviderError, Task, TaskProvider
+from provider.base import (
+    Habit,
+    HabitProvider,
+    ProviderError,
+    Task,
+    TaskProvider,
+    Template,
+    TemplateProvider,
+)
 from provider.supabase import SupabaseProvider
 
 state_lock = threading.Lock()
-pending_requests: set[str] = set()  # ids (habito, tarea o el centinela de navegacion) con peticion en vuelo
+pending_requests: set[str] = set()  # ids (habito, tarea, plantilla o el centinela de navegacion) en vuelo
 _NAV_SENTINEL = "__nav__"  # clave de _claim/_release para no duplicar una entrada a vista por doble toque
 
 
@@ -104,9 +113,11 @@ def make_key_callback(
     deck: Any,
     provider: HabitProvider,
     task_provider: TaskProvider,
+    template_provider: TemplateProvider,
     mapping: dict[str, int],
     habits_ref: dict[str, dict[str, Habit]],
     tasks_ref: dict[str, dict[str, Task]],
+    templates_ref: dict[str, dict[str, Template]],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     auto_return_timer: _AutoReturnTimer,
@@ -142,6 +153,14 @@ def make_key_callback(
       cuando la base lo confirma, la saca de ``tasks_ref`` y repinta la
       pantalla entera (``repaint``) para que las tareas restantes se
       recoloquen sin hueco, por el mismo motivo que un habito.
+    - **Plantilla** (vista "Crear"): mismo acuse verde, pide crear la
+      ocurrencia y, al confirmar la base, **anade la tarea nueva a
+      ``tasks_ref``** y repinta. La plantilla **no** sale de ``templates_ref``
+      (a diferencia de una tarea al cerrarse): sigue en pantalla, ahora en gris
+      porque ya tiene ocurrencia abierta, y su tecla deja de hacer nada --
+      ``instantiate_task`` no es idempotente. Ese gris sale solo de la tarea
+      insertada, ver ``core.screens._create_items``, y ``core.screens`` ya
+      devuelve "noop" en ese caso, asi que aqui no hay nada que comprobar.
     - **Navegacion** (menu, submenu Sistema, cambiar de vista, paginar,
       apagar): se delega entera en ``dispatch_navigation``, definido en
       ``main()`` porque necesita mutar el estado de pantalla compartido.
@@ -150,19 +169,22 @@ def make_key_callback(
         deck: El dispositivo Stream Deck.
         provider: Proveedor de habitos (puerto abstracto).
         task_provider: Proveedor de tareas (puerto abstracto).
+        template_provider: Proveedor de plantillas (puerto abstracto).
         mapping: Mapeo habito -> tecla vigente para este ciclo.
         habits_ref: Wrapper de un solo campo ``{"value": {id: Habit}}`` para
             que el closure observe actualizaciones de ciclos posteriores.
         tasks_ref: Idem para las tareas pendientes.
+        templates_ref: Idem para las plantillas de creacion rapida.
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
         auto_return_timer: Temporizador de auto-retorno a "Hoy" tras inactividad.
         dispatch_navigation: Ejecuta cualquier ``PressAction`` que no sea de
-            habito o tarea.
+            habito, tarea o plantilla.
         repaint: Repinta la pantalla activa entera bajo ``screen_lock``. La
-            usan los pasos de habito/tarea con exito, para reflejar de
-            inmediato un cambio que puede desplazar otros items.
+            usan los pasos de habito, los cierres de tarea y las creaciones
+            desde plantilla con exito, para reflejar de inmediato un cambio que
+            puede desplazar otros items.
         refresh: Ciclo de refresco completo (refetch + repintado), el mismo
             que corre periodicamente. Lo usa el deshacer de un habito, que
             necesita releer el estado real en vez de fiarse del valor
@@ -215,6 +237,43 @@ def make_key_callback(
             _safe_render(repaint)
             print(f"Tarea completada: {task.title}", flush=True)
 
+    def press_template(deck: Any, key: int, template_id: str) -> None:
+        template = templates_ref["value"].get(template_id)
+        if template is None:
+            return  # plantilla desaparecida entre ciclos (desactivada, desmarcada): se ignora
+        _safe_render(lambda: renderer.render_task_sending(deck, key))
+        try:
+            new_task_id = template_provider.create_task(template)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(template_id, str(exc), kind="template")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Crear tarea FALLO [{code}]: {template_id}", flush=True)
+        else:
+            # La plantilla NO se quita de templates_ref: sigue existiendo y se
+            # reutiliza, solo que ahora tiene una ocurrencia abierta.
+            #
+            # Lo que se anade a tasks_ref es la ocurrencia nueva, no un flag en
+            # la plantilla: ``core.screens._create_items`` deriva ``has_pending``
+            # de las tareas en cada resolucion, asi que marcar la plantilla a
+            # mano se perderia en el primer repintado. Insertando la tarea, el
+            # gris sale solo -- y ademas aparece ya en "Hoy"/"Tareas" sin
+            # esperar al siguiente ciclo, que es lo que el usuario espera ver.
+            #
+            # La base ya le puso fecha de hoy (instantiate_task sin p_due), pero
+            # aqui no se conoce: ``due_day``/``overdue`` quedan en su default y
+            # el proximo refresco trae la fila real. Ninguno de los dos se usa
+            # para pintar.
+            tasks_ref["value"][new_task_id] = Task(
+                id=new_task_id,
+                title=template.title,
+                emoji=template.emoji,
+                priority=template.priority,
+                template_id=template.id,
+            )
+            _safe_render(repaint)
+            print(f"Tarea creada desde plantilla: {template.title} -> {new_task_id}", flush=True)
+
     def on_key_change(deck: Any, key: int, pressed: bool) -> None:
         if not pressed:
             return
@@ -223,10 +282,11 @@ def make_key_callback(
         with screen_lock:
             habits_list = list(habits_ref["value"].values())
             tasks_list = list(tasks_ref["value"].values())
-            resolved = screens.resolve_page(screen, habits_list, tasks_list, mapping)
+            templates_list = list(templates_ref["value"].values())
+            resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, mapping)
             action = screens.resolve_press(screen, key, resolved)
 
-        if action.kind in ("habit", "habit_undo", "task"):
+        if action.kind in ("habit", "habit_undo", "task", "template"):
             # Un habito reserva su id sea cual sea la operacion, asi que un
             # paso y un deshacer del mismo habito tampoco pueden solaparse.
             item_id = action.payload
@@ -235,6 +295,8 @@ def make_key_callback(
             try:
                 if action.kind == "task":
                     press_task(deck, key, item_id)
+                elif action.kind == "template":
+                    press_template(deck, key, item_id)
                 else:
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
@@ -260,6 +322,7 @@ def main() -> None:
 
     habit_provider: HabitProvider = provider
     task_provider: TaskProvider = provider
+    template_provider: TemplateProvider = provider
 
     session = DeckSession()
     session.open()
@@ -267,11 +330,13 @@ def main() -> None:
     mapping = key_map.load_map()
     habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
     tasks_ref: dict[str, dict[str, Task]] = {"value": {}}  # task_id -> objeto Task, actualizado cada ciclo
+    templates_ref: dict[str, dict[str, Template]] = {"value": {}}  # template_id -> Template, idem
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
     last_habits_code: str | None = None  # ultimo codigo de error de habitos, para pintarlo tras navegar sin refetch
     last_tasks_code: str | None = None  # idem para tareas
+    last_templates_code: str | None = None  # idem para plantillas
 
     def _paint_current_screen() -> None:
         """Resuelve la pantalla activa contra los datos vigentes, la pinta y
@@ -282,13 +347,20 @@ def main() -> None:
         """
         deck = session.deck
         resolved = screens.resolve_page(
-            screen, list(habits_ref["value"].values()), list(tasks_ref["value"].values()), mapping
+            screen,
+            list(habits_ref["value"].values()),
+            list(tasks_ref["value"].values()),
+            list(templates_ref["value"].values()),
+            mapping,
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
 
         # Los codigos de error se pintan DESPUES del repintado general, para
         # que tapen los datos viejos de la parte que fallo, y solo si la
         # pantalla visible los usa (un fallo de tareas no debe teñir "Sistema").
+        # Los ids de vista van literales a proposito: es el unico sitio fuera de
+        # core/screens.py que los conoce, y una vista nueva tiene que decidir
+        # explicitamente que codigos le afectan.
         is_view = screen.kind is screens.ScreenKind.VIEW
         if last_habits_code is not None and is_view and screen.view_id in ("today", "habits"):
             code = last_habits_code
@@ -296,15 +368,20 @@ def main() -> None:
         if last_tasks_code is not None and is_view and screen.view_id in ("today", "tasks"):
             code = last_tasks_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_task.keys(), code))
+        if last_templates_code is not None and is_view and screen.view_id == "create":
+            code = last_templates_code
+            _safe_render(lambda: renderer.render_error_all(deck, resolved.key_template.keys(), code))
 
         deck.set_key_callback(
             make_key_callback(
                 deck,
                 habit_provider,
                 task_provider,
+                template_provider,
                 mapping,
                 habits_ref,
                 tasks_ref,
+                templates_ref,
                 screen,
                 screen_lock,
                 auto_return_timer,
@@ -332,12 +409,12 @@ def main() -> None:
         (``_enter_view``) y al deshacer un habito. Adquiere ``screen_lock``
         ella misma, asi que solo puede llamarse SIN el lock ya adquirido.
         """
-        nonlocal mapping, last_habits_code, last_tasks_code
+        nonlocal mapping, last_habits_code, last_tasks_code, last_templates_code
         with screen_lock:
-            # Habitos y tareas se leen por separado y fallan por separado: un
-            # fallo leyendo tareas deja su codigo aparte y no toca los
-            # habitos, y al reves. La lectura que falla no toca su mapeo ni
-            # sus datos (se conservan los del ciclo anterior).
+            # Las tres lecturas se hacen por separado y fallan por separado: un
+            # fallo leyendo tareas deja su codigo aparte y no toca los habitos
+            # ni las plantillas, y asi con cualquiera. La lectura que falla no
+            # toca su mapeo ni sus datos (se conservan los del ciclo anterior).
             try:
                 habits = habit_provider.get_habits()
             except ProviderError as exc:
@@ -358,6 +435,15 @@ def main() -> None:
                 tasks_ref["value"] = {t.id: t for t in tasks}
                 if tasks:
                     print(f"{len(tasks)} tarea(s) pendientes", flush=True)
+
+            try:
+                templates = template_provider.get_templates()
+            except ProviderError as exc:
+                _, last_templates_code = health.classify(exc)
+                print(f"[{last_templates_code}] {CODES[last_templates_code]} (plantillas): {exc}", flush=True)
+            else:
+                last_templates_code = None
+                templates_ref["value"] = {t.id: t for t in templates}
 
             _paint_current_screen()
 
@@ -407,7 +493,7 @@ def main() -> None:
             _paint_current_screen()
 
     def _dispatch_navigation(action: screens.PressAction) -> None:
-        """Ejecuta cualquier ``PressAction`` que no sea de habito o tarea."""
+        """Ejecuta cualquier ``PressAction`` que no sea de habito, tarea o plantilla."""
         if action.kind == "open_menu":
             _enter_menu()
         elif action.kind == "open_system":

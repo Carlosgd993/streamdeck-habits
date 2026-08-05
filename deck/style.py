@@ -48,3 +48,17 @@ COLOR_TASK_SENDING = (0, 230, 60)   # verde vivo: pulsacion registrada, peticion
                                     # brillante que el verde de prioridad 1 para que se distinga
                                     # tambien sobre esas teclas
 FONT_SIZE_TASK = 14
+
+# --- Plantillas (vista "Crear") ---------------------------------------------
+# Un morado que no choca con ninguno de los anteriores: no es un boton de
+# navegacion (COLOR_NAV es azul), no es una tarea (blanco/verde/amarillo/rojo)
+# ni un habito (blanco/gris). Una tecla morada significa siempre "esto crea algo".
+COLOR_TEMPLATE = (110, 70, 160)
+COLOR_TEXT_TEMPLATE = (255, 255, 255)
+
+# Plantilla que ya tiene una ocurrencia pendiente: el mismo gris que un habito
+# ya hecho, y por el mismo motivo -- "esto ya esta, no hace falta tocarlo". Ahi
+# la tecla ademas no hace nada (ver core.screens.resolve_press).
+COLOR_TEMPLATE_PENDING = COLOR_HABIT_DONE
+COLOR_TEXT_TEMPLATE_PENDING = COLOR_TEXT_HABIT_DONE
+FONT_SIZE_TEMPLATE = 14

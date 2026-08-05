@@ -7,13 +7,16 @@ particular:
 - ``HabitProvider``: el puerto de habitos que cualquier backend debe implementar.
 - ``TaskProvider``: el puerto de tareas, deliberadamente **separado** del
   anterior: un backend de habitos no tiene por que servir tambien tareas, y al
-  reves. Un adaptador concreto puede implementar los dos (es lo que hace
-  ``provider/supabase.py``, porque ambos salen del mismo contrato).
+  reves.
+- ``TemplateProvider``: el puerto de plantillas (crear una tarea a partir de una
+  definicion reutilizable), separado de los otros dos por la misma razon.
+  Un adaptador concreto puede implementar los tres (es lo que hace
+  ``provider/supabase.py``, porque los tres salen del mismo contrato).
 - Jerarquia de excepciones agnostica (``ProviderError`` y subclases), compartida
-  por los dos puertos.
-- Los modelos de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``)
-  y ``Task``, construidos desde campos ya parseados -- nunca desde el JSON crudo
-  de un backend.
+  por los tres puertos.
+- Los modelos de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``),
+  ``Task`` y ``Template``, construidos desde campos ya parseados -- nunca desde
+  el JSON crudo de un backend.
 
 La logica de negocio (que dia es hoy, cual es el siguiente valor de un habito,
 que tareas estan pendientes) vive en la base de datos; estos puertos y sus
@@ -148,10 +151,17 @@ def _format_number(value: float) -> str:
 
 
 TITLE_MAX_CHARS = 32
-"""Longitud maxima del titulo de una tarea en una tecla.
+"""Longitud maxima del titulo de una tarea o plantilla en una tecla.
 
 A partir de ahi el texto ya no cabe (el pintado envuelve en lineas cortas) y lo
 que sobra se recorta con una elipsis en vez de desbordarse en silencio."""
+
+
+def _clip_title(title: str) -> str:
+    """Recorta ``title`` a ``TITLE_MAX_CHARS`` con elipsis si no cabe en la tecla."""
+    if len(title) <= TITLE_MAX_CHARS:
+        return title
+    return title[: TITLE_MAX_CHARS - 1].rstrip() + "…"
 
 
 class Task:
@@ -175,6 +185,10 @@ class Task:
         overdue: Si la tarea ya vencio y arrastra de un dia anterior.
         due_day: Dia de vencimiento en formato ``YYYY-MM-DD``, ya normalizado a
             la zona horaria correcta por el proveedor. Vacio si no lo trae.
+        template_id: Id de la ``Template`` de la que salio esta ocurrencia, o
+            cadena vacia si es una tarea unica. Es lo que permite saber si una
+            plantilla ya tiene una ocurrencia pendiente sin preguntar otra vez
+            al proveedor (ver ``core.screens``).
     """
 
     def __init__(
@@ -185,6 +199,7 @@ class Task:
         priority: int = 0,
         overdue: bool = False,
         due_day: str = "",
+        template_id: str = "",
     ) -> None:
         self.id = id
         self.title = title
@@ -192,15 +207,65 @@ class Task:
         self.priority = priority
         self.overdue = overdue
         self.due_day = due_day
+        self.template_id = template_id
 
     def display_label(self) -> str:
         """Texto a mostrar en la tecla: el titulo, recortado si no cabe.
 
         El emoji va aparte (ver ``emoji``), como en los habitos.
         """
-        if len(self.title) <= TITLE_MAX_CHARS:
-            return self.title
-        return self.title[: TITLE_MAX_CHARS - 1].rstrip() + "…"
+        return _clip_title(self.title)
+
+
+class Template:
+    """Plantilla de tarea de creacion rapida, agnostica del backend.
+
+    Es la definicion reutilizable de una tarea que se repite **sin momento
+    fijo** ("Cita peluquero"): no la materializa nadie automaticamente, la crea
+    el usuario cuando le toca. Solo llegan aqui las plantillas que el proveedor
+    marca como de creacion rapida; el resto (las que se materializan solas) no
+    se pintan nunca.
+
+    Al contrario que ``Task``, una plantilla **no desaparece** al usarla: sigue
+    ahi para la proxima vez.
+
+    Attributes:
+        id: Identificador de la plantilla en el proveedor. Es el que se envia
+            para crear una ocurrencia -- ojo, no es el id de la tarea creada.
+        title: Titulo legible, ya sin el emoji si lo llevaba.
+        emoji: Emoji del titulo para usar como icono, o cadena vacia. Mismo
+            criterio que en ``Task``: no hay campo de icono propio, se saca del
+            titulo.
+        priority: Prioridad que heredara la ocurrencia creada (``0``/``1``/``3``/
+            ``5``). Se guarda por coherencia con ``Task``, aunque el pintado de
+            una plantilla no dependa de ella.
+        has_pending: Si ya existe una ocurrencia pendiente de esta plantilla.
+            **Lo calcula el dominio en cada resolucion de pantalla** (no viene
+            del backend), cruzando las plantillas con las tareas pendientes. Es
+            lo que evita crear un duplicado por accidente: la tecla se pinta en
+            gris y la pulsacion no hace nada.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        title: str,
+        emoji: str = "",
+        priority: int = 0,
+        has_pending: bool = False,
+    ) -> None:
+        self.id = id
+        self.title = title
+        self.emoji = emoji
+        self.priority = priority
+        self.has_pending = has_pending
+
+    def display_label(self) -> str:
+        """Texto a mostrar en la tecla: el titulo, recortado si no cabe.
+
+        El emoji va aparte (ver ``emoji``), igual que en habitos y tareas.
+        """
+        return _clip_title(self.title)
 
 
 class HabitProvider(ABC):
@@ -299,6 +364,54 @@ class TaskProvider(ABC):
 
         Args:
             task: La tarea a cerrar.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+
+class TemplateProvider(ABC):
+    """Puerto: contrato que debe implementar un backend de plantillas de tarea.
+
+    Separado de ``TaskProvider`` por la misma razon que este lo esta de
+    ``HabitProvider``: crear tareas a demanda desde una definicion reutilizable
+    es una capacidad distinta de listarlas y cerrarlas, y un backend puede
+    ofrecer una sin la otra. Comparte la jerarquia de excepciones ``Provider*``.
+    """
+
+    @abstractmethod
+    def get_templates(self) -> list[Template]:
+        """Devuelve las plantillas de creacion rapida, ya ordenadas.
+
+        Solo las que el proveedor marca como tales: las plantillas que se
+        materializan solas no se ofrecen como boton. El filtrado y el orden los
+        decide el proveedor, igual que en ``get_tasks``.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def create_task(self, template: Template) -> str:
+        """Crea una ocurrencia de tarea a partir de ``template``.
+
+        El proveedor decide todo lo de la tarea nueva (titulo, prioridad,
+        subtareas y **la fecha de vencimiento**): este metodo no envia ninguna
+        fecha, igual que ``step`` no envia ningun valor.
+
+        **No es idempotente**, al contrario que ``complete_task``: cada llamada
+        crea una ocurrencia mas. Reintentar a ciegas duplica, asi que el
+        llamador debe mirar ``Template.has_pending`` antes de invocarlo.
+
+        Args:
+            template: La plantilla de la que crear la ocurrencia.
+
+        Returns:
+            El id de la ocurrencia recien creada.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.
