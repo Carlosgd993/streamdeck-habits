@@ -269,6 +269,10 @@ Esto es **otra cosa** que el [despliegue en modo `--test`](#probar-código-sin-m
 
 Si acabas apuntando a `test`, **devuélvela a `main` al terminar**: es fácil dejarla ahí y que el deck siga pintando datos de mentira días después.
 
+**`habit_key_map.json` es único y no distingue de proyecto.** Cambiar `SUPABASE_ENV` no lo vacía ni lo cambia de fichero: al saltar a `test`, los hábitos de `main` que no existan ahí liberan su tecla y los de `test` reclaman las libres; al volver a `main`, sus hábitos vuelven a reclamar tecla **desde cero**, sin garantía de que sea la misma de antes de saltar a `test`. No es un bug — `update_mapping` hace exactamente lo que documenta ("nuevo hábito reclama la más baja libre") — pero conviene saberlo antes de sorprenderse de que un hábito cambió de sitio tras una prueba en `test`. Confirmado el 2026-08-05: al volver a `main` tras probar la pantalla "Crear", "Gym" reclamó la tecla 7.
+
+**Pendiente de revisar**: si esto molesta en la práctica, la solución sería separar el mapeo por entorno (`habit_key_map_main.json` / `habit_key_map_test.json`, o una clave por `habit_id` que incluya el proyecto) en `core/key_map.py`. No implementado todavía — de momento se asume el barajeo tras cada préstamo a `test`.
+
 Hay dos proyectos Supabase activos, cada uno con su propia base (esquema
 identico, datos independientes):
 
