@@ -2,14 +2,17 @@
 vistas de datos (Hoy/Habitos/Tareas/Crear...), todas resueltas con la misma
 pareja de funciones puras.
 
-Una pantalla resuelta en su pagina actual reparte las 15 teclas en cuatro
-cubos -- habito, tarea, plantilla o entrada de menu -- mas un total de paginas.
-Menu y Sistema son listas fijas de ``MenuEntry`` paginadas con
-``core.key_map.paginate``; cada vista de datos se resuelve con la funcion
-``build_page`` que registra su ``ViewSpec`` en ``VIEWS``. Anadir una vista nueva
-es registrar una entrada mas en ``VIEWS`` (con un
-``_tiered_page_builder``/``_flat_page_builder``, o uno propio) y un boton mas en
-``MENU_ENTRIES``; nada mas del sistema cambia.
+Una pantalla resuelta en su pagina actual reparte las 15 teclas en varios
+cubos -- habito, tarea, plantilla, entrada de menu o boton del teclado
+numerico -- mas un total de paginas. Menu y Sistema son listas fijas de
+``MenuEntry`` paginadas con ``core.key_map.paginate``; cada vista de datos se
+resuelve con la funcion ``build_page`` que registra su ``ViewSpec`` en
+``VIEWS``. Anadir una vista nueva es registrar una entrada mas en ``VIEWS``
+(con un ``_tiered_page_builder``/``_flat_page_builder``, o uno propio) y un
+boton mas en ``MENU_ENTRIES``; nada mas del sistema cambia. El teclado
+numerico (``ScreenKind.NUMERIC_ENTRY``, ver ``NUMERIC_KEYPAD``) es la unica
+pantalla que no es menu/sistema/vista: la abre un habito ``manual_entry`` al
+pulsarlo, sin entrada en ``VIEWS`` ni en el menu.
 
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
@@ -34,6 +37,7 @@ class ScreenKind(Enum):
     MENU = auto()
     SYSTEM = auto()
     VIEW = auto()
+    NUMERIC_ENTRY = auto()
 
 
 @dataclass
@@ -44,15 +48,25 @@ class ScreenState:
     defecto (``DEFAULT_VIEW_ID``, "Hoy"), pagina 0.
 
     Attributes:
-        kind: Menu principal, submenu Sistema o una vista de datos.
+        kind: Menu principal, submenu Sistema, una vista de datos o el
+            teclado numerico de entrada manual.
         view_id: Id de la vista activa en ``VIEWS``. Solo tiene sentido si
             ``kind`` es ``ScreenKind.VIEW``.
         page: Pagina 0-indexada dentro de la pantalla activa.
+        entry_habit_id: Id del habito que se esta editando, solo si ``kind``
+            es ``ScreenKind.NUMERIC_ENTRY``. Al entrar al teclado no se tocan
+            ``view_id``/``page``: es lo que permite que "Salir" vuelva
+            exactamente a la vista/pagina de origen sin un campo aparte.
+        entry_value: Lo tecleado hasta ahora en el teclado numerico (cadena,
+            no numero, para poder representar estados intermedios como
+            ``"12."``). Vacio fuera de ``NUMERIC_ENTRY``.
     """
 
     kind: ScreenKind = ScreenKind.VIEW
     view_id: str = "today"
     page: int = 0
+    entry_habit_id: str = ""
+    entry_value: str = ""
 
 
 @dataclass(frozen=True)
@@ -89,6 +103,47 @@ class MenuEntry:
     action: str
     view_id: str = ""
     key: int | None = None
+
+
+@dataclass(frozen=True)
+class NumericKey:
+    """Un boton del teclado numerico de entrada manual (ver ``NUMERIC_KEYPAD``).
+
+    Attributes:
+        kind: Que hace -- "digit" (teclea ``label``), "decimal" (anade "."),
+            "backspace" (borra el ultimo caracter), "confirm" (fija el valor
+            tecleado), "cancel" (vuelve a la vista de origen sin enviar nada)
+            o "display" (no es un boton: solo muestra lo tecleado hasta
+            ahora, ``resolve_press`` la trata como "noop").
+        label: Texto fijo del boton (el digito, ".", "OK", "Salir", "Borrar"),
+            salvo en "display", donde ``resolve_page`` lo sustituye por
+            ``ScreenState.entry_value`` en cada resolucion.
+    """
+
+    kind: str
+    label: str
+
+
+# Layout fijo de la pantalla de entrada manual (ver "Menu y pantallas" en
+# CLAUDE.md). Las teclas 0/5/10 se reinterpretan aqui: no son menu/paginacion,
+# son "salir"/"borrar"/"confirmar".
+NUMERIC_KEYPAD: dict[int, NumericKey] = {
+    0: NumericKey("cancel", "Salir"),
+    1: NumericKey("display", ""),
+    2: NumericKey("digit", "1"),
+    3: NumericKey("digit", "2"),
+    4: NumericKey("digit", "3"),
+    5: NumericKey("backspace", "Borrar"),
+    6: NumericKey("digit", "0"),
+    7: NumericKey("digit", "4"),
+    8: NumericKey("digit", "5"),
+    9: NumericKey("digit", "6"),
+    10: NumericKey("confirm", "OK"),
+    11: NumericKey("decimal", "."),
+    12: NumericKey("digit", "7"),
+    13: NumericKey("digit", "8"),
+    14: NumericKey("digit", "9"),
+}
 
 
 # PageBuilder: (habitos, tareas, plantillas, mapeo_habito->tecla, pagina)
@@ -281,6 +336,7 @@ class ResolvedPage:
     key_task: dict[int, Task] = field(default_factory=dict)
     key_template: dict[int, Template] = field(default_factory=dict)
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
+    key_numeric: dict[int, NumericKey] = field(default_factory=dict)
     page: int = 0
     total_pages: int = 1
 
@@ -331,6 +387,10 @@ def resolve_page(
     if screen.kind is ScreenKind.SYSTEM:
         key_nav, total_pages = _nav_page(SYSTEM_ENTRIES, screen.page)
         return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
+    if screen.kind is ScreenKind.NUMERIC_ENTRY:
+        key_numeric = dict(NUMERIC_KEYPAD)
+        key_numeric[1] = NumericKey("display", screen.entry_value)
+        return ResolvedPage(key_numeric=key_numeric, page=0, total_pages=1)
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
     key_habit, key_task, key_template, total_pages = spec.build_page(
@@ -350,12 +410,16 @@ class PressAction:
     """Que hacer tras pulsar una tecla, ya resuelta contra la pagina activa.
 
     Attributes:
-        kind: "habit" | "habit_undo" | "task" | "template" | "open_menu" |
-            "open_system" | "select_view" | "shutdown" | "page_prev" |
-            "page_next" | "noop".
+        kind: "habit" | "habit_undo" | "habit_enter_value" | "task" |
+            "template" | "open_menu" | "open_system" | "select_view" |
+            "shutdown" | "page_prev" | "page_next" | "numeric_digit" |
+            "numeric_decimal" | "numeric_backspace" | "numeric_confirm" |
+            "numeric_cancel" | "noop".
         payload: Id del habito/tarea/plantilla si ``kind`` es
-            "habit"/"habit_undo"/"task"/"template", o el ``view_id`` destino si
-            ``kind`` es "select_view". Vacio en el resto.
+            "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
+            "numeric_confirm", el ``view_id`` destino si ``kind`` es
+            "select_view", o el digito tecleado si ``kind`` es
+            "numeric_digit". Vacio en el resto.
     """
 
     kind: str
@@ -386,6 +450,23 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     Returns:
         La accion a ejecutar por el llamador.
     """
+    if screen.kind is ScreenKind.NUMERIC_ENTRY:
+        # Comprobacion antes que KEY_MENU/paginacion a proposito: en esta
+        # pantalla las teclas 0/5/10 no significan menu/borrar-pagina-atras,
+        # significan salir/borrar-caracter/confirmar (ver NUMERIC_KEYPAD).
+        nk = page.key_numeric.get(key)
+        if nk is None or nk.kind == "display":
+            return PressAction("noop")
+        if nk.kind == "cancel":
+            return PressAction("numeric_cancel")
+        if nk.kind == "confirm":
+            return PressAction("numeric_confirm", screen.entry_habit_id)
+        if nk.kind == "digit":
+            return PressAction("numeric_digit", nk.label)
+        if nk.kind == "decimal":
+            return PressAction("numeric_decimal")
+        return PressAction("numeric_backspace")
+
     if key == KEY_MENU:
         if screen.kind is ScreenKind.MENU:
             return PressAction("noop")  # ya esta en el menu, no hace falta nada
@@ -406,6 +487,11 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
 
     habit = page.key_habit.get(key)
     if habit is not None:
+        if habit.manual_entry:
+            # Un habito de entrada manual no tiene "deshacer": habit_set
+            # sobrescribe, asi que re-teclear ya es la correccion. Siempre
+            # abre el teclado, este hecho hoy o no.
+            return PressAction("habit_enter_value", habit.id)
         return PressAction("habit_undo" if _undoes(screen, habit) else "habit", habit.id)
     task = page.key_task.get(key)
     if task is not None:

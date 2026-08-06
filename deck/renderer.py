@@ -6,10 +6,11 @@ from collections.abc import Iterable
 from typing import Any, Literal
 
 from config import KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV
-from core.screens import MenuEntry, ResolvedPage
+from core.screens import MenuEntry, NumericKey, ResolvedPage
 from deck.primitives import solid_tile, text_tile
 from deck.style import (
     COLOR_ARROW,
+    COLOR_CONFIRM,
     COLOR_EMPTY,
     COLOR_ERROR,
     COLOR_HABIT_DONE,
@@ -17,21 +18,30 @@ from deck.style import (
     COLOR_MENU,
     COLOR_NAV,
     COLOR_NEUTRAL,
+    COLOR_NUMERIC,
+    COLOR_NUMERIC_BACKSPACE,
+    COLOR_NUMERIC_DISPLAY,
     COLOR_SHUTDOWN,
     COLOR_TASK_BY_PRIORITY,
     COLOR_TASK_SENDING,
     COLOR_TEMPLATE,
     COLOR_TEMPLATE_PENDING,
     COLOR_TEXT_ARROW,
+    COLOR_TEXT_CONFIRM,
     COLOR_TEXT_HABIT_DONE,
     COLOR_TEXT_HABIT_PENDING,
     COLOR_TEXT_NAV,
+    COLOR_TEXT_NUMERIC,
+    COLOR_TEXT_NUMERIC_BACKSPACE,
+    COLOR_TEXT_NUMERIC_DISPLAY,
     COLOR_TEXT_SHUTDOWN,
     COLOR_TEXT_TASK_BY_PRIORITY,
     COLOR_TEXT_TEMPLATE,
     COLOR_TEXT_TEMPLATE_PENDING,
     FONT_SIZE_HABIT_PENDING,
     FONT_SIZE_NAV,
+    FONT_SIZE_NUMERIC,
+    FONT_SIZE_NUMERIC_DISPLAY,
     FONT_SIZE_TASK,
     FONT_SIZE_TEMPLATE,
 )
@@ -178,20 +188,62 @@ def render_nav_entry(deck: Any, key: int, entry: MenuEntry) -> None:
     deck.set_key_image(key, image)
 
 
+def render_numeric_key(deck: Any, key: int, nk: NumericKey) -> None:
+    """Pinta un boton del teclado numerico de entrada manual (ver
+    ``core.screens.NUMERIC_KEYPAD``).
+
+    "Salir" reutiliza el azul generico de navegacion (``COLOR_NAV``): es el
+    mismo rol de "esto te saca de aqui" que la tecla de menu. El resto usa una
+    familia de colores propia que no choca con habito/tarea/plantilla/nav (ver
+    ``deck/style.py``): digitos y "." en gris azulado, "Borrar" en ambar
+    (distinto de ``COLOR_ERROR``), "OK" en verde estatico, y la "pantalla" del
+    valor tecleado en un tono oscuro propio.
+    """
+    if nk.kind == "display":
+        image = text_tile(
+            deck,
+            COLOR_NUMERIC_DISPLAY,
+            nk.label or "0",
+            text_color=COLOR_TEXT_NUMERIC_DISPLAY,
+            font_size=FONT_SIZE_NUMERIC_DISPLAY,
+        )
+    elif nk.kind == "cancel":
+        image = text_tile(deck, COLOR_NAV, nk.label, text_color=COLOR_TEXT_NAV, font_size=FONT_SIZE_NAV, emoji="✕")
+    elif nk.kind == "backspace":
+        image = text_tile(
+            deck,
+            COLOR_NUMERIC_BACKSPACE,
+            nk.label,
+            text_color=COLOR_TEXT_NUMERIC_BACKSPACE,
+            font_size=FONT_SIZE_NAV,
+            emoji="⌫",
+        )
+    elif nk.kind == "confirm":
+        image = text_tile(
+            deck, COLOR_CONFIRM, nk.label, text_color=COLOR_TEXT_CONFIRM, font_size=FONT_SIZE_NAV, emoji="✔️"
+        )
+    else:  # "digit" | "decimal"
+        image = text_tile(deck, COLOR_NUMERIC, nk.label, text_color=COLOR_TEXT_NUMERIC, font_size=FONT_SIZE_NUMERIC)
+    deck.set_key_image(key, image)
+
+
 def render_page(deck: Any, resolved: ResolvedPage) -> None:
     """Repinta las 15 teclas segun la pagina ya resuelta por ``core.screens``.
 
-    Cada tecla se resuelve en orden: menu (fija), flecha de paginacion o
-    neutra, entrada de menu/sistema, habito, tarea, plantilla y, si no es nada
-    de eso, vacia. ``resolved`` ya trae listo que hay en cada tecla; esta
-    funcion solo pinta.
+    Cada tecla se resuelve en orden: teclado numerico (si la pantalla activa
+    es ``NUMERIC_ENTRY``, cubre las 15 y va primero porque ahi 0/5/10 no son
+    menu/paginacion), menu (fija), flecha de paginacion o neutra, entrada de
+    menu/sistema, habito, tarea, plantilla y, si no es nada de eso, vacia.
+    ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
         deck: El dispositivo Stream Deck.
         resolved: La pagina activa, resuelta con ``core.screens.resolve_page``.
     """
     for key in range(deck.key_count()):
-        if key == KEY_MENU:
+        if key in resolved.key_numeric:
+            render_numeric_key(deck, key, resolved.key_numeric[key])
+        elif key == KEY_MENU:
             render_menu_key(deck, key)
         elif key in (KEY_PAGE_PREV, KEY_PAGE_NEXT):
             direction = "prev" if key == KEY_PAGE_PREV else "next"

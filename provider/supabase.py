@@ -114,6 +114,7 @@ def build_habit(data: dict[str, Any]) -> Habit:
             goal=float(data.get("goal", 1.0)),
             step=float(data.get("step", 1.0)),
             unit=str(data.get("unit") or ""),
+            manual_entry=bool(data.get("manual_entry", False)),
         )
     return BooleanHabit(id=id, name=name, emoji=emoji, order=order, current_value=current_value)
 
@@ -224,7 +225,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
                 f"{self._base}/v_today_habits",
                 headers=self._headers(Accept="application/json"),
                 params={
-                    "select": "id,name,icon_res,type,goal,step,unit,sort_order,current_value",
+                    "select": "id,name,icon_res,type,goal,step,unit,manual_entry,sort_order,current_value",
                     "order": "sort_order",
                 },
                 timeout=10,
@@ -279,6 +280,29 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
             return float(resp.json())
         except ValueError as exc:
             raise ProviderDataError("POST rpc/habit_undo -> respuesta no es un numero valido") from exc
+
+    def set_value(self, habit: Habit, value: float) -> float:
+        """Fija el valor exacto de hoy de ``habit`` via ``rpc/habit_set``.
+
+        Simetrica de ``step``/``undo`` en la forma, pero el valor lo decide el
+        llamador: la base solo aplica ``greatest(p_value, 0)`` y hace upsert
+        del checkin de hoy.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/habit_set",
+                headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
+                json={"p_habit_id": habit.id, "p_value": value},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/habit_set")
+        try:
+            return float(resp.json())
+        except ValueError as exc:
+            raise ProviderDataError("POST rpc/habit_set -> respuesta no es un numero valido") from exc
 
     def get_tasks(self) -> list[Task]:
         """Devuelve las tareas pendientes de hoy, ya mapeadas a dominio.

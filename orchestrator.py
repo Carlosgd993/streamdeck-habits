@@ -42,6 +42,7 @@ from provider.supabase import SupabaseProvider
 state_lock = threading.Lock()
 pending_requests: set[str] = set()  # ids (habito, tarea, plantilla o el centinela de navegacion) en vuelo
 _NAV_SENTINEL = "__nav__"  # clave de _claim/_release para no duplicar una entrada a vista por doble toque
+_ENTRY_MAX_CHARS = 10  # limite del valor tecleado en el teclado numerico, para que quepa en el tile
 
 
 def _claim(item_id: str) -> bool:
@@ -124,6 +125,7 @@ def make_key_callback(
     dispatch_navigation: Callable[[screens.PressAction], None],
     repaint: Callable[[], None],
     refresh: Callable[[], None],
+    exit_numeric_entry: Callable[[], None],
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el estado actual.
 
@@ -189,6 +191,26 @@ def make_key_callback(
             que corre periodicamente. Lo usa el deshacer de un habito, que
             necesita releer el estado real en vez de fiarse del valor
             devuelto.
+        exit_numeric_entry: Vuelve de la pantalla de teclado numerico a la
+            vista de origen y repinta. Lo usa una confirmacion ("OK") con
+            exito; en un fallo se queda en el teclado (ver mas abajo) para
+            poder reintentar sin volver a teclear.
+
+    Se suma un cuarto tipo de tecla, aparte de habito/tarea/plantilla:
+
+    - **Entrada manual de un habito** (``manual_entry``, p.ej. "Peso"): pulsar
+      la tecla no llama a ``step``, resuelve a ``"habit_enter_value"`` y abre
+      la pantalla de teclado numerico (navegacion pura, sin red, delegada en
+      ``dispatch_navigation`` igual que abrir el menu). Teclear digitos/"."/
+      borrar tampoco toca la red: solo muta ``ScreenState.entry_value`` y
+      repinta (tambien via ``dispatch_navigation``). Confirmar ("OK") si que
+      llama al proveedor (``set_value``, aqui en ``press_habit_value``) con el
+      mismo patron de acuse que un habito/tarea: si el valor tecleado esta
+      vacio o no parsea como numero, no hace nada (se sigue pudiendo teclear);
+      si el proveedor confirma, mutacion optimista + ``exit_numeric_entry``;
+      si falla, la tecla "OK" queda en rojo con el codigo y la pantalla se
+      queda en el teclado con lo tecleado intacto, para reintentar sin perder
+      nada.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
@@ -216,6 +238,30 @@ def make_key_callback(
             else:
                 _safe_render(repaint)
             print(f"{what} OK: {habit.name} -> {new_value}", flush=True)
+
+    def press_habit_value(deck: Any, key: int, habit_id: str) -> None:
+        habit = habits_ref["value"].get(habit_id)
+        if habit is None:
+            return  # habito desconocido (caso defensivo entre ciclos): se ignora
+        with screen_lock:
+            typed = screen.entry_value
+        try:
+            value = float(typed)
+        except ValueError:
+            return  # vacio o invalido (p.ej. solo "."): no se envia nada, se sigue tecleando
+        try:
+            new_value = provider.set_value(habit, value)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(habit_id, str(exc), kind="habit")
+            # Se queda en el teclado (no exit_numeric_entry) para poder
+            # reintentar sin perder lo tecleado; el codigo va sobre "OK".
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Entrada manual FALLO [{code}]: {habit_id}", flush=True)
+        else:
+            habit.current_value = new_value
+            _safe_render(exit_numeric_entry)
+            print(f"Entrada manual OK: {habit.name} -> {new_value}", flush=True)
 
     def press_task(deck: Any, key: int, task_id: str) -> None:
         task = tasks_ref["value"].get(task_id)
@@ -286,9 +332,11 @@ def make_key_callback(
             resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, mapping)
             action = screens.resolve_press(screen, key, resolved)
 
-        if action.kind in ("habit", "habit_undo", "task", "template"):
+        if action.kind in ("habit", "habit_undo", "task", "template", "numeric_confirm"):
             # Un habito reserva su id sea cual sea la operacion, asi que un
-            # paso y un deshacer del mismo habito tampoco pueden solaparse.
+            # paso/deshacer/confirmacion de entrada manual del mismo habito
+            # tampoco pueden solaparse ("numeric_confirm" lleva el habit_id
+            # como payload, ver core.screens.resolve_press).
             item_id = action.payload
             if not _claim(item_id):
                 return  # ya hay una peticion en vuelo para este elemento
@@ -297,6 +345,8 @@ def make_key_callback(
                     press_task(deck, key, item_id)
                 elif action.kind == "template":
                     press_template(deck, key, item_id)
+                elif action.kind == "numeric_confirm":
+                    press_habit_value(deck, key, item_id)
                 else:
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
@@ -388,6 +438,7 @@ def main() -> None:
                 _dispatch_navigation,
                 _repaint_locked,
                 refresh_cycle,
+                _exit_numeric_entry,
             )
         )
 
@@ -462,6 +513,37 @@ def main() -> None:
             screen.page += delta
             _paint_current_screen()
 
+    def _enter_numeric_entry(habit_id: str) -> None:
+        """Abre el teclado numerico para ``habit_id``, sin tocar
+        ``view_id``/``page``: es lo que permite que "Salir" vuelva
+        exactamente a la vista de origen (ver ``core.screens.ScreenState``)."""
+        with screen_lock:
+            screen.kind = screens.ScreenKind.NUMERIC_ENTRY
+            screen.entry_habit_id = habit_id
+            screen.entry_value = ""
+            _paint_current_screen()
+
+    def _exit_numeric_entry() -> None:
+        """Vuelve de la pantalla de teclado numerico a la vista de origen."""
+        with screen_lock:
+            screen.kind = screens.ScreenKind.VIEW
+            _paint_current_screen()
+
+    def _numeric_edit(kind: str, digit: str) -> None:
+        """Muta ``ScreenState.entry_value`` (teclear un digito, el punto
+        decimal o borrar) y repinta. Sin llamada de red, asi que no pasa por
+        ``_claim``/``_release``."""
+        with screen_lock:
+            if kind == "digit":
+                if len(screen.entry_value) < _ENTRY_MAX_CHARS:
+                    screen.entry_value += digit
+            elif kind == "decimal":
+                if "." not in screen.entry_value:
+                    screen.entry_value = (screen.entry_value or "0") + "."
+            elif kind == "backspace":
+                screen.entry_value = screen.entry_value[:-1]
+            _paint_current_screen()
+
     def _enter_view(view_id: str) -> None:
         """Cambia a ``view_id`` en pagina 0 y fuerza un refresco completo
         (refetch + repintado): entrar en una vista desde el menu siempre
@@ -506,6 +588,16 @@ def main() -> None:
             _change_page(1)
         elif action.kind == "shutdown":
             deck_keys.shutdown_pi()
+        elif action.kind == "habit_enter_value":
+            _enter_numeric_entry(action.payload)
+        elif action.kind == "numeric_cancel":
+            _exit_numeric_entry()
+        elif action.kind == "numeric_digit":
+            _numeric_edit("digit", action.payload)
+        elif action.kind == "numeric_decimal":
+            _numeric_edit("decimal", "")
+        elif action.kind == "numeric_backspace":
+            _numeric_edit("backspace", "")
 
     auto_return_timer = _AutoReturnTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)
     auto_return_timer.reset()  # armado desde el arranque

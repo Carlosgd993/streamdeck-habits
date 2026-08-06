@@ -62,3 +62,20 @@ COLOR_TEXT_TEMPLATE = (255, 255, 255)
 COLOR_TEMPLATE_PENDING = COLOR_HABIT_DONE
 COLOR_TEXT_TEMPLATE_PENDING = COLOR_TEXT_HABIT_DONE
 FONT_SIZE_TEMPLATE = 14
+
+# --- Teclado numerico (entrada manual de un habito, p.ej. "Peso") -----------
+# Familia nueva, sin chocar con ninguna de las anteriores: no es un habito
+# (blanco/gris), ni una tarea (prioridad), ni una plantilla (morado), ni
+# navegacion de menu (COLOR_NAV es azul, pero "Salir" lo reutiliza tal cual:
+# mismo rol de "esto te saca de aqui" que la tecla de menu).
+COLOR_NUMERIC = (45, 45, 60)               # digitos y "."
+COLOR_TEXT_NUMERIC = (255, 255, 255)
+COLOR_NUMERIC_BACKSPACE = (200, 130, 40)   # ambar: distinto de COLOR_ERROR
+COLOR_TEXT_NUMERIC_BACKSPACE = (0, 0, 0)
+COLOR_CONFIRM = (30, 160, 70)              # verde estatico del boton OK (no el
+                                            # verde vivo de acuse COLOR_TASK_SENDING)
+COLOR_TEXT_CONFIRM = (255, 255, 255)
+COLOR_NUMERIC_DISPLAY = (20, 20, 30)       # "pantalla" del valor tecleado
+COLOR_TEXT_NUMERIC_DISPLAY = (255, 255, 255)
+FONT_SIZE_NUMERIC = 20
+FONT_SIZE_NUMERIC_DISPLAY = 14

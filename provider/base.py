@@ -67,14 +67,28 @@ class Habit(ABC):
         current_value: Progreso acumulado hoy, ya calculado por el proveedor.
             Puede superar ``goal`` (p.ej. ``10.0`` con un objetivo de ``8.0``):
             es un estado valido, no un error.
+        manual_entry: Si es ``True``, pulsar la tecla no avanza un paso: abre
+            la pantalla de teclado numerico para fijar el valor exacto de hoy
+            (``HabitProvider.set_value``). Solo tiene sentido en un habito
+            cuantificable; vive en la clase base para que ``core.screens``
+            pueda leerlo sin ``isinstance``, igual que ``goal``/``is_done``.
     """
 
-    def __init__(self, id: str, name: str, emoji: str = "", order: int = 0, current_value: float = 0.0) -> None:
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        emoji: str = "",
+        order: int = 0,
+        current_value: float = 0.0,
+        manual_entry: bool = False,
+    ) -> None:
         self.id = id
         self.name = name
         self.emoji = emoji
         self.order = order
         self.current_value = current_value
+        self.manual_entry = manual_entry
 
     @property
     def goal(self) -> float:
@@ -107,7 +121,8 @@ class RealHabit(Habit):
     """Habito cuantificable: acumula ``step`` con cada pulsacion, sin tope.
 
     Attributes:
-        step: Cantidad que suma cada pulsacion (p.ej. ``1.0`` vaso).
+        step: Cantidad que suma cada pulsacion (p.ej. ``1.0`` vaso). Sin uso
+            si ``manual_entry`` es ``True``: ahi no se suma nada, se fija.
         unit: Unidad del habito (p.ej. ``"Cups"``); vacia si no esta definida.
     """
 
@@ -121,8 +136,9 @@ class RealHabit(Habit):
         goal: float = 1.0,
         step: float = 1.0,
         unit: str = "",
+        manual_entry: bool = False,
     ) -> None:
-        super().__init__(id, name, emoji, order, current_value)
+        super().__init__(id, name, emoji, order, current_value, manual_entry)
         self._goal = goal
         self.step = step
         self.unit = unit
@@ -138,7 +154,15 @@ class RealHabit(Habit):
         El nombre se omite a proposito: el emoji del habito ya identifica de
         que habito se trata, y en la tecla apenas hay sitio para nombre +
         progreso legibles. Puede superar el objetivo (p.ej. ``"10/8 Cups"``).
+
+        Excepcion: si ``manual_entry`` es ``True`` (p.ej. "Peso") no hay
+        "progreso hacia un objetivo" que mostrar -- el valor es una medicion,
+        no un avance -- asi que aqui se comporta como ``BooleanHabit``: el
+        nombre, sin numero. El valor sigue viendose en el teclado numerico al
+        pulsar la tecla (ver ``core.screens``).
         """
+        if self.manual_entry:
+            return self.name
         progress = f"{_format_number(self.current_value)}/{_format_number(self.goal)}"
         if self.unit:
             progress = f"{progress} {self.unit}"
@@ -322,6 +346,28 @@ class HabitProvider(ABC):
         Returns:
             El nuevo valor TOTAL acumulado hoy, o ``0.0`` si hoy no habia
             ningun progreso que deshacer (deshacer es seguro de repetir).
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def set_value(self, habit: Habit, value: float) -> float:
+        """Fija el valor exacto de hoy de ``habit`` (entrada manual).
+
+        A diferencia de ``step``/``undo``, aqui el llamador decide el valor:
+        es la operacion que usa un habito ``manual_entry`` (p.ej. "Peso") tras
+        teclearlo en el deck. El proveedor sigue teniendo la ultima palabra
+        (no baja de 0), pero no suma ni resta nada relativo al valor previo.
+
+        Args:
+            habit: El habito sobre el que fijar el valor.
+            value: El valor exacto a registrar hoy.
+
+        Returns:
+            El nuevo valor TOTAL acumulado hoy.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.
