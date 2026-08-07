@@ -79,3 +79,14 @@ COLOR_NUMERIC_DISPLAY = (20, 20, 30)       # "pantalla" del valor tecleado
 COLOR_TEXT_NUMERIC_DISPLAY = (255, 255, 255)
 FONT_SIZE_NUMERIC = 20
 FONT_SIZE_NUMERIC_DISPLAY = 14
+
+# --- Stand by ---------------------------------------------------------------
+# La pantalla de suspension se ve con el brillo al minimo
+# (``deck.session.BRIGHTNESS_STANDBY``), asi que aqui no se busca contraste
+# entre teclas sino que el conjunto quede casi negro y solo se distinga el
+# icono: fondo negro como una tecla vacia, y el emoji como unico elemento
+# encendido. Que se vea *algo* es justo lo que separa "suspendida" de
+# "apagada"/"colgada" a simple vista.
+COLOR_STANDBY = COLOR_EMPTY
+COLOR_TEXT_STANDBY = (110, 110, 110)
+FONT_SIZE_STANDBY = 12

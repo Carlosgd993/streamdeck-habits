@@ -10,6 +10,12 @@ from typing import Any
 from StreamDeck.DeviceManager import DeviceManager
 
 BRIGHTNESS = 60
+# Minimo con el que el icono de stand by se sigue distinguiendo. No es 0 a
+# proposito: a 0 el deck parece apagado o colgado, y la idea es que se note que
+# esta suspendido. El brillo es global (no hay control por tecla), asi que este
+# valor ilumina tenuemente las 15; subirlo se come parte del ahorro casi en
+# proporcion directa. Es la constante a tocar para ajustarlo a ojo.
+BRIGHTNESS_STANDBY = 10
 
 
 class DeckSession:
@@ -55,9 +61,25 @@ class DeckSession:
             sys.exit(1)
         deck.open()
         deck.reset()
-        deck.set_brightness(BRIGHTNESS)
         self.deck = deck
+        self.set_brightness(BRIGHTNESS)
         return self.deck
+
+    def set_brightness(self, percent: int) -> None:
+        """Fija el brillo de la retroiluminacion (0-100).
+
+        Es la unica palanca de consumo real que tiene el daemon, y no necesita
+        privilegios: apagarla (``BRIGHTNESS_STANDBY``) es lo que hace el modo
+        stand by. No toca las imagenes ya pintadas ni el hilo de lectura del
+        deck, asi que una tecla pulsada con el brillo a 0 se sigue recibiendo
+        igual -- que es justo lo que permite despertarlo.
+
+        Args:
+            percent: Brillo en tanto por ciento. La libreria ya lo satura al
+                rango valido.
+        """
+        if self.deck is not None:
+            self.deck.set_brightness(percent)
 
     def reconnect(self) -> Any:
         """Repite la logica de apertura tras un fallo de dispositivo en

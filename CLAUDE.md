@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Qué es esto
 
-Un daemon Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos y tareas. Corre 24/7 como servicio systemd en una Raspberry Pi 3, sondea la base de datos vía PostgREST cada 15 minutos y navega por un **menú de pantallas** (ver [Menú y pantallas](#menú-y-pantallas)): la vista por defecto "Hoy" pinta hábitos en blanco (pendiente) o gris oscuro (hecho hoy), registrando un checkin al pulsarlos, y tareas pendientes en el color de su prioridad, cerrándose al pulsarlas; desde el menú también se llega a vistas filtradas ("Hábitos" —  donde pulsar un booleano ya hecho lo **deshace** —, "Tareas"), a "Crear" (crea una tarea a partir de una plantilla) y a un submenú "Sistema" con el apagado de la Pi.
+Un daemon Python que convierte una Elgato Stream Deck física en un mando de seguimiento de hábitos y tareas. Corre 24/7 como servicio systemd en una Raspberry Pi 3, sondea la base de datos vía PostgREST cada 15 minutos y navega por un **menú de pantallas** (ver [Menú y pantallas](#menú-y-pantallas)): la vista por defecto "Hoy" pinta hábitos en blanco (pendiente) o gris oscuro (hecho hoy), registrando un checkin al pulsarlos, y tareas pendientes en el color de su prioridad, cerrándose al pulsarlas; desde el menú también se llega a vistas filtradas ("Hábitos" —  donde pulsar un booleano ya hecho lo **deshace** —, "Tareas"), a "Crear" (crea una tarea a partir de una plantilla) y a un submenú "Sistema" con la suspensión de la pantalla y el apagado de la Pi. Tras `STANDBY_SECONDS` sin pulsar nada (o pulsando "Suspender") entra en **stand by**: apaga la retroiluminación y deja de sondear, y cualquier tecla lo despierta — ver [Stand by](#stand-by).
 
 La base de datos vive en el repo hermano `../habits-core` (repositorio Git independiente). Este daemon es deliberadamente **tonto**: no calcula qué día es hoy, ni el siguiente valor de un hábito, ni qué tareas tocan, ni si algo está bloqueado. Todo eso lo decide la base. Ver [../CLAUDE.md](../CLAUDE.md) para el contexto que atraviesa ambos repos.
 
@@ -16,7 +16,7 @@ Son ~1.500 líneas en total: leer un módulo entero es barato, la duda suele ser
 
 ```
 orchestrator.py        Punto de entrada (ExecStart de systemd). Bucle, dispatcher de pantallas y callbacks de tecla.
-config.py               Rutas, teclas reservadas, tamaño de página, timeouts de refresco/auto-retorno.
+config.py               Rutas, teclas reservadas, tamaño de página, timeouts de refresco/auto-retorno/stand by.
 
 provider/              LA API, aislada tras tres puertos. No sabe nada del deck ni de pantallas.
   base.py             Los puertos: HabitProvider, TaskProvider y TemplateProvider;
@@ -25,7 +25,7 @@ provider/              LA API, aislada tras tres puertos. No sabe nada del deck 
                        build_template(). Único sitio con detalles de Supabase.
 
 deck/                  EL HARDWARE. No sabe nada del proveedor de datos.
-  session.py          Abrir/cerrar/reconectar el dispositivo, brillo.
+  session.py          Abrir/cerrar/reconectar el dispositivo, brillo (incluido el 0 del stand by).
   renderer.py         Pintado de alto nivel: render_habit, render_task, render_page (pinta cualquier
                        pantalla ya resuelta por core.screens)…
   primitives.py       Pillow de bajo nivel: solid_tile, text_tile, fuente de emoji.
@@ -33,8 +33,8 @@ deck/                  EL HARDWARE. No sabe nada del proveedor de datos.
   style.py            Colores y tamaños de fuente. Nada más.
 
 core/                  DOMINIO. Agnóstico de ambos lados.
-  screens.py          Registro extensible de menú/submenú/vistas y su resolución a teclas. Ver
-                       [Menú y pantallas](#menú-y-pantallas).
+  screens.py          Registro extensible de menú/submenú/vistas y su resolución a teclas, más
+                       el teclado numérico y el stand by. Ver [Menú y pantallas](#menú-y-pantallas).
   key_map.py          Asignación persistente hábito → tecla, volátil tarea → tecla, y paginate().
   health.py           Clasificar un fallo: ¿tecla en rojo o solo log?
   error_codes.py      AUTH / NET / API / KFUL.
@@ -55,6 +55,8 @@ scripts/               Dos smoke tests de hardware. Requieren un deck conectado.
 | Qué plantillas ofrece "Crear" | **Nada de código**: la columna `task_templates.show_in_deck` en `../habits-core` | `update task_templates set show_in_deck = true where …`. El daemon solo filtra por ella |
 | Qué hábitos abren el teclado numérico en vez de sumar paso | **Nada de código**: la columna `habits.manual_entry` en `../habits-core` (solo con `type='Real'`) | Ver [Menú y pantallas](#menú-y-pantallas), sección "teclado numérico" |
 | Qué hace una tecla reservada (menú, paginación, apagado) | `config.py` + `core/screens.py` + `deck/keys.py` | Ver [Menú y pantallas](#menú-y-pantallas) |
+| Cuánto tarda la pantalla en apagarse sola | `config.py` → `STANDBY_SECONDS` | Ver [Stand by](#stand-by). Es la única palanca de consumo que tiene el daemon |
+| Qué se ve mientras está suspendido | `core/screens.py` → `STANDBY_LAYOUT` | Un dict `tecla → StandbyKey(label, emoji)`; lo que no aparece se pinta negro. El brillo va aparte, en `deck/session.py` → `BRIGHTNESS_STANDBY` |
 | Cómo se habla con la base | `provider/supabase.py` **y solo ahí** | Si tocas otro sitio, has roto el aislamiento |
 | Qué campos trae un hábito, una tarea o una plantilla | `provider/supabase.py::build_habit`/`build_task`/`build_template` + `provider/base.py` | La columna debe existir ya en la vista de `habits-core` |
 | Cuándo se refresca o qué pasa al pulsar | `orchestrator.py` | Ver [El bucle principal](#el-bucle-principal) |
@@ -94,7 +96,7 @@ El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` de
 
 ### `deck/` — hardware y pintado
 
-- **`session.py`** — `DeckSession`: apertura (30 reintentos cada 2s; `sys.exit(1)` si no aparece), cierre, `reconnect()` y brillo (`BRIGHTNESS = 60`). `reconnect()` solo se usa tras un fallo en marcha, nunca en el arranque inicial.
+- **`session.py`** — `DeckSession`: apertura (30 reintentos cada 2s; `sys.exit(1)` si no aparece), cierre, `reconnect()` y brillo (`set_brightness()`, entre `BRIGHTNESS = 60` y `BRIGHTNESS_STANDBY = 0`). `reconnect()` solo se usa tras un fallo en marcha, nunca en el arranque inicial, y **reabre siempre a `BRIGHTNESS`**: por eso el bucle principal re-aplica el brillo de stand by tras reconectar (ver [Stand by](#stand-by)).
 - **`renderer.py`** — alto nivel, sobre una tecla o el deck completo: `render_habit` (usa `display_label()`, `emoji` e `is_done` para elegir blanco/pendiente o gris/hecho — solo color, sin bloquear nada), `render_task` (color de fondo según `priority`; una prioridad desconocida cae a la 0 en vez de fallar), `render_task_sending` (verde vivo + ✔, el acuse de recibo de la pulsación), `render_checkin_error`, `render_empty`, `render_menu_key` (tecla 0, fija en toda pantalla), `render_arrow` (teclas 5/10: el icono ◀️/▶️ se pinta siempre, activa o no la paginación — solo cambia el fondo, `COLOR_ARROW` si hay más de una página o `COLOR_NEUTRAL` si no), `render_nav_entry` (un botón de menú o de Sistema; el de "Apagar" usa el rojo de aviso `COLOR_SHUTDOWN`, el resto el azul genérico `COLOR_NAV`), `render_template` (una plantilla de "Crear": morada si se puede usar, gris apagado si ya tiene ocurrencia abierta — ahí el gris **sí** significa deshabilitada, al revés que en un hábito), `render_numeric_key` (un botón del teclado numérico de entrada manual — dígito/".", "Borrar", "OK", "Salir" o la "pantalla" con lo tecleado, ver [Menú y pantallas](#menú-y-pantallas)), `render_page` (pinta las 15 teclas a partir de un `core.screens.ResolvedPage` ya resuelto: si la pantalla activa es el teclado numérico, las 15 salen de `key_numeric` — incluidas 0/5/10, reinterpretadas ahí como salir/borrar/confirmar —, si no, menú fijo en 0, flecha en 5/10, entrada de menú/hábito/tarea/plantilla en el resto, vacía si no hay nada), `render_error_all` (pinta el código de error en un conjunto de teclas — las de hábitos o las de tareas de la página visible, según cuál haya fallado, para no dejar información obsoleta en pantalla).
 - **`primitives.py`** — Pillow de bajo nivel vía `PILHelper`: `solid_tile` (color plano) y `text_tile` (texto envuelto/centrado más un `emoji` opcional como icono a color en la mitad superior, o la tecla entera si `text` es vacío). El emoji usa `_emoji_font()` (`NotoColorEmoji.ttf`, probando los tamaños de "strike" conocidos porque es una fuente CBDT/CBLC de mapa de bits) y `_emoji_glyph()` (`embedded_color=True`, reescalado).
 - **`keys.py`** — un único efecto lateral: `shutdown_pi()`, invocado desde el dispatcher de `orchestrator.py` cuando se pulsa "Apagar" en el submenú Sistema. Ver [Menú y pantallas](#menú-y-pantallas).
@@ -112,7 +114,7 @@ El eje del diseño es un **puerto/adaptador (hexagonal)**: `provider/base.py` de
 
 ## Menú y pantallas
 
-La tecla 0 (`config.KEY_MENU`) abre siempre el menú principal, desde cualquier pantalla (no hace nada si ya estás en el menú). El menú tiene botones "Hoy", "Hábitos", "Tareas", "Crear" y "Sistema"; "Sistema" es un submenú con "Apagar" — sin botón "Atrás": sería redundante, la tecla 0 ya vuelve al menú principal desde Sistema igual que desde cualquier otra pantalla. La vista por defecto, tanto al arrancar el daemon como al volver por inactividad, es "Hoy" (`core.screens.DEFAULT_VIEW_ID`).
+La tecla 0 (`config.KEY_MENU`) abre siempre el menú principal, desde cualquier pantalla (no hace nada si ya estás en el menú). El menú tiene botones "Hoy", "Hábitos", "Tareas", "Crear" y "Sistema"; "Sistema" es un submenú con "Suspender" y "Apagar" — sin botón "Atrás": sería redundante, la tecla 0 ya vuelve al menú principal desde Sistema igual que desde cualquier otra pantalla. La vista por defecto, tanto al arrancar el daemon como al volver por inactividad o del stand by, es "Hoy" (`core.screens.DEFAULT_VIEW_ID`).
 
 Todo esto se resuelve con una sola abstracción en `core/screens.py`: una pantalla activa (`ScreenState`: menú, Sistema o una vista con su página) se resuelve contra los datos vigentes con `resolve_page(...)` a un `ResolvedPage` (qué hábito/tarea/plantilla/entrada de menú pintar en cada tecla, más el total de páginas), y una pulsación se resuelve con `resolve_press(screen, key, page)` a una `PressAction` que el dispatcher de `orchestrator.py` ejecuta. `deck/renderer.py::render_page` pinta cualquier `ResolvedPage` con el mismo bucle, sea menú, Sistema o una vista.
 
@@ -134,7 +136,42 @@ Un hábito `manual_entry` **no tiene "deshacer"**: a diferencia de "Hábitos" co
 
 Entrar en una vista desde el menú ("Hoy"/"Hábitos"/"Tareas"/"Crear") dispara un refresco completo (refetch + repintado) antes de pintarla; navegar dentro de una pantalla ya cargada (menú, Sistema, cambiar de página) solo repinta, sin refetch. El refresco periódico de `REFRESH_SECONDS` sigue actualizando los datos en segundo plano y repinta lo que esté visible en cada momento, sea cual sea la pantalla activa.
 
-Si el deck lleva `AUTO_RETURN_SECONDS` (5 min) sin ninguna pulsación estando fuera de "Hoy", vuelve solo a "Hoy" (con los datos ya en caché, sin refetch). Cualquier pulsación, en cualquier pantalla, reprograma ese temporizador.
+Si el deck lleva `AUTO_RETURN_SECONDS` (5 min) sin ninguna pulsación estando fuera de "Hoy", vuelve solo a "Hoy" (con los datos ya en caché, sin refetch). Cualquier pulsación, en cualquier pantalla, reprograma ese temporizador — y también el de stand by, ver abajo.
+
+## Stand by
+
+`ScreenKind.STANDBY` es la quinta pantalla: baja la retroiluminación del deck al mínimo (`session.set_brightness(BRIGHTNESS_STANDBY)`), pinta una pantalla fija con un icono y suspende el ciclo de refresco. Entra de dos formas, ambas por `orchestrator._enter_standby`:
+
+- **Sola**, tras `config.STANDBY_SECONDS` (30 min) sin ninguna pulsación. Es un segundo `_IdleTimer` con el mismo disparador que el de auto-retorno (cualquier tecla los reprograma los dos) y plazo distinto, así que lo normal es que primero vuelva a "Hoy" a los 5 min y 25 min después se apague.
+- **A mano**, con el botón "Suspender" del submenú Sistema.
+
+**Es la única palanca de consumo real que tiene el daemon, y es la que importa.** La deck MK.2 declara `MaxPower 500mA` y consume ~300 mA (~1,5 W) en marcha; los 15 backlights son el grueso, así que bajarlos al mínimo ahorra del orden de ~0,7–0,9 W de los ~2,5–3 W del conjunto Pi+deck (a brillo 0 serían ~0,1 W más, que es lo que cuesta ver el icono). Todo lo demás que se probó en la Pi 3 no compensa: `ondemand` ya baja sola a 600 MHz en reposo, el daemon ya consume 0,2% de CPU (bajar `set_poll_frequency` no da nada), y HDMI/LEDs/`wlan0` suman ~0,1–0,3 W a cambio de reglas `sudoers` nuevas. Cortar la alimentación USB o dejar que la deck haga autosuspend USB mataría el propio camino de despertado. **No se puede medir por software**: la Pi 3 no tiene el ADC del PMIC (`vcgencmd pmic_read_adc` responde `Command not registered`, es de Pi 4/5); haría falta un medidor USB intercalado.
+
+**Pulsar cualquier tecla despierta, y esa pulsación no hace nada más.** `core.screens.resolve_press` comprueba `ScreenKind.STANDBY` **lo primero de todo** — antes que `NUMERIC_ENTRY` y antes que `KEY_MENU`/paginación — y devuelve `"wake"` sin llegar a mirar el índice de tecla. Es lo que garantiza que encender el deck a ciegas no cierre la tarea ni marque el hábito que hubiera debajo. Cualquier pantalla nueva que se añada debe respetar ese orden.
+
+Despertar (`orchestrator._wake`) es **datos frescos primero, luz después**: reutiliza `_enter_view(DEFAULT_VIEW_ID)`, que ya reserva el centinela de navegación (un doble toque no dispara dos refrescos), saca de `STANDBY` y fuerza un `refresh_cycle()` completo. Como ese repintado ocurre con el brillo todavía a 0, el deck se enciende ya con el contenido correcto: sin destello de datos viejos ni doble repintado. A cambio, tarda lo que tarde la red (1-2 s). El `finally` que sube el brillo **no es decorativo**: si el proveedor está caído o falla el dispositivo, el deck tiene que encenderse igual o se quedaría negro para siempre.
+
+### Qué se ve mientras está suspendido
+
+El brillo de stand by **no es 0** a propósito: a 0 el deck parece apagado o colgado. `BRIGHTNESS_STANDBY = 10` (en `deck/session.py`) deja lo justo para que se distinga un icono, y es la constante a tocar para ajustarlo a ojo. Ojo: **el brillo del Stream Deck es global, no hay control por tecla**, así que ese valor ilumina tenuemente las 15 y subirlo se come parte del ahorro casi en proporción directa.
+
+**Lo que se ve sale entero de `core.screens.STANDBY_LAYOUT`, y ese dict es el único sitio que hay que tocar para cambiarlo**:
+
+```python
+STANDBY_LAYOUT: dict[int, StandbyKey] = {
+    7: StandbyKey("", "🌙"),   # tecla central: solo icono, sin texto
+}
+```
+
+Las teclas que no aparecen se pintan negras. Añadir, quitar o mover contenido es editar entradas de ese dict — nada más del sistema cambia: `resolve_page` lo expande a las 15 teclas (rellenando con `_STANDBY_BLANK`) y `deck.renderer.render_standby_key` pinta cada una. Los colores y el tamaño de fuente están en `deck/style.py` (`COLOR_STANDBY`, `COLOR_TEXT_STANDBY`, `FONT_SIZE_STANDBY`). `StandbyKey` tiene `label` y `emoji`, igual que un botón de menú, así que una tecla puede llevar texto, icono o ambos.
+
+Que se resuelva a las 15 teclas (y no solo a las que tienen contenido) es lo que hace que `render_page` la trate como un bloque, igual que el teclado numérico: si no, las teclas 0/5/10 recaerían en menú/paginación, que aquí no significan nada.
+
+### Tres detalles que no son obvios y conviene no "simplificar"
+
+- **Entrar en stand by pinta de verdad, y baja el brillo antes de pintar.** Pintar es necesario porque con brillo > 0 la pantalla anterior se seguiría intuyendo. Y el orden (brillo primero) hace que la transición se lea como un fundido en vez de como un parpadeo de pantalla nueva a plena luz.
+- **`_on_auto_return_timeout` sale antes si está suspendido.** Con el botón "Suspender" el stand by se adelanta pero el temporizador de auto-retorno sigue armado; sin esa salida, a los 5 min sacaría de `STANDBY` sin encender la pantalla y dejaría el deck a oscuras con las teclas otra vez activas — justo lo que `"wake"` existe para impedir.
+- **`_enter_standby` comprueba si ya está suspendido.** No es solo defensivo: pulsar "Suspender" reprograma el temporizador de stand by (`on_key_change` lo hace en toda pulsación), que volverá a disparar estando ya suspendido.
 
 **"Hoy" es la única vista que se "vacía", y sin dejar hueco.** Es la única de las tres que usa `_flat_page_builder` en vez del mapeo estable de hábitos: `core.screens._today_items` construye, en cada resolución, la lista de hábitos aún no completados hoy (`not habit.is_done`, ordenados por `(order, id)`) seguida de las tareas pendientes (ya vienen ordenadas por prioridad/fecha), y esa lista se reparte de cero desde la primera tecla disponible con `key_map.paginate` — sin reservar nada. Al completar un hábito o cerrar una tarea, `make_key_callback` repinta la **pantalla entera** (no solo esa tecla): el item desaparece de la lista y todo lo que queda se recoloca una posición, sin dejar hueco entre botones activos. "Hábitos" **no** hace esto a propósito: sigue usando `_tiered_page_builder` (mapeo estable, ver [Reparto de teclas](#reparto-de-teclas)) y muestra el estado de todos, hechos o no, para poder repasarlos — ahí nada desaparece, así que no hay huecos que evitar.
 
@@ -153,7 +190,7 @@ Ese cruce se **recalcula en cada resolución**, no se acumula: si la ocurrencia 
 
 ## El bucle principal
 
-`main()` construye el proveedor (`sys.exit(1)` si falla), abre la sesión del deck, carga el mapeo y entra en un bucle infinito de `refresh_cycle()` separados por `time.sleep(REFRESH_SECONDS)` (900s). El mismo `SupabaseProvider` se usa por sus tres puertos (`habit_provider` / `task_provider` / `template_provider`), solo para dejar explícito qué capacidad usa cada llamada. Todo el estado de pantalla (`screen: core.screens.ScreenState`, `mapping`) está serializado por un `screen_lock` que comparten `refresh_cycle`, las funciones de navegación y el callback de tecla (incluido `repaint()` tras un paso/cierre con éxito), para que un ciclo periódico y una pulsación del usuario nunca se entrelacen.
+`main()` construye el proveedor (`sys.exit(1)` si falla), abre la sesión del deck, carga el mapeo y entra en un bucle infinito de `refresh_cycle()` separados por `time.sleep(REFRESH_SECONDS)` (900s). **En stand by el ciclo se salta entero** (`if not _is_standby()`): no tiene sentido pedir datos ni repintar una pantalla apagada, y el despertado ya fuerza su propio ciclo completo. El bucle sigue despertando cada 15 min sin hacer nada; no compensa complicarlo. El mismo `SupabaseProvider` se usa por sus tres puertos (`habit_provider` / `task_provider` / `template_provider`), solo para dejar explícito qué capacidad usa cada llamada. Todo el estado de pantalla (`screen: core.screens.ScreenState`, `mapping`) está serializado por un `screen_lock` que comparten `refresh_cycle`, las funciones de navegación y el callback de tecla (incluido `repaint()` tras un paso/cierre con éxito), para que un ciclo periódico y una pulsación del usuario nunca se entrelacen.
 
 **Cada ciclo (`refresh_cycle`, bajo `screen_lock`):**
 
@@ -168,7 +205,7 @@ El estado que ve el callback son wrappers dict de una entrada (`habits_ref`/`tas
 
 **Al pulsar una tecla (`make_key_callback`):**
 
-1. Reprograma el temporizador de auto-retorno (`AUTO_RETURN_SECONDS`), sea cual sea la tecla.
+1. Reprograma **los dos** temporizadores de inactividad (`AUTO_RETURN_SECONDS` y `STANDBY_SECONDS`, vía `_reset_idle_timers`), sea cual sea la tecla. Si la pantalla activa es el stand by, la pulsación no hace nada más que despertar (ver [Stand by](#stand-by)).
 2. Bajo `screen_lock`, resuelve la página activa (`core.screens.resolve_page`) y la pulsación contra ella (`core.screens.resolve_press`) a una `PressAction`.
 3. **Hábito** → `provider.step(habit)`, **sin comprobar si ya alcanzó el objetivo**: la tecla nunca se bloquea, es la base quien decide el nuevo valor. Éxito → `habit.current_value = new_value` (mutación directa del objeto compartido con `habits_ref`) y `repaint()`: repinta la **pantalla activa entera**, optimista, sin refetch — no basta con esa tecla porque en "Hoy" el hábito puede desaparecer de la lista y hacer que el resto se recoloque (ver [Menú y pantallas](#menú-y-pantallas)). `pending_requests` + `state_lock` (vía `_claim`/`_release`) descartan una segunda pulsación del mismo elemento mientras hay una en vuelo.
 
@@ -177,7 +214,7 @@ El estado que ve el callback son wrappers dict de una entrada (`habits_ref`/`tas
 5. **Plantilla** (solo en "Crear") → mismo acuse verde, luego `create_task(template)`. Al confirmar la base, la ocurrencia devuelta se **añade** a `tasks_ref` y se repinta: la plantilla se queda en pantalla (ahora en gris, y su tecla ya no hace nada) y la tarea nueva aparece en "Hoy"/"Tareas" sin esperar al siguiente ciclo. Se queda en "Crear", no navega: así se pueden encadenar varias.
 6. **Navegación** (abrir menú/Sistema, volver, elegir vista, paginar, apagar) → se delega en el dispatcher de `orchestrator.py` (`_dispatch_navigation`), que llama a `_enter_menu`/`_enter_system`/`_enter_view`/`_change_page`/`deck_keys.shutdown_pi`. `_enter_view` (entrar en una vista desde el menú) usa el mismo patrón `_claim`/`_release` que un hábito/tarea/plantilla, con una clave centinela fija, para no disparar dos refrescos por un doble toque.
 7. `ProviderError` (en un checkin/cierre/creación) → tecla en rojo con el código + entrada en `checkin_failures.log`.
-8. Cualquier otra excepción → se trata como fallo de dispositivo: **nunca se muestra en tecla**, se registra en `device_errors.log` y dispara `session.reconnect()`. Los repintados van envueltos en `_safe_render` justo por esto.
+8. Cualquier otra excepción → se trata como fallo de dispositivo: **nunca se muestra en tecla**, se registra en `device_errors.log` y dispara `session.reconnect()`. Los repintados van envueltos en `_safe_render` justo por esto. Como `reconnect()` reabre el deck a `BRIGHTNESS`, el bucle re-aplica `BRIGHTNESS_STANDBY` después si estaba suspendido: si no, un fallo de dispositivo encendería el deck sin que nadie lo haya pulsado.
 
 No hay tecla de refresco manual: entrar en una vista desde el menú ya fuerza un refresco completo (ver [Menú y pantallas](#menú-y-pantallas)).
 
@@ -204,9 +241,17 @@ Las tareas se pintan con el color de su prioridad (`deck/style.py`): **0 blanca,
 | 5 | `KEY_PAGE_PREV` | Flecha "◀" si la pantalla activa tiene más de una página; gris neutro si no |
 | 10 | `KEY_PAGE_NEXT` | Flecha "▶" si la pantalla activa tiene más de una página; gris neutro si no |
 
+En el teclado numérico las tres se reinterpretan (salir/borrar/OK) y **en stand by ninguna hace lo de siempre**: cualquiera de las 15 se limita a despertar el deck (ver [Stand by](#stand-by)).
+
 El apagado de la Pi ya no es una tecla fija: es el botón "Apagar" del submenú Sistema (menú → Sistema → Apagar), pintado en rojo de aviso para seguir distinguiéndose como acción destructiva.
 
-### Apagado desde el submenú Sistema
+### El submenú Sistema
+
+Dos botones, en este orden: **"Suspender"** (tecla 1, azul de navegación) y **"Apagar"** (tecla 2, rojo de aviso). El orden es deliberado: la acción reversible se queda con la tecla más accesible y la irreversible no hereda la posición de la que se pulsa a menudo. El color hace el resto — el rojo sigue siendo exclusivo de "Apagar".
+
+"Suspender" **no necesita ninguna regla `sudoers`**, al contrario que "Apagar": es una llamada USB al propio deck (`set_brightness`), no un comando del sistema. Lo de abajo aplica solo a "Apagar".
+
+#### Apagado de la Pi
 
 `deck.keys.shutdown_pi()` ejecuta `sudo -n shutdown -h now`. El servicio corre como `admin` **sin sudo**, así que hace falta una regla `NOPASSWD` en la Pi para que el comando no se quede pidiendo contraseña (el `-n` hace que falle rápido en vez de bloquear si la regla no está):
 

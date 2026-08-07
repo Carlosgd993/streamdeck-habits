@@ -25,9 +25,9 @@ import core.key_map as key_map
 import core.screens as screens
 import deck.keys as deck_keys
 import deck.renderer as renderer
-from config import AUTO_RETURN_SECONDS, REFRESH_SECONDS
+from config import AUTO_RETURN_SECONDS, REFRESH_SECONDS, STANDBY_SECONDS
 from core.error_codes import CODES
-from deck.session import DeckSession
+from deck.session import BRIGHTNESS, BRIGHTNESS_STANDBY, DeckSession
 from provider.base import (
     Habit,
     HabitProvider,
@@ -77,9 +77,13 @@ def _safe_render(render: Callable[[], None]) -> None:
         health.log_device_error(str(device_exc))
 
 
-class _AutoReturnTimer:
-    """Temporizador reiniciable: cada pulsacion lo reprograma; si nadie pulsa
-    nada durante ``seconds``, dispara ``callback`` una vez.
+class _IdleTimer:
+    """Temporizador de inactividad reiniciable: cada pulsacion lo reprograma;
+    si nadie pulsa nada durante ``seconds``, dispara ``callback`` una vez.
+
+    Hay dos instancias, con el mismo disparador (una pulsacion, cualquiera) y
+    plazos distintos: ``AUTO_RETURN_SECONDS`` para volver a "Hoy" y
+    ``STANDBY_SECONDS`` para entrar en stand by.
 
     Usa ``threading.Timer`` con su propio lock interno, independiente de
     ``screen_lock``, para que reprogramarlo (que ocurre en el hilo de
@@ -121,7 +125,7 @@ def make_key_callback(
     templates_ref: dict[str, dict[str, Template]],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
-    auto_return_timer: _AutoReturnTimer,
+    reset_idle_timers: Callable[[], None],
     dispatch_navigation: Callable[[screens.PressAction], None],
     repaint: Callable[[], None],
     refresh: Callable[[], None],
@@ -129,7 +133,7 @@ def make_key_callback(
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el estado actual.
 
-    El closure resultante reprograma el temporizador de auto-retorno en
+    El closure resultante reprograma los temporizadores de inactividad en
     cualquier pulsacion, resuelve que tecla es (habito, tarea o accion de
     navegacion) contra la pagina vigente y actua en consecuencia:
 
@@ -164,8 +168,14 @@ def make_key_callback(
       insertada, ver ``core.screens._create_items``, y ``core.screens`` ya
       devuelve "noop" en ese caso, asi que aqui no hay nada que comprobar.
     - **Navegacion** (menu, submenu Sistema, cambiar de vista, paginar,
-      apagar): se delega entera en ``dispatch_navigation``, definido en
-      ``main()`` porque necesita mutar el estado de pantalla compartido.
+      suspender, despertar, apagar): se delega entera en
+      ``dispatch_navigation``, definido en ``main()`` porque necesita mutar el
+      estado de pantalla compartido.
+    - **Stand by**: si la pantalla activa es ``ScreenKind.STANDBY``,
+      ``core.screens.resolve_press`` devuelve "wake" para **cualquier** tecla
+      antes de mirar su indice, asi que la pulsacion que enciende el deck
+      nunca ejecuta lo que hubiera debajo. Aqui no hay nada que comprobar:
+      llega como una accion de navegacion mas.
 
     Args:
         deck: El dispositivo Stream Deck.
@@ -180,7 +190,9 @@ def make_key_callback(
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
-        auto_return_timer: Temporizador de auto-retorno a "Hoy" tras inactividad.
+        reset_idle_timers: Reprograma los dos temporizadores de inactividad
+            (auto-retorno a "Hoy" y entrada en stand by). Se llama en toda
+            pulsacion, sea de la tecla que sea.
         dispatch_navigation: Ejecuta cualquier ``PressAction`` que no sea de
             habito, tarea o plantilla.
         repaint: Repinta la pantalla activa entera bajo ``screen_lock``. La
@@ -323,7 +335,7 @@ def make_key_callback(
     def on_key_change(deck: Any, key: int, pressed: bool) -> None:
         if not pressed:
             return
-        auto_return_timer.reset()  # cualquier pulsacion, en cualquier pantalla, reprograma el auto-retorno
+        reset_idle_timers()  # cualquier pulsacion, en cualquier pantalla, reprograma auto-retorno y stand by
 
         with screen_lock:
             habits_list = list(habits_ref["value"].values())
@@ -434,7 +446,7 @@ def main() -> None:
                 templates_ref,
                 screen,
                 screen_lock,
-                auto_return_timer,
+                _reset_idle_timers,
                 _dispatch_navigation,
                 _repaint_locked,
                 refresh_cycle,
@@ -497,6 +509,56 @@ def main() -> None:
                 templates_ref["value"] = {t.id: t for t in templates}
 
             _paint_current_screen()
+
+    def _is_standby() -> bool:
+        """Si el deck esta ahora mismo suspendido (pantalla apagada)."""
+        with screen_lock:
+            return screen.kind is screens.ScreenKind.STANDBY
+
+    def _enter_standby() -> None:
+        """Apaga la retroiluminacion del deck y deja de refrescar.
+
+        La dispara el temporizador de ``STANDBY_SECONDS`` sin pulsaciones y
+        tambien el boton "Suspender" del submenu Sistema. La comprobacion de
+        salida temprana no es solo defensiva: pulsar "Suspender" reprograma el
+        temporizador de stand by (lo hace ``on_key_change`` en TODA pulsacion),
+        asi que este volvera a disparar estando ya suspendido.
+
+        Baja el brillo ANTES de pintar para que la transicion se lea como un
+        fundido (el contenido anterior se apaga y luego aparece el icono) en vez
+        de como un parpadeo de pantalla nueva a plena luz.
+
+        Hay que pintar de verdad: ``BRIGHTNESS_STANDBY`` no es 0, asi que lo que
+        hubiera antes se seguiria intuyendo. Lo que se ve sale de
+        ``core.screens.STANDBY_LAYOUT``.
+        """
+        with screen_lock:
+            if screen.kind is screens.ScreenKind.STANDBY:
+                return
+            screen.kind = screens.ScreenKind.STANDBY
+            _safe_render(lambda: session.set_brightness(BRIGHTNESS_STANDBY))
+            _paint_current_screen()
+        print("Stand by: pantalla suspendida", flush=True)
+
+    def _wake() -> None:
+        """Sale del stand by: datos frescos primero, luz despues.
+
+        ``_enter_view`` ya hace todo lo necesario (reserva el centinela de
+        navegacion para que un doble toque no dispare dos refrescos, deja la
+        pantalla en "Hoy" -- lo que de paso saca de ``STANDBY`` -- y fuerza un
+        ``refresh_cycle`` completo), y como el repintado ocurre con el brillo
+        todavia a 0, el deck se enciende ya con el contenido correcto: sin
+        destello de datos viejos ni doble repintado.
+
+        El ``finally`` no es decorativo: si el proveedor esta caido o falla el
+        propio dispositivo, el deck TIENE que encenderse igual, o se quedaria
+        negro para siempre y pareceria roto.
+        """
+        try:
+            _enter_view(screens.DEFAULT_VIEW_ID)
+        finally:
+            _safe_render(lambda: session.set_brightness(BRIGHTNESS))
+            print("Stand by: pantalla despertada", flush=True)
 
     def _enter_menu() -> None:
         with screen_lock:
@@ -564,6 +626,14 @@ def main() -> None:
         temporizador, el ciclo periodico ya se encarga de mantenerlo fresco.
         """
         with screen_lock:
+            if screen.kind is screens.ScreenKind.STANDBY:
+                # Suspendido: no tocar. Normalmente este temporizador ya
+                # disparo antes que el de stand by (5 min < 30 min), pero el
+                # boton "Suspender" adelanta el stand by y lo deja armado.
+                # Sin esta salida, a los 5 min sacaria de STANDBY sin encender
+                # la pantalla: deck a oscuras con las teclas otra vez activas,
+                # justo lo que "wake" existe para impedir.
+                return
             at_home = (
                 screen.kind is screens.ScreenKind.VIEW
                 and screen.view_id == screens.DEFAULT_VIEW_ID
@@ -586,6 +656,10 @@ def main() -> None:
             _change_page(-1)
         elif action.kind == "page_next":
             _change_page(1)
+        elif action.kind == "standby":
+            _enter_standby()
+        elif action.kind == "wake":
+            _wake()
         elif action.kind == "shutdown":
             deck_keys.shutdown_pi()
         elif action.kind == "habit_enter_value":
@@ -599,13 +673,27 @@ def main() -> None:
         elif action.kind == "numeric_backspace":
             _numeric_edit("backspace", "")
 
-    auto_return_timer = _AutoReturnTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)
-    auto_return_timer.reset()  # armado desde el arranque
+    # Dos plazos, el mismo disparador: cualquier pulsacion reprograma ambos.
+    auto_return_timer = _IdleTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)
+    standby_timer = _IdleTimer(STANDBY_SECONDS, _enter_standby)
+
+    def _reset_idle_timers() -> None:
+        """Reprograma los dos temporizadores de inactividad. La llama
+        ``make_key_callback`` en toda pulsacion, sea de la tecla que sea."""
+        auto_return_timer.reset()
+        standby_timer.reset()
+
+    _reset_idle_timers()  # armados desde el arranque
 
     try:
         while True:
             try:
-                refresh_cycle()
+                # En stand by no se refresca: no tiene sentido pedir datos ni
+                # repintar una pantalla apagada. El bucle sigue despertando
+                # cada REFRESH_SECONDS sin hacer nada; el despertado fuerza su
+                # propio ciclo completo (ver _wake).
+                if not _is_standby():
+                    refresh_cycle()
             except Exception as exc:
                 # Cualquier fallo que no sea del proveedor de habitos/tareas
                 # (esos ya se gestionan dentro de refresh_cycle) se trata
@@ -614,9 +702,15 @@ def main() -> None:
                 health.log_device_error(str(exc))
                 print(f"Error de dispositivo, intentando reconectar: {exc}", flush=True)
                 session.reconnect()
+                # reconnect() reabre con BRIGHTNESS: sin esto, un fallo de
+                # dispositivo durante el stand by encenderia el deck sin que
+                # nadie lo haya pulsado.
+                if _is_standby():
+                    _safe_render(lambda: session.set_brightness(BRIGHTNESS_STANDBY))
             time.sleep(REFRESH_SECONDS)
     finally:
         auto_return_timer.cancel()
+        standby_timer.cancel()
         session.close()
 
 

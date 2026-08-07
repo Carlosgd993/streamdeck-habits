@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from typing import Any, Literal
 
 from config import KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV
-from core.screens import MenuEntry, NumericKey, ResolvedPage
+from core.screens import MenuEntry, NumericKey, ResolvedPage, StandbyKey
 from deck.primitives import solid_tile, text_tile
 from deck.style import (
     COLOR_ARROW,
@@ -22,6 +22,7 @@ from deck.style import (
     COLOR_NUMERIC_BACKSPACE,
     COLOR_NUMERIC_DISPLAY,
     COLOR_SHUTDOWN,
+    COLOR_STANDBY,
     COLOR_TASK_BY_PRIORITY,
     COLOR_TASK_SENDING,
     COLOR_TEMPLATE,
@@ -35,6 +36,7 @@ from deck.style import (
     COLOR_TEXT_NUMERIC_BACKSPACE,
     COLOR_TEXT_NUMERIC_DISPLAY,
     COLOR_TEXT_SHUTDOWN,
+    COLOR_TEXT_STANDBY,
     COLOR_TEXT_TASK_BY_PRIORITY,
     COLOR_TEXT_TEMPLATE,
     COLOR_TEXT_TEMPLATE_PENDING,
@@ -42,6 +44,7 @@ from deck.style import (
     FONT_SIZE_NAV,
     FONT_SIZE_NUMERIC,
     FONT_SIZE_NUMERIC_DISPLAY,
+    FONT_SIZE_STANDBY,
     FONT_SIZE_TASK,
     FONT_SIZE_TEMPLATE,
 )
@@ -227,13 +230,31 @@ def render_numeric_key(deck: Any, key: int, nk: NumericKey) -> None:
     deck.set_key_image(key, image)
 
 
+def render_standby_key(deck: Any, key: int, sk: StandbyKey) -> None:
+    """Pinta una tecla con contenido de la pantalla de stand by (ver
+    ``core.screens.STANDBY_LAYOUT``).
+
+    Fondo negro como una tecla vacia: con el brillo al minimo lo unico que debe
+    llegar a verse es el icono, que es lo que distingue un deck suspendido de
+    uno apagado o colgado. Si la fuente de emoji no esta instalada queda la
+    tecla en negro y se pierde esa senal, pero no falla nada (se degrada, igual
+    que el resto de iconos)."""
+    if not sk.label and not sk.emoji:
+        deck.set_key_image(key, solid_tile(deck, COLOR_STANDBY))  # tecla sin contenido
+        return
+    image = text_tile(
+        deck, COLOR_STANDBY, sk.label, text_color=COLOR_TEXT_STANDBY, font_size=FONT_SIZE_STANDBY, emoji=sk.emoji
+    )
+    deck.set_key_image(key, image)
+
+
 def render_page(deck: Any, resolved: ResolvedPage) -> None:
     """Repinta las 15 teclas segun la pagina ya resuelta por ``core.screens``.
 
-    Cada tecla se resuelve en orden: teclado numerico (si la pantalla activa
-    es ``NUMERIC_ENTRY``, cubre las 15 y va primero porque ahi 0/5/10 no son
-    menu/paginacion), menu (fija), flecha de paginacion o neutra, entrada de
-    menu/sistema, habito, tarea, plantilla y, si no es nada de eso, vacia.
+    Cada tecla se resuelve en orden: stand by y teclado numerico primero (cada
+    uno cubre las 15 y van antes porque ahi 0/5/10 no son menu/paginacion),
+    luego menu (fija), flecha de paginacion o neutra, entrada de menu/sistema,
+    habito, tarea, plantilla y, si no es nada de eso, vacia.
     ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
@@ -241,7 +262,9 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
         resolved: La pagina activa, resuelta con ``core.screens.resolve_page``.
     """
     for key in range(deck.key_count()):
-        if key in resolved.key_numeric:
+        if key in resolved.key_standby:
+            render_standby_key(deck, key, resolved.key_standby[key])
+        elif key in resolved.key_numeric:
             render_numeric_key(deck, key, resolved.key_numeric[key])
         elif key == KEY_MENU:
             render_menu_key(deck, key)

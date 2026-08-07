@@ -9,10 +9,13 @@ numerico -- mas un total de paginas. Menu y Sistema son listas fijas de
 resuelve con la funcion ``build_page`` que registra su ``ViewSpec`` en
 ``VIEWS``. Anadir una vista nueva es registrar una entrada mas en ``VIEWS``
 (con un ``_tiered_page_builder``/``_flat_page_builder``, o uno propio) y un
-boton mas en ``MENU_ENTRIES``; nada mas del sistema cambia. El teclado
-numerico (``ScreenKind.NUMERIC_ENTRY``, ver ``NUMERIC_KEYPAD``) es la unica
-pantalla que no es menu/sistema/vista: la abre un habito ``manual_entry`` al
-pulsarlo, sin entrada en ``VIEWS`` ni en el menu.
+boton mas en ``MENU_ENTRIES``; nada mas del sistema cambia.
+
+Hay dos pantallas que no son menu/sistema/vista y no aparecen en ``VIEWS``:
+el teclado numerico (``ScreenKind.NUMERIC_ENTRY``, ver ``NUMERIC_KEYPAD``),
+que abre un habito ``manual_entry`` al pulsarlo, y el stand by
+(``ScreenKind.STANDBY``), en el que el deck esta apagado y **cualquier** tecla
+se limita a despertarlo.
 
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
@@ -26,7 +29,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from config import AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
+from config import ALL_KEYS, AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.key_map import paginate
 from provider.base import BooleanHabit, Habit, Task, Template
 
@@ -38,6 +41,7 @@ class ScreenKind(Enum):
     SYSTEM = auto()
     VIEW = auto()
     NUMERIC_ENTRY = auto()
+    STANDBY = auto()
 
 
 @dataclass
@@ -48,8 +52,8 @@ class ScreenState:
     defecto (``DEFAULT_VIEW_ID``, "Hoy"), pagina 0.
 
     Attributes:
-        kind: Menu principal, submenu Sistema, una vista de datos o el
-            teclado numerico de entrada manual.
+        kind: Menu principal, submenu Sistema, una vista de datos, el teclado
+            numerico de entrada manual o el stand by (pantalla apagada).
         view_id: Id de la vista activa en ``VIEWS``. Solo tiene sentido si
             ``kind`` es ``ScreenKind.VIEW``.
         page: Pagina 0-indexada dentro de la pantalla activa.
@@ -87,10 +91,11 @@ class MenuEntry:
         label: Texto del boton.
         emoji: Icono a color, o cadena vacia.
         action: Que hace al pulsarlo -- "select_view" (entra en ``view_id``),
-            "open_system" (abre el submenu Sistema) o "shutdown" (apaga la
-            Raspberry Pi). No hay boton de "volver": la tecla de menu ya
-            vuelve al menu principal desde cualquier pantalla, incluida
-            Sistema, asi que un boton "Atras" seria redundante.
+            "open_system" (abre el submenu Sistema), "standby" (apaga la
+            pantalla del deck) o "shutdown" (apaga la Raspberry Pi). No hay
+            boton de "volver": la tecla de menu ya vuelve al menu principal
+            desde cualquier pantalla, incluida Sistema, asi que un boton
+            "Atras" seria redundante.
         view_id: Id de la vista a la que lleva, solo si ``action`` es
             "select_view".
         key: Tecla fija dentro de la pagina 0 (p.ej. "Sistema" siempre en la
@@ -103,6 +108,34 @@ class MenuEntry:
     action: str
     view_id: str = ""
     key: int | None = None
+
+
+@dataclass(frozen=True)
+class StandbyKey:
+    """Una tecla con contenido en la pantalla de stand by (ver ``STANDBY_LAYOUT``).
+
+    Attributes:
+        label: Texto de la tecla, o cadena vacia para dejar solo el icono.
+        emoji: Icono a color, o cadena vacia.
+    """
+
+    label: str
+    emoji: str
+
+
+# Que se ve mientras el deck esta suspendido. **Este dict es el unico sitio que
+# hay que tocar para cambiarlo**: las teclas que no aparecen aqui se pintan
+# vacias (negras), asi que anadir, quitar o mover contenido es editar entradas.
+# Por defecto solo la tecla central lleva un icono, lo justo para distinguir
+# "suspendida" de "apagada" sin encender apenas nada.
+#
+# Se pinta de verdad (no basta con dejar lo que hubiera): el brillo de stand by
+# no es 0, asi que la pantalla anterior se seguiria intuyendo.
+STANDBY_LAYOUT: dict[int, StandbyKey] = {
+    7: StandbyKey("", "🌙"),
+}
+
+_STANDBY_BLANK = StandbyKey("", "")  # relleno de las teclas sin contenido en stand by
 
 
 @dataclass(frozen=True)
@@ -323,7 +356,12 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
+# "Suspender" va antes que "Apagar" a proposito: la accion reversible se queda
+# con la tecla mas accesible y la irreversible no hereda la posicion de la que
+# se pulsa a menudo. El color tambien las separa (azul de navegacion vs. rojo de
+# aviso, ver ``deck.renderer.render_nav_entry``).
 SYSTEM_ENTRIES: list[MenuEntry] = [
+    MenuEntry("Suspender", "🌙", "standby"),
     MenuEntry("Apagar", "🔴", "shutdown"),
 ]
 
@@ -337,6 +375,7 @@ class ResolvedPage:
     key_template: dict[int, Template] = field(default_factory=dict)
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
     key_numeric: dict[int, NumericKey] = field(default_factory=dict)
+    key_standby: dict[int, StandbyKey] = field(default_factory=dict)
     page: int = 0
     total_pages: int = 1
 
@@ -381,6 +420,14 @@ def resolve_page(
     Returns:
         La pagina resuelta, lista para pintar con ``deck.renderer.render_page``.
     """
+    if screen.kind is ScreenKind.STANDBY:
+        # La pantalla de suspension es fija: no depende de habitos, tareas ni
+        # plantillas. Se resuelve a las 15 teclas (las que STANDBY_LAYOUT no
+        # define quedan en blanco) por el mismo motivo que el teclado numerico:
+        # asi ``render_page`` la trata como un bloque y las teclas 0/5/10 no
+        # recaen en menu/paginacion, que aqui no significan nada.
+        key_standby = {key: STANDBY_LAYOUT.get(key, _STANDBY_BLANK) for key in ALL_KEYS}
+        return ResolvedPage(key_standby=key_standby, page=0, total_pages=1)
     if screen.kind is ScreenKind.MENU:
         key_nav, total_pages = _nav_page(MENU_ENTRIES, screen.page)
         return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
@@ -412,9 +459,9 @@ class PressAction:
     Attributes:
         kind: "habit" | "habit_undo" | "habit_enter_value" | "task" |
             "template" | "open_menu" | "open_system" | "select_view" |
-            "shutdown" | "page_prev" | "page_next" | "numeric_digit" |
-            "numeric_decimal" | "numeric_backspace" | "numeric_confirm" |
-            "numeric_cancel" | "noop".
+            "shutdown" | "standby" | "wake" | "page_prev" | "page_next" |
+            "numeric_digit" | "numeric_decimal" | "numeric_backspace" |
+            "numeric_confirm" | "numeric_cancel" | "noop".
         payload: Id del habito/tarea/plantilla si ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
             "numeric_confirm", el ``view_id`` destino si ``kind`` es
@@ -450,6 +497,14 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     Returns:
         La accion a ejecutar por el llamador.
     """
+    if screen.kind is ScreenKind.STANDBY:
+        # Lo PRIMERO de todo, antes incluso que el teclado numerico: con el
+        # deck a oscuras, **cualquier** tecla se limita a despertarlo y no
+        # ejecuta lo que hubiera debajo. Cortocircuitar aqui, por ``kind`` y
+        # sin mirar el indice de tecla, es lo que garantiza que pulsar a ciegas
+        # para encender no cierre una tarea ni marque un habito por accidente.
+        return PressAction("wake")
+
     if screen.kind is ScreenKind.NUMERIC_ENTRY:
         # Comprobacion antes que KEY_MENU/paginacion a proposito: en esta
         # pantalla las teclas 0/5/10 no significan menu/borrar-pagina-atras,
