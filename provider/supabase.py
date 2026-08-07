@@ -8,8 +8,8 @@ proyecto:
 - Carga de la URL y la clave publishable desde el ``.env``.
 - Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits``,
   ``v_today_tasks`` y ``v_templates``, y las funciones ``rpc/habit_step``,
-  ``rpc/habit_undo``, ``rpc/complete_task`` e ``rpc/instantiate_task`` del
-  contrato.
+  ``rpc/habit_undo``, ``rpc/complete_task``, ``rpc/set_task_priority`` e
+  ``rpc/instantiate_task`` del contrato.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
   (``provider.base.Habit`` y subtipos, ``provider.base.Task``,
   ``provider.base.Template``).
@@ -347,6 +347,25 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
             raise ProviderNetworkError(str(exc)) from exc
 
         self._check_status(resp, "POST rpc/complete_task")
+
+    def set_priority(self, task: Task, priority: int) -> None:
+        """Cambia la prioridad de ``task`` via ``rpc/set_task_priority``.
+
+        Misma forma que ``complete_task``: ``void`` en la base, 204 sin
+        cuerpo, nada que parsear. Solo toca ocurrencias pendientes -- sobre
+        una ya completada/omitida o inexistente no hace nada, ni falla.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/set_task_priority",
+                headers=self._headers(**{"Content-Type": "application/json"}),
+                json={"p_task_id": task.id, "p_priority": priority},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/set_task_priority")
 
     def get_templates(self) -> list[Template]:
         """Devuelve las plantillas de creacion rapida, ya mapeadas a dominio.

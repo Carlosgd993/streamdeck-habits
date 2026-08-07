@@ -6,7 +6,7 @@ from collections.abc import Iterable
 from typing import Any, Literal
 
 from config import KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV
-from core.screens import MenuEntry, NumericKey, ResolvedPage, StandbyKey
+from core.screens import MenuEntry, NumericKey, OptionEntry, ResolvedPage, StandbyKey
 from deck.primitives import solid_tile, text_tile
 from deck.style import (
     COLOR_ARROW,
@@ -21,6 +21,7 @@ from deck.style import (
     COLOR_NUMERIC,
     COLOR_NUMERIC_BACKSPACE,
     COLOR_NUMERIC_DISPLAY,
+    COLOR_OPTIONS_MESSAGE,
     COLOR_SHUTDOWN,
     COLOR_STANDBY,
     COLOR_TASK_BY_PRIORITY,
@@ -35,6 +36,7 @@ from deck.style import (
     COLOR_TEXT_NUMERIC,
     COLOR_TEXT_NUMERIC_BACKSPACE,
     COLOR_TEXT_NUMERIC_DISPLAY,
+    COLOR_TEXT_OPTIONS_MESSAGE,
     COLOR_TEXT_SHUTDOWN,
     COLOR_TEXT_STANDBY,
     COLOR_TEXT_TASK_BY_PRIORITY,
@@ -44,6 +46,7 @@ from deck.style import (
     FONT_SIZE_NAV,
     FONT_SIZE_NUMERIC,
     FONT_SIZE_NUMERIC_DISPLAY,
+    FONT_SIZE_OPTIONS,
     FONT_SIZE_STANDBY,
     FONT_SIZE_TASK,
     FONT_SIZE_TEMPLATE,
@@ -248,13 +251,51 @@ def render_standby_key(deck: Any, key: int, sk: StandbyKey) -> None:
     deck.set_key_image(key, image)
 
 
+def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
+    """Pinta una tecla de la pantalla de opciones de un habito/tarea (ver
+    ``core.screens.HABIT_OPTIONS_LAYOUT``/``TASK_OPTIONS_LAYOUT``), la que se abre al mantener pulsado
+    un habito o una tarea.
+
+    "Volver" reutiliza el azul generico de navegacion (``COLOR_NAV``): mismo
+    rol que "Salir" en el teclado numerico, esto te saca de aqui sin tocar el
+    habito/tarea que abrio el menu. Un mensaje informativo usa un color propio
+    apagado, para no parecer una tecla de contenido pulsable. Una tecla de
+    prioridad (solo en ``TASK_OPTIONS_LAYOUT``) reutiliza literalmente los
+    colores de tarea por prioridad (``COLOR_TASK_BY_PRIORITY``), para que se
+    reconozca de un vistazo con el mismo codigo de color que el resto del
+    deck. Una tecla sin contenido se pinta vacia.
+    """
+    if entry.kind == "back":
+        image = text_tile(
+            deck, COLOR_NAV, entry.label, text_color=COLOR_TEXT_NAV, font_size=FONT_SIZE_NAV, emoji=entry.emoji
+        )
+    elif entry.kind == "message":
+        image = text_tile(
+            deck,
+            COLOR_OPTIONS_MESSAGE,
+            entry.label,
+            text_color=COLOR_TEXT_OPTIONS_MESSAGE,
+            font_size=FONT_SIZE_OPTIONS,
+            emoji=entry.emoji,
+        )
+    elif entry.kind == "priority":
+        color = COLOR_TASK_BY_PRIORITY.get(entry.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+        text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(entry.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+        image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_TASK)
+    else:  # "blank"
+        deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
+        return
+    deck.set_key_image(key, image)
+
+
 def render_page(deck: Any, resolved: ResolvedPage) -> None:
     """Repinta las 15 teclas segun la pagina ya resuelta por ``core.screens``.
 
-    Cada tecla se resuelve en orden: stand by y teclado numerico primero (cada
-    uno cubre las 15 y van antes porque ahi 0/5/10 no son menu/paginacion),
-    luego menu (fija), flecha de paginacion o neutra, entrada de menu/sistema,
-    habito, tarea, plantilla y, si no es nada de eso, vacia.
+    Cada tecla se resuelve en orden: stand by, teclado numerico y menu de
+    opciones primero (cada uno cubre las 15 y van antes porque ahi 0/5/10 no
+    son menu/paginacion), luego menu (fija), flecha de paginacion o neutra,
+    entrada de menu/sistema, habito, tarea, plantilla y, si no es nada de eso,
+    vacia.
     ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
@@ -266,6 +307,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
             render_standby_key(deck, key, resolved.key_standby[key])
         elif key in resolved.key_numeric:
             render_numeric_key(deck, key, resolved.key_numeric[key])
+        elif key in resolved.key_options:
+            render_option_entry(deck, key, resolved.key_options[key])
         elif key == KEY_MENU:
             render_menu_key(deck, key)
         elif key in (KEY_PAGE_PREV, KEY_PAGE_NEXT):

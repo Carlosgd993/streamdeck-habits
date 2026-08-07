@@ -11,11 +11,15 @@ resuelve con la funcion ``build_page`` que registra su ``ViewSpec`` en
 (con un ``_tiered_page_builder``/``_flat_page_builder``, o uno propio) y un
 boton mas en ``MENU_ENTRIES``; nada mas del sistema cambia.
 
-Hay dos pantallas que no son menu/sistema/vista y no aparecen en ``VIEWS``:
+Hay tres pantallas que no son menu/sistema/vista y no aparecen en ``VIEWS``:
 el teclado numerico (``ScreenKind.NUMERIC_ENTRY``, ver ``NUMERIC_KEYPAD``),
-que abre un habito ``manual_entry`` al pulsarlo, y el stand by
-(``ScreenKind.STANDBY``), en el que el deck esta apagado y **cualquier** tecla
-se limita a despertarlo.
+que abre un habito ``manual_entry`` al pulsarlo; el menu de opciones de un
+habito/tarea (``ScreenKind.ITEM_OPTIONS``, ver ``HABIT_OPTIONS_LAYOUT``/
+``TASK_OPTIONS_LAYOUT``), que
+abre mantener pulsado un habito o una tarea (la duracion la mide
+``orchestrator.make_key_callback``, este modulo solo describe la pantalla); y
+el stand by (``ScreenKind.STANDBY``), en el que el deck esta apagado y
+**cualquier** tecla se limita a despertarlo.
 
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
@@ -42,6 +46,7 @@ class ScreenKind(Enum):
     VIEW = auto()
     NUMERIC_ENTRY = auto()
     STANDBY = auto()
+    ITEM_OPTIONS = auto()
 
 
 @dataclass
@@ -53,7 +58,8 @@ class ScreenState:
 
     Attributes:
         kind: Menu principal, submenu Sistema, una vista de datos, el teclado
-            numerico de entrada manual o el stand by (pantalla apagada).
+            numerico de entrada manual, el menu de opciones de un
+            habito/tarea (mantener pulsado) o el stand by (pantalla apagada).
         view_id: Id de la vista activa en ``VIEWS``. Solo tiene sentido si
             ``kind`` es ``ScreenKind.VIEW``.
         page: Pagina 0-indexada dentro de la pantalla activa.
@@ -64,6 +70,15 @@ class ScreenState:
         entry_value: Lo tecleado hasta ahora en el teclado numerico (cadena,
             no numero, para poder representar estados intermedios como
             ``"12."``). Vacio fuera de ``NUMERIC_ENTRY``.
+        entry_item_kind: "habit" o "task", solo si ``kind`` es
+            ``ScreenKind.ITEM_OPTIONS``: de que tipo es el elemento sobre el
+            que se abrio el menu de opciones (una tarea no tiene "deshacer"
+            ni objetivo, un habito si, asi que una opcion real necesitara
+            saber cual es de los dos).
+        entry_item_id: Id del habito/tarea sobre el que se abrio el menu de
+            opciones. Igual que ``entry_habit_id``, entrar aqui no toca
+            ``view_id``/``page``: "Volver" regresa exactamente a la vista de
+            origen sin un campo aparte.
     """
 
     kind: ScreenKind = ScreenKind.VIEW
@@ -71,6 +86,8 @@ class ScreenState:
     page: int = 0
     entry_habit_id: str = ""
     entry_value: str = ""
+    entry_item_kind: str = ""
+    entry_item_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -176,6 +193,78 @@ NUMERIC_KEYPAD: dict[int, NumericKey] = {
     12: NumericKey("digit", "7"),
     13: NumericKey("digit", "8"),
     14: NumericKey("digit", "9"),
+}
+
+
+@dataclass(frozen=True)
+class OptionEntry:
+    """Una tecla de la pantalla de opciones de un habito o de una tarea (ver
+    ``HABIT_OPTIONS_LAYOUT``/``TASK_OPTIONS_LAYOUT``): lo que se abre al
+    mantener pulsado un habito o una tarea en cualquier vista que los muestre
+    (ver ``config.LONG_PRESS_SECONDS`` y ``orchestrator.make_key_callback``,
+    que es quien mide la duracion de la pulsacion -- este modulo solo
+    describe que hay en cada tecla).
+
+    Un habito y una tarea llevan a pantallas **distintas**
+    (``ScreenState.entry_item_kind`` decide cual, ver ``resolve_page``),
+    porque sus opciones futuras seran distintas -- una tarea no tiene
+    objetivo ni "deshacer", un habito no tiene fecha de vencimiento. El menu
+    de un habito sigue siendo una maqueta (volver + un par de teclas de
+    aviso, ninguna opcion real todavia); el de una tarea ya tiene la
+    primera opcion de verdad, cambiar la prioridad. Anadir una opcion mas es
+    anadir una entrada al layout que corresponda con su propio ``kind`` y
+    darle significado en ``resolve_press``, igual que cualquier otro layout
+    fijo de este modulo.
+
+    Attributes:
+        kind: "back" (vuelve a la vista de origen sin tocar el habito/tarea;
+            fija en la tecla 0, mismo lugar y mismo rol que la tecla de menu
+            en el resto de pantallas), "message" (contenido informativo, no
+            interactivo -- ``resolve_press`` la trata como "noop"), "priority"
+            (solo en ``TASK_OPTIONS_LAYOUT``: fija la prioridad de la tarea a
+            ``priority`` -- ver ``resolve_press``) o "blank" (tecla vacia).
+        label: Texto de la tecla.
+        emoji: Icono a color, o cadena vacia.
+        priority: Prioridad (``0``/``1``/``3``/``5``) que fija esta tecla.
+            Solo tiene sentido si ``kind`` es "priority".
+    """
+
+    kind: str
+    label: str
+    emoji: str = ""
+    priority: int = 0
+
+
+_ITEM_OPTIONS_BACK = OptionEntry("back", "Volver", "↩️")
+_ITEM_OPTIONS_BLANK = OptionEntry("blank", "", "")  # relleno de las teclas sin contenido
+
+# Contenido de las pantallas de opciones de un habito y de una tarea (ver
+# "Menu y pantallas" en CLAUDE.md): una para cada ``entry_item_kind``, para
+# que puedan crecer con opciones distintas sin pisarse. "Volver" fija en la
+# tecla 0 en ambas (mismo sitio que la tecla de menu, pero sin abrir el menu
+# principal: vuelve a la vista/pagina de origen sin ejecutar ninguna accion
+# sobre el habito/tarea que la abrio). Igual que STANDBY_LAYOUT, estos dicts
+# son el sitio a tocar para anadir opciones reales; las teclas que no
+# aparecen aqui se pintan vacias.
+#
+# HABIT_OPTIONS_LAYOUT sigue siendo el prototipo original (sin opciones
+# reales); TASK_OPTIONS_LAYOUT ya tiene la primera: cambiar la prioridad,
+# en las teclas 11-14 (blanco/verde/amarillo/rojo, mismos colores que
+# ``deck.style.COLOR_TASK_BY_PRIORITY`` -- ver ``resolve_press`` y
+# ``deck.renderer.render_option_entry``).
+HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
+    KEY_MENU: _ITEM_OPTIONS_BACK,
+    6: OptionEntry("message", "Opciones de habito", "🚧"),
+    7: OptionEntry("message", "Proximamente", ""),
+}
+
+TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
+    KEY_MENU: _ITEM_OPTIONS_BACK,
+    6: OptionEntry("message", "Prioridad", "🎚️"),
+    11: OptionEntry("priority", "Ninguna", priority=0),
+    12: OptionEntry("priority", "Baja", priority=1),
+    13: OptionEntry("priority", "Media", priority=3),
+    14: OptionEntry("priority", "Alta", priority=5),
 }
 
 
@@ -376,6 +465,7 @@ class ResolvedPage:
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
     key_numeric: dict[int, NumericKey] = field(default_factory=dict)
     key_standby: dict[int, StandbyKey] = field(default_factory=dict)
+    key_options: dict[int, OptionEntry] = field(default_factory=dict)
     page: int = 0
     total_pages: int = 1
 
@@ -438,6 +528,15 @@ def resolve_page(
         key_numeric = dict(NUMERIC_KEYPAD)
         key_numeric[1] = NumericKey("display", screen.entry_value)
         return ResolvedPage(key_numeric=key_numeric, page=0, total_pages=1)
+    if screen.kind is ScreenKind.ITEM_OPTIONS:
+        # Mismo patron que NUMERIC_ENTRY/STANDBY: se resuelve a las 15 teclas
+        # (lo que el layout no define queda en blanco) para que la tecla 0 se
+        # reinterprete como "Volver" y render_page trate la pantalla entera
+        # como un bloque, sin recaer en menu/paginacion. Habito y tarea usan
+        # layouts distintos -- sus opciones futuras seran distintas.
+        layout = HABIT_OPTIONS_LAYOUT if screen.entry_item_kind == "habit" else TASK_OPTIONS_LAYOUT
+        key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
+        return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
     key_habit, key_task, key_template, total_pages = spec.build_page(
@@ -461,12 +560,16 @@ class PressAction:
             "template" | "open_menu" | "open_system" | "select_view" |
             "shutdown" | "standby" | "wake" | "page_prev" | "page_next" |
             "numeric_digit" | "numeric_decimal" | "numeric_backspace" |
-            "numeric_confirm" | "numeric_cancel" | "noop".
+            "numeric_confirm" | "numeric_cancel" | "item_options_exit" |
+            "task_set_priority" | "noop".
         payload: Id del habito/tarea/plantilla si ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
             "numeric_confirm", el ``view_id`` destino si ``kind`` es
-            "select_view", o el digito tecleado si ``kind`` es
-            "numeric_digit". Vacio en el resto.
+            "select_view", el digito tecleado si ``kind`` es "numeric_digit",
+            o la prioridad elegida (como texto) si ``kind`` es
+            "task_set_priority" -- el id de la tarea no va aqui, se lee de
+            ``ScreenState.entry_item_id`` en el momento de ejecutar, igual
+            que "numeric_confirm" con ``entry_habit_id``. Vacio en el resto.
     """
 
     kind: str
@@ -521,6 +624,21 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
         if nk.kind == "decimal":
             return PressAction("numeric_decimal")
         return PressAction("numeric_backspace")
+
+    if screen.kind is ScreenKind.ITEM_OPTIONS:
+        # Misma razon que NUMERIC_ENTRY: aqui la tecla 0 no abre el menu
+        # principal, vuelve a la vista de origen sin tocar el habito/tarea
+        # que abrio este menu. Los mensajes informativos no hacen nada.
+        entry = page.key_options.get(key)
+        if entry is None or entry.kind in ("message", "blank"):
+            return PressAction("noop")
+        if entry.kind == "priority":
+            # El id de la tarea no va en el payload (solo la prioridad
+            # elegida): igual que "numeric_confirm" con entry_habit_id, el
+            # llamador lo lee de screen.entry_item_id en el momento de
+            # ejecutar la accion.
+            return PressAction("task_set_priority", str(entry.priority))
+        return PressAction("item_options_exit")
 
     if key == KEY_MENU:
         if screen.kind is ScreenKind.MENU:

@@ -25,7 +25,7 @@ import core.key_map as key_map
 import core.screens as screens
 import deck.keys as deck_keys
 import deck.renderer as renderer
-from config import AUTO_RETURN_SECONDS, REFRESH_SECONDS, STANDBY_SECONDS
+from config import AUTO_RETURN_SECONDS, LONG_PRESS_SECONDS, REFRESH_SECONDS, STANDBY_SECONDS
 from core.error_codes import CODES
 from deck.session import BRIGHTNESS, BRIGHTNESS_STANDBY, DeckSession
 from provider.base import (
@@ -130,6 +130,8 @@ def make_key_callback(
     repaint: Callable[[], None],
     refresh: Callable[[], None],
     exit_numeric_entry: Callable[[], None],
+    enter_item_options: Callable[[str, str], None],
+    exit_item_options: Callable[[], None],
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el estado actual.
 
@@ -167,10 +169,22 @@ def make_key_callback(
       ``instantiate_task`` no es idempotente. Ese gris sale solo de la tarea
       insertada, ver ``core.screens._create_items``, y ``core.screens`` ya
       devuelve "noop" en ese caso, asi que aqui no hay nada que comprobar.
+    - **Mantener pulsado un habito o una tarea**: las tres pulsaciones de
+      arriba (paso/deshacer de habito, cierre de tarea) ya no se ejecutan al
+      presionar, sino al **soltar** -- ver ``on_key_change`` mas abajo. Al
+      presionar se arma un temporizador de ``config.LONG_PRESS_SECONDS``; si
+      se suelta antes, se cancela y se ejecuta la accion corta de siempre
+      (con la duracion tipica de un toque humano de latencia, imperceptible);
+      si el temporizador dispara con la tecla todavia pulsada, abre el menu
+      de opciones (``ScreenKind.ITEM_OPTIONS``) para ese habito/tarea en vez
+      de tocarlo, y la posterior liberacion de la tecla no hace nada (ya
+      quedo consumida). El resto de teclas (plantilla, navegacion, teclado
+      numerico) no tiene esta espera: siguen actuando al presionar, como
+      siempre.
     - **Navegacion** (menu, submenu Sistema, cambiar de vista, paginar,
-      suspender, despertar, apagar): se delega entera en
-      ``dispatch_navigation``, definido en ``main()`` porque necesita mutar el
-      estado de pantalla compartido.
+      suspender, despertar, abrir/cerrar el menu de opciones, apagar): se
+      delega entera en ``dispatch_navigation``, definido en ``main()`` porque
+      necesita mutar el estado de pantalla compartido.
     - **Stand by**: si la pantalla activa es ``ScreenKind.STANDBY``,
       ``core.screens.resolve_press`` devuelve "wake" para **cualquier** tecla
       antes de mirar su indice, asi que la pulsacion que enciende el deck
@@ -207,6 +221,14 @@ def make_key_callback(
             vista de origen y repinta. Lo usa una confirmacion ("OK") con
             exito; en un fallo se queda en el teclado (ver mas abajo) para
             poder reintentar sin volver a teclear.
+        enter_item_options: Abre el menu de opciones de un habito/tarea
+            (``kind``, ``item_id``) sin tocar ``view_id``/``page`` y repinta.
+            La dispara el temporizador de mantener pulsado (ver mas abajo),
+            nunca una pulsacion normal.
+        exit_item_options: Vuelve del menu de opciones a la vista de origen y
+            repinta. La usan tanto "Volver" (via ``dispatch_navigation``) como
+            un cambio de prioridad de tarea con exito (ver
+            "task_set_priority" mas abajo).
 
     Se suma un cuarto tipo de tecla, aparte de habito/tarea/plantilla:
 
@@ -223,6 +245,17 @@ def make_key_callback(
       si falla, la tecla "OK" queda en rojo con el codigo y la pantalla se
       queda en el teclado con lo tecleado intacto, para reintentar sin perder
       nada.
+    - **Menu de opciones de un habito/tarea** (mantener pulsado): "Volver"
+      (tecla 0 dentro de esa pantalla) resuelve a ``"item_options_exit"`` y se
+      delega en ``dispatch_navigation`` -- sin red, sin tocar el habito/tarea
+      que abrio el menu. El de un habito sigue siendo un prototipo sin
+      opciones reales; el de una tarea ya tiene una: **cambiar la
+      prioridad** (teclas 11-14, blanco/verde/amarillo/rojo). Pulsar una
+      llama a ``TaskProvider.set_priority`` (``press_task_priority``, con el
+      mismo patron de acuse que un paso de habito) y, si la base confirma,
+      mutacion optimista + ``exit_item_options`` -- vuelve a la vista de
+      origen ya con el color nuevo. Fallo -> la tecla queda en rojo con el
+      codigo, sin salir del menu, para poder reintentar.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
@@ -295,6 +328,25 @@ def make_key_callback(
             _safe_render(repaint)
             print(f"Tarea completada: {task.title}", flush=True)
 
+    def press_task_priority(deck: Any, key: int, priority_str: str) -> None:
+        with screen_lock:
+            task_id = screen.entry_item_id
+        task = tasks_ref["value"].get(task_id)
+        if task is None:
+            return  # tarea desaparecida entre ciclos (cerrada por otro cliente): se ignora
+        priority = int(priority_str)
+        try:
+            task_provider.set_priority(task, priority)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(task_id, str(exc), kind="task")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Cambiar prioridad FALLO [{code}]: {task_id}", flush=True)
+        else:
+            task.priority = priority
+            _safe_render(exit_item_options)
+            print(f"Prioridad cambiada: {task.title} -> {priority}", flush=True)
+
     def press_template(deck: Any, key: int, template_id: str) -> None:
         template = templates_ref["value"].get(template_id)
         if template is None:
@@ -332,18 +384,13 @@ def make_key_callback(
             _safe_render(repaint)
             print(f"Tarea creada desde plantilla: {template.title} -> {new_task_id}", flush=True)
 
-    def on_key_change(deck: Any, key: int, pressed: bool) -> None:
-        if not pressed:
-            return
-        reset_idle_timers()  # cualquier pulsacion, en cualquier pantalla, reprograma auto-retorno y stand by
+    _HOLD_KINDS = ("habit", "habit_undo", "task")  # las unicas que distinguen corta de mantenida
+    _pending_hold: dict[int, tuple[screens.PressAction, threading.Timer]] = {}  # tecla -> (accion, temporizador)
+    _hold_lock = threading.Lock()  # protege _pending_hold frente al hilo del temporizador
 
-        with screen_lock:
-            habits_list = list(habits_ref["value"].values())
-            tasks_list = list(tasks_ref["value"].values())
-            templates_list = list(templates_ref["value"].values())
-            resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, mapping)
-            action = screens.resolve_press(screen, key, resolved)
-
+    def _run_action(deck: Any, key: int, action: screens.PressAction) -> None:
+        """Ejecuta una ``PressAction`` ya resuelta (la accion corta de un
+        habito/tarea, o cualquier otra que no distinga corta de mantenida)."""
         if action.kind in ("habit", "habit_undo", "task", "template", "numeric_confirm"):
             # Un habito reserva su id sea cual sea la operacion, asi que un
             # paso/deshacer/confirmacion de entrada manual del mismo habito
@@ -363,8 +410,71 @@ def make_key_callback(
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
                 _release(item_id)
+        elif action.kind == "task_set_priority":
+            # El id de la tarea no viaja en el payload (solo la prioridad
+            # elegida): se lee de screen.entry_item_id, igual que
+            # "numeric_confirm" lee el valor tecleado de screen.entry_value.
+            with screen_lock:
+                item_id = screen.entry_item_id
+            if not _claim(item_id):
+                return  # ya hay una peticion en vuelo para esta tarea
+            try:
+                press_task_priority(deck, key, action.payload)
+            finally:
+                _release(item_id)
         elif action.kind != "noop":
             dispatch_navigation(action)
+
+    def _arm_hold(deck: Any, key: int, action: screens.PressAction) -> None:
+        """Arma el temporizador de mantener pulsado para ``key``. Si dispara
+        con la tecla todavia presionada, abre el menu de opciones en vez de
+        ejecutar ``action``; si se suelta antes, ``on_key_change`` lo cancela
+        y ejecuta ``action`` como una pulsacion corta normal."""
+
+        def _on_hold_timeout() -> None:
+            with _hold_lock:
+                entry = _pending_hold.pop(key, None)
+            if entry is None:
+                return  # ya se solto antes de que disparara (pulsacion corta): nada que hacer
+            item_kind = "habit" if action.kind in ("habit", "habit_undo") else "task"
+            enter_item_options(item_kind, action.payload)
+
+        timer = threading.Timer(LONG_PRESS_SECONDS, _on_hold_timeout)
+        timer.daemon = True
+        with _hold_lock:
+            _pending_hold[key] = (action, timer)
+        timer.start()
+
+    def _release_hold(deck: Any, key: int) -> None:
+        """Al soltar una tecla: si su temporizador de mantener pulsado seguia
+        pendiente, lo cancela y ejecuta la accion corta; si ya disparo (o la
+        tecla no era de las que distinguen corta/mantenida), no hace nada --
+        ya se resolvio al presionar o al disparar el temporizador."""
+        with _hold_lock:
+            entry = _pending_hold.pop(key, None)
+        if entry is None:
+            return
+        action, timer = entry
+        timer.cancel()
+        _run_action(deck, key, action)
+
+    def on_key_change(deck: Any, key: int, pressed: bool) -> None:
+        if not pressed:
+            _release_hold(deck, key)
+            return
+        reset_idle_timers()  # cualquier pulsacion, en cualquier pantalla, reprograma auto-retorno y stand by
+
+        with screen_lock:
+            habits_list = list(habits_ref["value"].values())
+            tasks_list = list(tasks_ref["value"].values())
+            templates_list = list(templates_ref["value"].values())
+            resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, mapping)
+            action = screens.resolve_press(screen, key, resolved)
+
+        if action.kind in _HOLD_KINDS:
+            _arm_hold(deck, key, action)
+        else:
+            _run_action(deck, key, action)
 
     return on_key_change
 
@@ -451,6 +561,8 @@ def main() -> None:
                 _repaint_locked,
                 refresh_cycle,
                 _exit_numeric_entry,
+                _enter_item_options,
+                _exit_item_options,
             )
         )
 
@@ -591,6 +703,25 @@ def main() -> None:
             screen.kind = screens.ScreenKind.VIEW
             _paint_current_screen()
 
+    def _enter_item_options(item_kind: str, item_id: str) -> None:
+        """Abre el menu de opciones de un habito/tarea, sin tocar
+        ``view_id``/``page``: es lo que permite que "Volver" regrese
+        exactamente a la vista de origen (ver ``core.screens.ScreenState``).
+        La dispara solo el temporizador de mantener pulsado, nunca una
+        pulsacion normal."""
+        with screen_lock:
+            screen.kind = screens.ScreenKind.ITEM_OPTIONS
+            screen.entry_item_kind = item_kind
+            screen.entry_item_id = item_id
+            _paint_current_screen()
+
+    def _exit_item_options() -> None:
+        """Vuelve del menu de opciones de un habito/tarea a la vista de
+        origen, sin ejecutar ninguna accion sobre el elemento que lo abrio."""
+        with screen_lock:
+            screen.kind = screens.ScreenKind.VIEW
+            _paint_current_screen()
+
     def _numeric_edit(kind: str, digit: str) -> None:
         """Muta ``ScreenState.entry_value`` (teclear un digito, el punto
         decimal o borrar) y repinta. Sin llamada de red, asi que no pasa por
@@ -672,6 +803,8 @@ def main() -> None:
             _numeric_edit("decimal", "")
         elif action.kind == "numeric_backspace":
             _numeric_edit("backspace", "")
+        elif action.kind == "item_options_exit":
+            _exit_item_options()
 
     # Dos plazos, el mismo disparador: cualquier pulsacion reprograma ambos.
     auto_return_timer = _IdleTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)

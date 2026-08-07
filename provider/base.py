@@ -417,6 +417,25 @@ class TaskProvider(ABC):
             ProviderDataError: Si la respuesta no tiene el formato esperado.
         """
 
+    @abstractmethod
+    def set_priority(self, task: Task, priority: int) -> None:
+        """Cambia la prioridad de ``task`` a ``priority``.
+
+        No devuelve nada, igual que ``complete_task``: la tarea sigue
+        pendiente, solo cambia su color en el deck. La usa el menu de
+        opciones de una tarea (mantener pulsado, ver ``core.screens``).
+
+        Args:
+            task: La tarea sobre la que cambiar la prioridad.
+            priority: Nueva prioridad (``0``/``1``/``3``/``5``).
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado
+                (incluida una prioridad fuera de ``0``/``1``/``3``/``5``).
+        """
+
 
 class TemplateProvider(ABC):
     """Puerto: contrato que debe implementar un backend de plantillas de tarea.

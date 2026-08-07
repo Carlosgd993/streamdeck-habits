@@ -80,6 +80,16 @@ COLOR_TEXT_NUMERIC_DISPLAY = (255, 255, 255)
 FONT_SIZE_NUMERIC = 20
 FONT_SIZE_NUMERIC_DISPLAY = 14
 
+# --- Menu de opciones de un habito/tarea (mantener pulsado) -----------------
+# Familia nueva: ni habito/tarea/plantilla, ni teclado numerico, ni stand by.
+# "Volver" reutiliza COLOR_NAV (mismo rol que "Salir" en el teclado numerico:
+# esto te saca de aqui sin tocar nada). El mensaje informativo usa un gris
+# azulado propio, deliberadamente apagado, para no parecer una tecla de
+# contenido pulsable -- de momento no hace nada al pulsarla.
+COLOR_OPTIONS_MESSAGE = (35, 45, 55)
+COLOR_TEXT_OPTIONS_MESSAGE = (200, 200, 200)
+FONT_SIZE_OPTIONS = 13
+
 # --- Stand by ---------------------------------------------------------------
 # La pantalla de suspension se ve con el brillo al minimo
 # (``deck.session.BRIGHTNESS_STANDBY``), asi que aqui no se busca contraste
