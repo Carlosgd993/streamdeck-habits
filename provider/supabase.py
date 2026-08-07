@@ -8,8 +8,8 @@ proyecto:
 - Carga de la URL y la clave publishable desde el ``.env``.
 - Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits``,
   ``v_today_tasks`` y ``v_templates``, y las funciones ``rpc/habit_step``,
-  ``rpc/habit_undo``, ``rpc/complete_task``, ``rpc/set_task_priority`` e
-  ``rpc/instantiate_task`` del contrato.
+  ``rpc/habit_undo``, ``rpc/complete_task``, ``rpc/skip_task``,
+  ``rpc/set_task_priority`` e ``rpc/instantiate_task`` del contrato.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
   (``provider.base.Habit`` y subtipos, ``provider.base.Task``,
   ``provider.base.Template``).
@@ -347,6 +347,24 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
             raise ProviderNetworkError(str(exc)) from exc
 
         self._check_status(resp, "POST rpc/complete_task")
+
+    def skip_task(self, task: Task) -> None:
+        """Omite ``task`` via ``rpc/skip_task``.
+
+        Misma forma que ``complete_task``: ``void`` en la base, 204 sin
+        cuerpo, nada que parsear. Idempotente en la base.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/skip_task",
+                headers=self._headers(**{"Content-Type": "application/json"}),
+                json={"p_task_id": task.id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/skip_task")
 
     def set_priority(self, task: Task, priority: int) -> None:
         """Cambia la prioridad de ``task`` via ``rpc/set_task_priority``.

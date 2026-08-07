@@ -210,11 +210,11 @@ class OptionEntry:
     porque sus opciones futuras seran distintas -- una tarea no tiene
     objetivo ni "deshacer", un habito no tiene fecha de vencimiento. El menu
     de un habito sigue siendo una maqueta (volver + un par de teclas de
-    aviso, ninguna opcion real todavia); el de una tarea ya tiene la
-    primera opcion de verdad, cambiar la prioridad. Anadir una opcion mas es
-    anadir una entrada al layout que corresponda con su propio ``kind`` y
-    darle significado en ``resolve_press``, igual que cualquier otro layout
-    fijo de este modulo.
+    aviso, ninguna opcion real todavia); el de una tarea ya tiene dos:
+    cambiar la prioridad y omitirla (skip). Anadir una opcion mas es anadir
+    una entrada al layout que corresponda con su propio ``kind`` y darle
+    significado en ``resolve_press``, igual que cualquier otro layout fijo
+    de este modulo.
 
     Attributes:
         kind: "back" (vuelve a la vista de origen sin tocar el habito/tarea;
@@ -222,7 +222,9 @@ class OptionEntry:
             en el resto de pantallas), "message" (contenido informativo, no
             interactivo -- ``resolve_press`` la trata como "noop"), "priority"
             (solo en ``TASK_OPTIONS_LAYOUT``: fija la prioridad de la tarea a
-            ``priority`` -- ver ``resolve_press``) o "blank" (tecla vacia).
+            ``priority`` -- ver ``resolve_press``), "skip" (solo en
+            ``TASK_OPTIONS_LAYOUT``: omite la tarea via ``skip_task`` -- ver
+            ``resolve_press``) o "blank" (tecla vacia).
         label: Texto de la tecla.
         emoji: Icono a color, o cadena vacia.
         priority: Prioridad (``0``/``1``/``3``/``5``) que fija esta tecla.
@@ -248,10 +250,14 @@ _ITEM_OPTIONS_BLANK = OptionEntry("blank", "", "")  # relleno de las teclas sin 
 # aparecen aqui se pintan vacias.
 #
 # HABIT_OPTIONS_LAYOUT sigue siendo el prototipo original (sin opciones
-# reales); TASK_OPTIONS_LAYOUT ya tiene la primera: cambiar la prioridad,
-# en las teclas 11-14 (blanco/verde/amarillo/rojo, mismos colores que
+# reales); TASK_OPTIONS_LAYOUT ya tiene dos: "Skip" (tecla 1, omite la tarea
+# via skip_task) y cambiar la prioridad (cabecera en la tecla 5, botones en
+# las teclas 11-14: blanco/verde/amarillo/rojo, mismos colores que
 # ``deck.style.COLOR_TASK_BY_PRIORITY`` -- ver ``resolve_press`` y
-# ``deck.renderer.render_option_entry``).
+# ``deck.renderer.render_option_entry``). Las teclas 0/5/10 NO se
+# reinterpretan aqui como en NUMERIC_KEYPAD -- resolve_press resuelve
+# ITEM_OPTIONS antes de llegar a esa logica, asi que 5 puede llevar
+# contenido normal como cualquier otra.
 HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
     KEY_MENU: _ITEM_OPTIONS_BACK,
     6: OptionEntry("message", "Opciones de habito", "🚧"),
@@ -260,7 +266,8 @@ HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
 
 TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
     KEY_MENU: _ITEM_OPTIONS_BACK,
-    6: OptionEntry("message", "Prioridad", "🎚️"),
+    1: OptionEntry("skip", "Skip", "⏭️"),
+    5: OptionEntry("message", "Prioridad", "🎚️"),
     11: OptionEntry("priority", "Ninguna", priority=0),
     12: OptionEntry("priority", "Baja", priority=1),
     13: OptionEntry("priority", "Media", priority=3),
@@ -561,13 +568,14 @@ class PressAction:
             "shutdown" | "standby" | "wake" | "page_prev" | "page_next" |
             "numeric_digit" | "numeric_decimal" | "numeric_backspace" |
             "numeric_confirm" | "numeric_cancel" | "item_options_exit" |
-            "task_set_priority" | "noop".
+            "task_set_priority" | "task_skip" | "noop".
         payload: Id del habito/tarea/plantilla si ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
             "numeric_confirm", el ``view_id`` destino si ``kind`` es
             "select_view", el digito tecleado si ``kind`` es "numeric_digit",
             o la prioridad elegida (como texto) si ``kind`` es
-            "task_set_priority" -- el id de la tarea no va aqui, se lee de
+            "task_set_priority" -- el id de la tarea no va aqui (ni en
+            "task_skip", que no lleva payload), se lee de
             ``ScreenState.entry_item_id`` en el momento de ejecutar, igual
             que "numeric_confirm" con ``entry_habit_id``. Vacio en el resto.
     """
@@ -638,6 +646,10 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             # llamador lo lee de screen.entry_item_id en el momento de
             # ejecutar la accion.
             return PressAction("task_set_priority", str(entry.priority))
+        if entry.kind == "skip":
+            # Sin payload: skip_task solo necesita el id de la tarea, que el
+            # llamador lee de screen.entry_item_id, igual que arriba.
+            return PressAction("task_skip")
         return PressAction("item_options_exit")
 
     if key == KEY_MENU:

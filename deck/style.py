@@ -90,6 +90,13 @@ COLOR_OPTIONS_MESSAGE = (35, 45, 55)
 COLOR_TEXT_OPTIONS_MESSAGE = (200, 200, 200)
 FONT_SIZE_OPTIONS = 13
 
+# "Skip" (omitir una tarea, solo en TASK_OPTIONS_LAYOUT): naranja propio,
+# distinto de COLOR_ERROR/COLOR_SHUTDOWN (no es un fallo ni algo tan
+# irreversible como apagar la Pi) y de COLOR_TASK_BY_PRIORITY (no es una
+# prioridad).
+COLOR_TASK_SKIP = (190, 110, 20)
+COLOR_TEXT_TASK_SKIP = (255, 255, 255)
+
 # --- Stand by ---------------------------------------------------------------
 # La pantalla de suspension se ve con el brillo al minimo
 # (``deck.session.BRIGHTNESS_STANDBY``), asi que aqui no se busca contraste

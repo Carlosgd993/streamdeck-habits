@@ -227,8 +227,8 @@ def make_key_callback(
             nunca una pulsacion normal.
         exit_item_options: Vuelve del menu de opciones a la vista de origen y
             repinta. La usan tanto "Volver" (via ``dispatch_navigation``) como
-            un cambio de prioridad de tarea con exito (ver
-            "task_set_priority" mas abajo).
+            un cambio de prioridad o un skip de tarea con exito (ver
+            "task_set_priority"/"task_skip" mas abajo).
 
     Se suma un cuarto tipo de tecla, aparte de habito/tarea/plantilla:
 
@@ -249,13 +249,20 @@ def make_key_callback(
       (tecla 0 dentro de esa pantalla) resuelve a ``"item_options_exit"`` y se
       delega en ``dispatch_navigation`` -- sin red, sin tocar el habito/tarea
       que abrio el menu. El de un habito sigue siendo un prototipo sin
-      opciones reales; el de una tarea ya tiene una: **cambiar la
-      prioridad** (teclas 11-14, blanco/verde/amarillo/rojo). Pulsar una
-      llama a ``TaskProvider.set_priority`` (``press_task_priority``, con el
-      mismo patron de acuse que un paso de habito) y, si la base confirma,
-      mutacion optimista + ``exit_item_options`` -- vuelve a la vista de
-      origen ya con el color nuevo. Fallo -> la tecla queda en rojo con el
-      codigo, sin salir del menu, para poder reintentar.
+      opciones reales; el de una tarea ya tiene dos:
+
+      - **Cambiar la prioridad** (teclas 11-14, blanco/verde/amarillo/rojo)
+        -> ``TaskProvider.set_priority`` (``press_task_priority``). Exito ->
+        mutacion optimista de ``task.priority`` + ``exit_item_options``.
+      - **Skip** (tecla 1, naranja) -> mismo acuse verde que cerrar una tarea
+        (``render_task_sending``), luego ``TaskProvider.skip_task``
+        (``press_task_skip``). Exito -> la tarea sale de ``tasks_ref``
+        (igual que al completarla) + ``exit_item_options``.
+
+      Ambas comparten patron: sin id en el payload de la ``PressAction``
+      (se lee de ``screen.entry_item_id``), reservadas con
+      ``_claim``/``_release`` por ese id, y en caso de fallo la tecla queda
+      en rojo con el codigo sin salir del menu, para poder reintentar.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
@@ -347,6 +354,28 @@ def make_key_callback(
             _safe_render(exit_item_options)
             print(f"Prioridad cambiada: {task.title} -> {priority}", flush=True)
 
+    def press_task_skip(deck: Any, key: int) -> None:
+        with screen_lock:
+            task_id = screen.entry_item_id
+        task = tasks_ref["value"].get(task_id)
+        if task is None:
+            return  # tarea desaparecida entre ciclos (cerrada/omitida por otro cliente): se ignora
+        _safe_render(lambda: renderer.render_task_sending(deck, key))
+        try:
+            task_provider.skip_task(task)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(task_id, str(exc), kind="task")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Skip FALLO [{code}]: {task_id}", flush=True)
+        else:
+            # Igual que un cierre: la tarea sale de tasks_ref para que otra
+            # pulsacion no reintente omitirla, y exit_item_options repinta la
+            # vista de origen ya sin ella (se recoloca sin dejar hueco).
+            tasks_ref["value"].pop(task_id, None)
+            _safe_render(exit_item_options)
+            print(f"Tarea omitida: {task.title}", flush=True)
+
     def press_template(deck: Any, key: int, template_id: str) -> None:
         template = templates_ref["value"].get(template_id)
         if template is None:
@@ -410,16 +439,19 @@ def make_key_callback(
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
                 _release(item_id)
-        elif action.kind == "task_set_priority":
-            # El id de la tarea no viaja en el payload (solo la prioridad
-            # elegida): se lee de screen.entry_item_id, igual que
-            # "numeric_confirm" lee el valor tecleado de screen.entry_value.
+        elif action.kind in ("task_set_priority", "task_skip"):
+            # Ninguna de las dos lleva el id de la tarea en el payload: se
+            # lee de screen.entry_item_id, igual que "numeric_confirm" lee
+            # el valor tecleado de screen.entry_value.
             with screen_lock:
                 item_id = screen.entry_item_id
             if not _claim(item_id):
                 return  # ya hay una peticion en vuelo para esta tarea
             try:
-                press_task_priority(deck, key, action.payload)
+                if action.kind == "task_set_priority":
+                    press_task_priority(deck, key, action.payload)
+                else:
+                    press_task_skip(deck, key)
             finally:
                 _release(item_id)
         elif action.kind != "noop":

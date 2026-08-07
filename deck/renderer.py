@@ -26,6 +26,7 @@ from deck.style import (
     COLOR_STANDBY,
     COLOR_TASK_BY_PRIORITY,
     COLOR_TASK_SENDING,
+    COLOR_TASK_SKIP,
     COLOR_TEMPLATE,
     COLOR_TEMPLATE_PENDING,
     COLOR_TEXT_ARROW,
@@ -40,6 +41,7 @@ from deck.style import (
     COLOR_TEXT_SHUTDOWN,
     COLOR_TEXT_STANDBY,
     COLOR_TEXT_TASK_BY_PRIORITY,
+    COLOR_TEXT_TASK_SKIP,
     COLOR_TEXT_TEMPLATE,
     COLOR_TEXT_TEMPLATE_PENDING,
     FONT_SIZE_HABIT_PENDING,
@@ -263,7 +265,9 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
     prioridad (solo en ``TASK_OPTIONS_LAYOUT``) reutiliza literalmente los
     colores de tarea por prioridad (``COLOR_TASK_BY_PRIORITY``), para que se
     reconozca de un vistazo con el mismo codigo de color que el resto del
-    deck. Una tecla sin contenido se pinta vacia.
+    deck. "Skip" (solo en ``TASK_OPTIONS_LAYOUT``) usa un naranja propio
+    (``COLOR_TASK_SKIP``), distinto del rojo de error/apagado y de los
+    colores de prioridad. Una tecla sin contenido se pinta vacia.
     """
     if entry.kind == "back":
         image = text_tile(
@@ -282,6 +286,11 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
         color = COLOR_TASK_BY_PRIORITY.get(entry.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
         text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(entry.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
         image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_TASK)
+    elif entry.kind == "skip":
+        image = text_tile(
+            deck, COLOR_TASK_SKIP, entry.label, text_color=COLOR_TEXT_TASK_SKIP, font_size=FONT_SIZE_NAV,
+            emoji=entry.emoji,
+        )
     else:  # "blank"
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return

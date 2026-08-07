@@ -418,6 +418,25 @@ class TaskProvider(ABC):
         """
 
     @abstractmethod
+    def skip_task(self, task: Task) -> None:
+        """Marca ``task`` como omitida (no se hizo hoy).
+
+        No devuelve nada, igual que ``complete_task``: la tarea deja de
+        estar pendiente (sale de ``get_tasks()``), pero el rastro queda
+        como "omitida" en vez de "hecha". Es idempotente en la base. La usa
+        el menu de opciones de una tarea (mantener pulsado, ver
+        ``core.screens``).
+
+        Args:
+            task: La tarea a omitir.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
     def set_priority(self, task: Task, priority: int) -> None:
         """Cambia la prioridad de ``task`` a ``priority``.
 
