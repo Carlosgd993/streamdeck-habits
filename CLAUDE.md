@@ -23,6 +23,9 @@ provider/              LA API, aislada tras tres puertos. No sabe nada del deck 
                        Habit/BooleanHabit/RealHabit, Task, Template, excepciones.
   supabase.py         El adaptador (implementa los tres): PostgREST, build_habit(), build_task(),
                        build_template(). Único sitio con detalles de Supabase.
+  keepalive.py        Reactivación best-effort de un proyecto Supabase pausado por inactividad (Management
+                       API, credencial y API distintas de las de arriba). Ver más abajo, en "El bucle
+                       principal".
 
 deck/                  EL HARDWARE. No sabe nada del proveedor de datos.
   session.py          Abrir/cerrar/reconectar el dispositivo, brillo (incluido el 0 del stand by).
@@ -229,6 +232,8 @@ Ese cruce se **recalcula en cada resolución**, no se acumula: si la ocurrencia 
 4. `_paint_current_screen()`: resuelve la **pantalla activa** (no solo "Hoy": lo que sea que esté abierto — menú, Sistema o cualquier vista) contra los datos que acaban de llegar (`core.screens.resolve_page`), la pinta (`renderer.render_page`), pinta encima los códigos de error guardados **si la pantalla visible los usa** (`last_habits_code` solo en "Hoy"/"Hábitos", `last_tasks_code` en "Hoy"/"Tareas", `last_templates_code` solo en "Crear"), y **re-registra** `deck.set_key_callback(...)` con un closure fresco.
 
 **Las tres lecturas fallan por separado**: la que falla no toca su mapeo ni sus datos (se conservan los del ciclo anterior) y no afecta a las otras. El ciclo **siempre** llega a pintar y a re-registrar el callback, de modo que lo pintado y lo que hace cada tecla nunca se desincronizan.
+
+**Reactivación de un proyecto Supabase pausado.** Un proyecto del plan gratuito se pausa solo tras ~1 semana sin tráfico: su subdominio de API deja de resolver por DNS, lo que `provider.supabase` traduce en el mismo `ProviderNetworkError`/`NET` que "la Pi no tiene red" — son indistinguibles desde el propio checkin. Al final de `refresh_cycle` (ya **fuera** de `screen_lock`, es una llamada de red que no toca pantalla ni mapeo), si cualquiera de las tres lecturas trajo `NET`, se lanza en su propio hilo `provider.keepalive.try_restore_active_project()`, que pide la reactivación a la Management API de Supabase (`api.supabase.com`, no PostgREST). Es una **credencial y una API distintas** de las que usa `provider/supabase.py`: requiere `SUPABASE_ACCESS_TOKEN` (Personal Access Token de la cuenta, no la clave publishable) en el `.env` — sin él, la función no hace nada y el daemon se comporta exactamente igual que antes de que este módulo existiera. `config.RESTORE_COOLDOWN_SECONDS` (30 min) evita repetir la petición mientras el proyecto sigue "despertando" (tarda uno o dos minutos; se confirma solo, en un ciclo posterior).
 
 El estado que ve el callback son wrappers dict de una entrada (`habits_ref`/`tasks_ref`/`templates_ref = {"value": {id: obj}}`) precisamente para que el closure observe las actualizaciones de ciclos posteriores. Aun así, **el mapeo tecla→elemento solo es tan reciente como el último ciclo o la última navegación.**
 

@@ -25,7 +25,8 @@ import core.key_map as key_map
 import core.screens as screens
 import deck.keys as deck_keys
 import deck.renderer as renderer
-from config import AUTO_RETURN_SECONDS, LONG_PRESS_SECONDS, REFRESH_SECONDS, STANDBY_SECONDS
+import provider.keepalive as keepalive
+from config import AUTO_RETURN_SECONDS, LONG_PRESS_SECONDS, REFRESH_SECONDS, RESTORE_COOLDOWN_SECONDS, STANDBY_SECONDS
 from core.error_codes import CODES
 from deck.session import BRIGHTNESS, BRIGHTNESS_STANDBY, DeckSession
 from provider.base import (
@@ -541,6 +542,7 @@ def main() -> None:
     last_habits_code: str | None = None  # ultimo codigo de error de habitos, para pintarlo tras navegar sin refetch
     last_tasks_code: str | None = None  # idem para tareas
     last_templates_code: str | None = None  # idem para plantillas
+    last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
 
     def _paint_current_screen() -> None:
         """Resuelve la pantalla activa contra los datos vigentes, la pinta y
@@ -608,6 +610,35 @@ def main() -> None:
         with screen_lock:
             _paint_current_screen()
 
+    def _maybe_restore_project() -> None:
+        """Si el ciclo que acaba de terminar trajo NET en cualquiera de las
+        tres lecturas, intenta reactivar el proyecto Supabase activo (ver
+        ``provider.keepalive``): un NET persistente es el sintoma de un
+        proyecto pausado por inactividad tanto como el de "sin red", y no
+        hay forma de distinguirlos desde el propio checkin, asi que se
+        intenta siempre que se vea NET -- sin token configurado,
+        ``try_restore_active_project`` no hace nada (ver su docstring).
+
+        Se auto-limita a un intento cada ``RESTORE_COOLDOWN_SECONDS``:
+        reactivar tarda uno o dos minutos, y NET se repite cada ciclo
+        mientras tanto. Se llama SIN ``screen_lock`` (ver ``refresh_cycle``)
+        y lanza la peticion en su propio hilo para no retrasar el repintado
+        ni una pulsacion en curso con una llamada de red que no las afecta.
+        """
+        nonlocal last_restore_attempt
+        if "NET" not in (last_habits_code, last_tasks_code, last_templates_code):
+            return
+        now = time.monotonic()
+        if now - last_restore_attempt < RESTORE_COOLDOWN_SECONDS:
+            return
+        last_restore_attempt = now
+
+        def _attempt() -> None:
+            ok = keepalive.try_restore_active_project()
+            print(f"Reactivacion de proyecto Supabase {'solicitada' if ok else 'no disponible'}", flush=True)
+
+        threading.Thread(target=_attempt, daemon=True).start()
+
     def refresh_cycle() -> None:
         """Refetch + repintado de la pantalla activa.
 
@@ -615,6 +646,9 @@ def main() -> None:
         hilo de callbacks del deck: al entrar en una vista desde el menu
         (``_enter_view``) y al deshacer un habito. Adquiere ``screen_lock``
         ella misma, asi que solo puede llamarse SIN el lock ya adquirido.
+
+        Termina, ya sin el lock, intentando reactivar el proyecto Supabase si
+        el ciclo trajo NET (``_maybe_restore_project``, ver su docstring).
         """
         nonlocal mapping, last_habits_code, last_tasks_code, last_templates_code
         with screen_lock:
@@ -653,6 +687,8 @@ def main() -> None:
                 templates_ref["value"] = {t.id: t for t in templates}
 
             _paint_current_screen()
+
+        _maybe_restore_project()  # fuera de screen_lock: es una llamada de red que no toca pantalla/mapeo
 
     def _is_standby() -> bool:
         """Si el deck esta ahora mismo suspendido (pantalla apagada)."""

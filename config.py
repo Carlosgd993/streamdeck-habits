@@ -25,3 +25,5 @@ REFRESH_SECONDS = 900  # 15 min
 AUTO_RETURN_SECONDS = 300  # 5 min sin pulsar fuera de la vista "Hoy" -> vuelve sola a "Hoy"
 STANDBY_SECONDS = 1800  # 30 min sin pulsar nada -> stand by (pantalla apagada, sin refrescos)
 LONG_PRESS_SECONDS = 0.6  # mantener pulsado un habito/tarea este tiempo abre su menu de opciones
+
+RESTORE_COOLDOWN_SECONDS = 1800  # 30 min minimo entre intentos de reactivar un proyecto Supabase pausado
