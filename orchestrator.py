@@ -1,8 +1,9 @@
 #!/opt/streamdeck-habits/venv/bin/python
-"""Punto de entrada del daemon: bucle de refresco que sincroniza los habitos,
-las tareas pendientes y las plantillas de creacion rapida del proveedor con las
-teclas del Stream Deck, y gestiona la navegacion por menu, la paginacion y los
-pasos/deshaceres/cierres/creaciones al pulsar.
+"""Punto de entrada del daemon: bucle de refresco que sincroniza los habitos
+(con objetivo y de solo registro), las tareas pendientes y las plantillas de
+creacion rapida del proveedor con las teclas del Stream Deck, y gestiona la
+navegacion por menu, la paginacion y los pasos/deshaceres/cierres/creaciones
+al pulsar.
 
 El orquestador depende solo de los puertos abstractos de ``provider.base``
 (interfaces ``HabitProvider``/``TaskProvider``/``TemplateProvider``, modelos
@@ -122,6 +123,7 @@ def make_key_callback(
     template_provider: TemplateProvider,
     mapping: dict[str, int],
     habits_ref: dict[str, dict[str, Habit]],
+    log_habits_ref: dict[str, dict[str, Habit]],
     tasks_ref: dict[str, dict[str, Task]],
     templates_ref: dict[str, dict[str, Template]],
     screen: screens.ScreenState,
@@ -200,6 +202,11 @@ def make_key_callback(
         mapping: Mapeo habito -> tecla vigente para este ciclo.
         habits_ref: Wrapper de un solo campo ``{"value": {id: Habit}}`` para
             que el closure observe actualizaciones de ciclos posteriores.
+        log_habits_ref: Idem para los habitos de solo registro (``LogHabit``,
+            vista "Logs"). Aparte de ``habits_ref`` porque ``get_log_habits()``
+            es una lectura separada de ``get_habits()`` (ver
+            ``provider.base.HabitProvider``); ``press_habit`` busca en los dos
+            porque un habito pulsado puede venir de cualquiera.
         tasks_ref: Idem para las tareas pendientes.
         templates_ref: Idem para las plantillas de creacion rapida.
         screen: Pantalla activa (menu, sistema o vista con su pagina).
@@ -249,9 +256,20 @@ def make_key_callback(
     - **Menu de opciones de un habito/tarea** (mantener pulsado): "Volver"
       (tecla 0 dentro de esa pantalla) resuelve a ``"item_options_exit"`` y se
       delega en ``dispatch_navigation`` -- sin red, sin tocar el habito/tarea
-      que abrio el menu. El de un habito sigue siendo un prototipo sin
-      opciones reales; el de una tarea ya tiene dos:
+      que abrio el menu. El de un habito tiene una opcion real; el de una
+      tarea tiene dos:
 
+      - **Deshacer** (tecla 1, ambar -- solo en el menu de un habito) ->
+        ``HabitProvider.undo()`` (``press_habit_undo_option``). Generico para
+        cualquier ``Habit`` (con objetivo o de solo registro, ver
+        ``provider.base.LogHabit``), no solo el ``BooleanHabit`` hecho que ya
+        cubre el tap-undo de "Habitos" (``core.screens._undoes``). Exito ->
+        mutacion optimista de ``habit.current_value`` + ``screen.kind =
+        ScreenKind.VIEW`` + ``refresh()`` completo (no ``exit_item_options``,
+        que solo repintaria con cache): el valor que devuelve la base es el
+        del dia, y en un habito ``weekly_quota`` hay que releer el contador
+        semanal real -- mismo motivo que el ``"habit_undo"`` de una pulsacion
+        corta normal, ver ``press_habit``.
       - **Cambiar la prioridad** (teclas 11-14, blanco/verde/amarillo/rojo)
         -> ``TaskProvider.set_priority`` (``press_task_priority``). Exito ->
         mutacion optimista de ``task.priority`` + ``exit_item_options``.
@@ -260,7 +278,7 @@ def make_key_callback(
         (``press_task_skip``). Exito -> la tarea sale de ``tasks_ref``
         (igual que al completarla) + ``exit_item_options``.
 
-      Ambas comparten patron: sin id en el payload de la ``PressAction``
+      Las tres comparten patron: sin id en el payload de la ``PressAction``
       (se lee de ``screen.entry_item_id``), reservadas con
       ``_claim``/``_release`` por ese id, y en caso de fallo la tecla queda
       en rojo con el codigo sin salir del menu, para poder reintentar.
@@ -270,7 +288,11 @@ def make_key_callback(
     """
 
     def press_habit(deck: Any, key: int, habit_id: str, *, undo: bool = False) -> None:
-        habit = habits_ref["value"].get(habit_id)
+        # Un habito pulsado puede venir de get_habits() o de get_log_habits():
+        # los ids no colisionan nunca (misma tabla, un id es de un purpose o
+        # del otro, nunca de los dos), asi que basta con mirar en el que lo
+        # tenga.
+        habit = habits_ref["value"].get(habit_id) or log_habits_ref["value"].get(habit_id)
         if habit is None:
             return  # habito desconocido (caso defensivo entre ciclos): se ignora
         what = "Deshacer" if undo else "Paso"
@@ -377,6 +399,40 @@ def make_key_callback(
             _safe_render(exit_item_options)
             print(f"Tarea omitida: {task.title}", flush=True)
 
+    def press_habit_undo_option(deck: Any, key: int) -> None:
+        """"Deshacer" del menu de opciones de un habito (tecla 1 de
+        HABIT_OPTIONS_LAYOUT). Generaliza HabitProvider.undo() -- ya vale
+        para cualquier Habit, con objetivo o de solo registro -- al menu de
+        mantener pulsado, sin depender del tap-undo de "Habitos" (que solo
+        cubre BooleanHabit hecho, ver core.screens._undoes).
+
+        Igual que el "habit_undo" de una pulsacion normal (ver press_habit),
+        dispara refresh() en vez de mutacion optimista + exit_item_options:
+        el valor que devuelve la base es el del dia, y en un habito
+        weekly_quota hay que releer el contador semanal real -- refresh()
+        tambien saca de ScreenKind.ITEM_OPTIONS (se fija antes de llamarlo,
+        para que el repintado caiga sobre la vista de origen, no sobre el
+        menu de opciones).
+        """
+        with screen_lock:
+            habit_id = screen.entry_item_id
+        habit = habits_ref["value"].get(habit_id) or log_habits_ref["value"].get(habit_id)
+        if habit is None:
+            return  # habito desaparecido entre ciclos: se ignora
+        try:
+            new_value = provider.undo(habit)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(habit_id, str(exc), kind="habit")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Deshacer (opciones) FALLO [{code}]: {habit_id}", flush=True)
+        else:
+            habit.current_value = new_value
+            with screen_lock:
+                screen.kind = screens.ScreenKind.VIEW
+            refresh()
+            print(f"Deshacer (opciones) OK: {habit.name} -> {new_value}", flush=True)
+
     def press_template(deck: Any, key: int, template_id: str) -> None:
         template = templates_ref["value"].get(template_id)
         if template is None:
@@ -440,19 +496,21 @@ def make_key_callback(
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
                 _release(item_id)
-        elif action.kind in ("task_set_priority", "task_skip"):
-            # Ninguna de las dos lleva el id de la tarea en el payload: se
-            # lee de screen.entry_item_id, igual que "numeric_confirm" lee
-            # el valor tecleado de screen.entry_value.
+        elif action.kind in ("task_set_priority", "task_skip", "habit_options_undo"):
+            # Ninguna lleva el id del habito/tarea en el payload: se lee de
+            # screen.entry_item_id, igual que "numeric_confirm" lee el valor
+            # tecleado de screen.entry_value.
             with screen_lock:
                 item_id = screen.entry_item_id
             if not _claim(item_id):
-                return  # ya hay una peticion en vuelo para esta tarea
+                return  # ya hay una peticion en vuelo para este elemento
             try:
                 if action.kind == "task_set_priority":
                     press_task_priority(deck, key, action.payload)
-                else:
+                elif action.kind == "task_skip":
                     press_task_skip(deck, key)
+                else:
+                    press_habit_undo_option(deck, key)
             finally:
                 _release(item_id)
         elif action.kind != "noop":
@@ -501,7 +559,8 @@ def make_key_callback(
             habits_list = list(habits_ref["value"].values())
             tasks_list = list(tasks_ref["value"].values())
             templates_list = list(templates_ref["value"].values())
-            resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, mapping)
+            log_habits_list = list(log_habits_ref["value"].values())
+            resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, log_habits_list, mapping)
             action = screens.resolve_press(screen, key, resolved)
 
         if action.kind in _HOLD_KINDS:
@@ -534,12 +593,14 @@ def main() -> None:
 
     mapping = key_map.load_map()
     habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
+    log_habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # idem para los LogHabit de get_log_habits()
     tasks_ref: dict[str, dict[str, Task]] = {"value": {}}  # task_id -> objeto Task, actualizado cada ciclo
     templates_ref: dict[str, dict[str, Template]] = {"value": {}}  # template_id -> Template, idem
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
     last_habits_code: str | None = None  # ultimo codigo de error de habitos, para pintarlo tras navegar sin refetch
+    last_log_habits_code: str | None = None  # idem para los habitos de solo registro
     last_tasks_code: str | None = None  # idem para tareas
     last_templates_code: str | None = None  # idem para plantillas
     last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
@@ -557,6 +618,7 @@ def main() -> None:
             list(habits_ref["value"].values()),
             list(tasks_ref["value"].values()),
             list(templates_ref["value"].values()),
+            list(log_habits_ref["value"].values()),
             mapping,
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
@@ -570,6 +632,9 @@ def main() -> None:
         is_view = screen.kind is screens.ScreenKind.VIEW
         if last_habits_code is not None and is_view and screen.view_id in ("today", "habits"):
             code = last_habits_code
+            _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
+        if last_log_habits_code is not None and is_view and screen.view_id == "logs":
+            code = last_log_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
         if last_tasks_code is not None and is_view and screen.view_id in ("today", "tasks"):
             code = last_tasks_code
@@ -586,6 +651,7 @@ def main() -> None:
                 template_provider,
                 mapping,
                 habits_ref,
+                log_habits_ref,
                 tasks_ref,
                 templates_ref,
                 screen,
@@ -612,7 +678,7 @@ def main() -> None:
 
     def _maybe_restore_project() -> None:
         """Si el ciclo que acaba de terminar trajo NET en cualquiera de las
-        tres lecturas, intenta reactivar el proyecto Supabase activo (ver
+        cuatro lecturas, intenta reactivar el proyecto Supabase activo (ver
         ``provider.keepalive``): un NET persistente es el sintoma de un
         proyecto pausado por inactividad tanto como el de "sin red", y no
         hay forma de distinguirlos desde el propio checkin, asi que se
@@ -626,7 +692,7 @@ def main() -> None:
         ni una pulsacion en curso con una llamada de red que no las afecta.
         """
         nonlocal last_restore_attempt
-        if "NET" not in (last_habits_code, last_tasks_code, last_templates_code):
+        if "NET" not in (last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code):
             return
         now = time.monotonic()
         if now - last_restore_attempt < RESTORE_COOLDOWN_SECONDS:
@@ -650,12 +716,13 @@ def main() -> None:
         Termina, ya sin el lock, intentando reactivar el proyecto Supabase si
         el ciclo trajo NET (``_maybe_restore_project``, ver su docstring).
         """
-        nonlocal mapping, last_habits_code, last_tasks_code, last_templates_code
+        nonlocal mapping, last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code
         with screen_lock:
-            # Las tres lecturas se hacen por separado y fallan por separado: un
-            # fallo leyendo tareas deja su codigo aparte y no toca los habitos
-            # ni las plantillas, y asi con cualquiera. La lectura que falla no
-            # toca su mapeo ni sus datos (se conservan los del ciclo anterior).
+            # Las cuatro lecturas se hacen por separado y fallan por separado:
+            # un fallo leyendo tareas deja su codigo aparte y no toca los
+            # habitos ni las plantillas, y asi con cualquiera. La lectura que
+            # falla no toca su mapeo ni sus datos (se conservan los del ciclo
+            # anterior).
             try:
                 habits = habit_provider.get_habits()
             except ProviderError as exc:
@@ -665,6 +732,20 @@ def main() -> None:
                 last_habits_code = None
                 mapping = key_map.update_mapping(habits, mapping)
                 habits_ref["value"] = {h.id: h for h in habits}
+
+            try:
+                # Los habitos de solo registro no usan el mapeo persistido de
+                # core.key_map: "Logs" pagina de cero cada vez (igual que
+                # "Hoy"/"Tareas"), y como nunca desaparecen de su propia lista
+                # eso ya les da tecla estable sin necesitar el fichero (ver
+                # core.screens._log_items).
+                log_habits = habit_provider.get_log_habits()
+            except ProviderError as exc:
+                _, last_log_habits_code = health.classify(exc)
+                print(f"[{last_log_habits_code}] {CODES[last_log_habits_code]} (logs): {exc}", flush=True)
+            else:
+                last_log_habits_code = None
+                log_habits_ref["value"] = {h.id: h for h in log_habits}
 
             try:
                 tasks = task_provider.get_tasks()

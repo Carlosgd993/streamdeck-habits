@@ -14,9 +14,9 @@ particular:
   ``provider/supabase.py``, porque los tres salen del mismo contrato).
 - Jerarquia de excepciones agnostica (``ProviderError`` y subclases), compartida
   por los tres puertos.
-- Los modelos de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``),
-  ``Task`` y ``Template``, construidos desde campos ya parseados -- nunca desde
-  el JSON crudo de un backend.
+- Los modelos de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``/
+  ``LogHabit``), ``Task`` y ``Template``, construidos desde campos ya parseados --
+  nunca desde el JSON crudo de un backend.
 
 La logica de negocio (que dia es hoy, cual es el siguiente valor de un habito,
 que tareas estan pendientes) vive en la base de datos; estos puertos y sus
@@ -174,6 +174,71 @@ def _format_number(value: float) -> str:
     return str(int(value)) if value == int(value) else f"{value:g}"
 
 
+class LogHabit(Habit):
+    """Habito de solo registro (``purpose = 'log'`` en el backend): no tiene
+    objetivo ni programacion, y nunca esta "pendiente" ni "hecho" -- es solo
+    un boton para dejar constancia de que algo ocurrio (p.ej. "Desperte", con
+    la hora exacta guardada por la base en ``habit_checkins.checkin_time``,
+    que ni siquiera llega hasta aqui: ver ``provider.supabase.build_log_habit``).
+
+    Pulsarlo llama a ``HabitProvider.step()``, la misma operacion y la misma
+    RPC que un habito con objetivo -- el backend no distingue "avanzar" de
+    "registrar", solo ``purpose`` decide si un habito puede aparecer
+    "pendiente" en alguna vista. Por eso ``LogHabit`` vive en la misma
+    jerarquia que ``BooleanHabit``/``RealHabit`` en vez de en un puerto propio:
+    comparte la capacidad de "pulsar y avanzar", solo cambia que no se lee
+    desde ``get_habits()`` (que nunca la devuelve, ver ``HabitProvider``) ni
+    se pinta con el mismo criterio de color (ver ``deck.renderer.render_habit``).
+
+    Attributes:
+        color: Color propio del habito en formato ``"#RRGGBB"``, o cadena
+            vacia si no esta definido en la base. Es la unica senal visual
+            propia que trae el contrato para un log: al no haber estado
+            pendiente/hecho que pintar en blanco/gris, el color es lo que
+            distingue un log de otro de un vistazo. Un habito con objetivo
+            tambien tiene esta columna en la base, pero el cliente la ignora
+            a proposito porque ya usa el eje blanco/gris.
+        cumulative: Si ``True`` (``type == "Real"`` en la base), varias
+            pulsaciones el mismo dia se acumulan (``habit_step`` suma
+            ``step`` sin tope, igual que un ``RealHabit`` con objetivo) y la
+            tecla enseña un contador (p.ej. "Cocacola x3"). Si ``False``
+            (``type == "Boolean"``, el caso de "Desperte"), es un registro
+            unico diario: pulsarlo de nuevo no acumula nada (``habit_step``
+            vuelve a fijar el mismo valor), asi que no tiene sentido mostrar
+            numero.
+        unit: Unidad del log (p.ej. ``"Cups"``), vacia si no esta definida.
+            Solo se usa si ``cumulative`` es ``True`` y hay progreso hoy.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        emoji: str = "",
+        order: int = 0,
+        current_value: float = 0.0,
+        color: str = "",
+        cumulative: bool = False,
+        unit: str = "",
+    ) -> None:
+        super().__init__(id, name, emoji, order, current_value)
+        self.color = color
+        self.cumulative = cumulative
+        self.unit = unit
+
+    def display_label(self) -> str:
+        """El nombre del habito, y si es acumulable y hoy ya tiene registros,
+        el contador de veces (p.ej. "Cocacola x3"). Un log no acumulable
+        (p.ej. "Desperte") es un registro unico diario: pulsar la tecla ya es
+        el dato completo, nunca enseña numero."""
+        if not self.cumulative or self.current_value <= 0:
+            return self.name
+        count = f"x{_format_number(self.current_value)}"
+        if self.unit:
+            count = f"{count} {self.unit}"
+        return f"{self.name} {count}"
+
+
 TITLE_MAX_CHARS = 32
 """Longitud maxima del titulo de una tarea o plantilla en una tecla.
 
@@ -304,6 +369,23 @@ class HabitProvider(ABC):
     @abstractmethod
     def get_habits(self) -> list[Habit]:
         """Devuelve los habitos del usuario con su progreso de hoy ya incluido.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def get_log_habits(self) -> list[Habit]:
+        """Devuelve los habitos de solo registro (``LogHabit``), sin progreso
+        que interpretar: al reves que ``get_habits()``, aqui no hay
+        "pendiente" ni "hecho" -- la lista sale entera siempre, no se filtra
+        por nada. Metodo separado de ``get_habits()`` (en vez de un
+        discriminador dentro de la misma lista) para que esa otra interfaz
+        no cambie: todo lo que ya consume ``get_habits()`` (paginacion
+        estable de "Habitos", filtro de pendientes en "Hoy") sigue viendo
+        exactamente los habitos con objetivo de siempre.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.

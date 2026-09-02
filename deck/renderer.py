@@ -14,6 +14,7 @@ from deck.style import (
     COLOR_EMPTY,
     COLOR_ERROR,
     COLOR_HABIT_DONE,
+    COLOR_HABIT_LOG_DEFAULT,
     COLOR_HABIT_PENDING,
     COLOR_MENU,
     COLOR_NAV,
@@ -53,9 +54,32 @@ from deck.style import (
     FONT_SIZE_TASK,
     FONT_SIZE_TEMPLATE,
 )
-from provider.base import Habit, Task, Template
+from provider.base import Habit, LogHabit, Task, Template
 
 _DEFAULT_PRIORITY = 0  # al que cae una prioridad que no este en los diccionarios de estilo
+
+
+def _parse_hex_color(hex_color: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Convierte un color ``"#RRGGBB"`` (el que trae ``habits.color``) a una
+    tupla RGB para Pillow. Cae a ``fallback`` si viene vacio o no tiene el
+    formato esperado -- un log sin color propio en la base, o un valor
+    corrupto, no debe romper el pintado (se degrada, no falla)."""
+    if len(hex_color) == 7 and hex_color[0] == "#":
+        try:
+            return (int(hex_color[1:3], 16), int(hex_color[3:5], 16), int(hex_color[5:7], 16))
+        except ValueError:
+            pass
+    return fallback
+
+
+def _contrasting_text_color(background: tuple[int, int, int]) -> tuple[int, int, int]:
+    """Negro o blanco, el que mas contraste haga sobre ``background`` (brillo
+    percibido, formula YIQ). Solo hace falta aqui: es el unico fondo de este
+    modulo que elige libremente el usuario en la base -- el resto de familias
+    de color ya vienen con su pareja de texto fija a mano en ``deck/style.py``."""
+    r, g, b = background
+    brightness = (r * 299 + g * 587 + b * 114) / 1000
+    return (0, 0, 0) if brightness > 140 else (255, 255, 255)
 
 
 def render_habit(deck: Any, key: int, habit: Habit | None) -> None:
@@ -69,15 +93,41 @@ def render_habit(deck: Any, key: int, habit: Habit | None) -> None:
     p.ej. "10/8 Cups" en gris). Si ``habit`` es ``None`` la tecla se pinta
     vacia (negra).
 
-    El texto lo decide ``habit.display_label()`` (nombre para booleanos, solo
-    progreso para habitos cuantificables); el emoji del icono (``habit.emoji``),
-    si tiene, se pinta aparte como icono a color.
+    Un ``LogHabit`` (vista "Logs") no tiene objetivo, asi que aqui "hecho" no
+    es ``is_done`` (que compara contra ``goal``, ajeno a un log) sino
+    ``not habit.cumulative and habit.current_value > 0``: un log de registro
+    unico diario (``cumulative=False``, p.ej. "Desperte") ya registrado hoy
+    se pinta en el mismo gris ``COLOR_HABIT_DONE`` que un habito con objetivo
+    hecho -- misma senal, "ya llegaste, sigue pudiendose pulsar". Un log
+    acumulable (``cumulative=True``, p.ej. "Cocacola") NUNCA pasa a gris: cada
+    pulsacion es un registro mas que se quiere seguir invitando a hacer, asi
+    que conserva su color propio (``habit.color``, formato ``"#RRGGBB"``, o
+    ``COLOR_HABIT_LOG_DEFAULT`` si no tiene uno definido) tenga o no progreso
+    hoy. Ahi el texto se calcula por contraste (``_contrasting_text_color``)
+    porque, al reves que el resto de familias de este modulo, ese fondo no es
+    un valor fijo que ya venga con su pareja de texto pensada a mano.
+
+    El texto lo decide ``habit.display_label()`` (nombre para booleanos y
+    logs de registro unico, progreso/contador para habitos cuantificables y
+    logs acumulables); el emoji del icono (``habit.emoji``), si tiene, se
+    pinta aparte como icono a color.
     """
     if habit is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
     label = habit.display_label()
-    if habit.is_done:
+    log_done = isinstance(habit, LogHabit) and not habit.cumulative and habit.current_value > 0
+    if isinstance(habit, LogHabit) and not log_done:
+        color = _parse_hex_color(habit.color, COLOR_HABIT_LOG_DEFAULT)
+        image = text_tile(
+            deck,
+            color,
+            label,
+            text_color=_contrasting_text_color(color),
+            font_size=FONT_SIZE_HABIT_PENDING,
+            emoji=habit.emoji,
+        )
+    elif log_done or habit.is_done:
         image = text_tile(deck, COLOR_HABIT_DONE, label, text_color=COLOR_TEXT_HABIT_DONE, emoji=habit.emoji)
     else:
         image = text_tile(
@@ -261,13 +311,17 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
     "Volver" reutiliza el azul generico de navegacion (``COLOR_NAV``): mismo
     rol que "Salir" en el teclado numerico, esto te saca de aqui sin tocar el
     habito/tarea que abrio el menu. Un mensaje informativo usa un color propio
-    apagado, para no parecer una tecla de contenido pulsable. Una tecla de
-    prioridad (solo en ``TASK_OPTIONS_LAYOUT``) reutiliza literalmente los
-    colores de tarea por prioridad (``COLOR_TASK_BY_PRIORITY``), para que se
-    reconozca de un vistazo con el mismo codigo de color que el resto del
-    deck. "Skip" (solo en ``TASK_OPTIONS_LAYOUT``) usa un naranja propio
-    (``COLOR_TASK_SKIP``), distinto del rojo de error/apagado y de los
-    colores de prioridad. Una tecla sin contenido se pinta vacia.
+    apagado, para no parecer una tecla de contenido pulsable. "Deshacer" (solo
+    en ``HABIT_OPTIONS_LAYOUT``) reutiliza ``COLOR_NUMERIC_BACKSPACE`` tal
+    cual -- mismo significado ("borra/corrige algo reciente") que ya tiene en
+    el teclado numerico; no hay colision posible porque las dos pantallas
+    nunca se pintan a la vez. Una tecla de prioridad (solo en
+    ``TASK_OPTIONS_LAYOUT``) reutiliza literalmente los colores de tarea por
+    prioridad (``COLOR_TASK_BY_PRIORITY``), para que se reconozca de un
+    vistazo con el mismo codigo de color que el resto del deck. "Skip" (solo
+    en ``TASK_OPTIONS_LAYOUT``) usa un naranja propio (``COLOR_TASK_SKIP``),
+    distinto del rojo de error/apagado y de los colores de prioridad. Una
+    tecla sin contenido se pinta vacia.
     """
     if entry.kind == "back":
         image = text_tile(
@@ -290,6 +344,11 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
         image = text_tile(
             deck, COLOR_TASK_SKIP, entry.label, text_color=COLOR_TEXT_TASK_SKIP, font_size=FONT_SIZE_NAV,
             emoji=entry.emoji,
+        )
+    elif entry.kind == "undo":
+        image = text_tile(
+            deck, COLOR_NUMERIC_BACKSPACE, entry.label, text_color=COLOR_TEXT_NUMERIC_BACKSPACE,
+            font_size=FONT_SIZE_NAV, emoji=entry.emoji,
         )
     else:  # "blank"
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))

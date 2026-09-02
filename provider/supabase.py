@@ -7,9 +7,11 @@ proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
 - Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits``,
-  ``v_today_tasks`` y ``v_templates``, y las funciones ``rpc/habit_step``,
-  ``rpc/habit_undo``, ``rpc/complete_task``, ``rpc/skip_task``,
-  ``rpc/set_task_priority`` e ``rpc/instantiate_task`` del contrato.
+  ``v_log_habits``, ``v_today_tasks`` y ``v_templates``, y las funciones
+  ``rpc/habit_step``, ``rpc/habit_undo``, ``rpc/complete_task``,
+  ``rpc/skip_task``, ``rpc/set_task_priority`` e ``rpc/instantiate_task`` del
+  contrato. ``v_log_habits`` reutiliza ``rpc/habit_step`` para el press --
+  no hay una RPC de registro aparte, el contrato es el mismo.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
   (``provider.base.Habit`` y subtipos, ``provider.base.Task``,
   ``provider.base.Template``).
@@ -36,6 +38,7 @@ from provider.base import (
     BooleanHabit,
     Habit,
     HabitProvider,
+    LogHabit,
     ProviderAuthError,
     ProviderDataError,
     ProviderNetworkError,
@@ -117,6 +120,35 @@ def build_habit(data: dict[str, Any]) -> Habit:
             manual_entry=bool(data.get("manual_entry", False)),
         )
     return BooleanHabit(id=id, name=name, emoji=emoji, order=order, current_value=current_value)
+
+
+def build_log_habit(data: dict[str, Any]) -> LogHabit:
+    """Mapea una fila cruda de ``v_log_habits`` al modelo de dominio.
+
+    Sin ramas de clase por ``type`` (a diferencia de ``build_habit``): un log
+    no tiene objetivo que enseñar, asi que ``Boolean``/``Real`` nunca cambian
+    la clase instanciada -- ambos son siempre ``LogHabit``. Pero ``type`` si
+    decide ``LogHabit.cumulative`` (``"Real"`` acumula por dia, ``"Boolean"``
+    es un registro unico): ver ``provider.base.LogHabit``. El color sale tal
+    cual de la base (``"#RRGGBB"`` o ``None``); la conversion a RGB para
+    Pillow es cosa de ``deck.renderer``, no de este adaptador.
+
+    Args:
+        data: Fila del habito de registro devuelta por la vista.
+
+    Returns:
+        El ``LogHabit`` correspondiente.
+    """
+    return LogHabit(
+        id=data["id"],
+        name=data["name"],
+        emoji=_extract_emoji_icon(str(data.get("icon_res") or "")),
+        order=int(data.get("sort_order") or 0),
+        current_value=float(data.get("current_value") or 0.0),
+        color=str(data.get("color") or ""),
+        cumulative=data.get("type") == "Real",
+        unit=str(data.get("unit") or ""),
+    )
 
 
 def build_task(data: dict[str, Any]) -> Task:
@@ -239,6 +271,37 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
         except ValueError as exc:
             raise ProviderDataError("GET v_today_habits -> respuesta no es JSON valido") from exc
         return [build_habit(h) for h in raw]
+
+    def get_log_habits(self) -> list[Habit]:
+        """Devuelve los habitos de solo registro, ya mapeados a dominio.
+
+        Mismo patron que ``get_habits``: una sola peticion, esta vez a
+        ``v_log_habits`` -- la vista ya filtra por ``purpose = 'log'`` y no
+        expone ``goal``/``step``/``done`` porque no significan nada aqui.
+        Tampoco ordena por si sola, igual que ``v_today_habits``. Pide
+        ``type``/``unit`` ademas de lo minimo: ``type`` decide si el log
+        acumula por dia o es un registro unico (``LogHabit.cumulative``, ver
+        ``build_log_habit``).
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_log_habits",
+                headers=self._headers(Accept="application/json"),
+                params={
+                    "select": "id,name,icon_res,color,type,unit,sort_order,current_value",
+                    "order": "sort_order",
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_log_habits")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_log_habits -> respuesta no es JSON valido") from exc
+        return [build_log_habit(h) for h in raw]
 
     def step(self, habit: Habit) -> float:
         """Avanza un paso ``habit`` via ``rpc/habit_step`` y devuelve el nuevo total."""

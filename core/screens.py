@@ -208,9 +208,10 @@ class OptionEntry:
     Un habito y una tarea llevan a pantallas **distintas**
     (``ScreenState.entry_item_kind`` decide cual, ver ``resolve_page``),
     porque sus opciones futuras seran distintas -- una tarea no tiene
-    objetivo ni "deshacer", un habito no tiene fecha de vencimiento. El menu
-    de un habito sigue siendo una maqueta (volver + un par de teclas de
-    aviso, ninguna opcion real todavia); el de una tarea ya tiene dos:
+    objetivo ni fecha de vencimiento. El menu de un habito ya tiene una
+    opcion real, "Deshacer" (retrocede un paso via ``HabitProvider.undo()``,
+    vale para cualquier ``Habit`` -- con objetivo o de solo registro, ver
+    ``orchestrator.press_habit_undo_option``); el de una tarea tiene dos:
     cambiar la prioridad y omitirla (skip). Anadir una opcion mas es anadir
     una entrada al layout que corresponda con su propio ``kind`` y darle
     significado en ``resolve_press``, igual que cualquier otro layout fijo
@@ -220,7 +221,9 @@ class OptionEntry:
         kind: "back" (vuelve a la vista de origen sin tocar el habito/tarea;
             fija en la tecla 0, mismo lugar y mismo rol que la tecla de menu
             en el resto de pantallas), "message" (contenido informativo, no
-            interactivo -- ``resolve_press`` la trata como "noop"), "priority"
+            interactivo -- ``resolve_press`` la trata como "noop"), "undo"
+            (solo en ``HABIT_OPTIONS_LAYOUT``: retrocede un paso del habito
+            via ``HabitProvider.undo()`` -- ver ``resolve_press``), "priority"
             (solo en ``TASK_OPTIONS_LAYOUT``: fija la prioridad de la tarea a
             ``priority`` -- ver ``resolve_press``), "skip" (solo en
             ``TASK_OPTIONS_LAYOUT``: omite la tarea via ``skip_task`` -- ver
@@ -249,9 +252,20 @@ _ITEM_OPTIONS_BLANK = OptionEntry("blank", "", "")  # relleno de las teclas sin 
 # son el sitio a tocar para anadir opciones reales; las teclas que no
 # aparecen aqui se pintan vacias.
 #
-# HABIT_OPTIONS_LAYOUT sigue siendo el prototipo original (sin opciones
-# reales); TASK_OPTIONS_LAYOUT ya tiene dos: "Skip" (tecla 1, omite la tarea
-# via skip_task) y cambiar la prioridad (cabecera en la tecla 5, botones en
+# HABIT_OPTIONS_LAYOUT tiene una opcion real, "Deshacer" (tecla 1, mismo
+# hueco que "Skip" en TASK_OPTIONS_LAYOUT): retrocede un paso del habito via
+# HabitProvider.undo() -- Boolean -> 0, cuantificable -> value-step sin bajar
+# de 0, ver provider.base.HabitProvider.undo. Es generico para CUALQUIER
+# Habit (con objetivo o de solo registro), no solo para el caso que lo motivo
+# (corregir una pulsacion de mas en un log acumulable como "Cocacola"): antes
+# de esto no habia ninguna forma de deshacer un habito cuantificable con
+# objetivo en ningun sitio del deck, ni siquiera en "Habitos" (su undo por
+# tap solo cubre BooleanHabit, ver ViewSpec.allows_undo/_undoes). Ver
+# orchestrator.press_habit_undo_option para el porque usa refresh() en vez
+# de exit_item_options().
+#
+# TASK_OPTIONS_LAYOUT tiene dos: "Skip" (tecla 1, omite la tarea via
+# skip_task) y cambiar la prioridad (cabecera en la tecla 5, botones en
 # las teclas 11-14: blanco/verde/amarillo/rojo, mismos colores que
 # ``deck.style.COLOR_TASK_BY_PRIORITY`` -- ver ``resolve_press`` y
 # ``deck.renderer.render_option_entry``). Las teclas 0/5/10 NO se
@@ -260,8 +274,7 @@ _ITEM_OPTIONS_BLANK = OptionEntry("blank", "", "")  # relleno de las teclas sin 
 # contenido normal como cualquier otra.
 HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
     KEY_MENU: _ITEM_OPTIONS_BACK,
-    6: OptionEntry("message", "Opciones de habito", "🚧"),
-    7: OptionEntry("message", "Proximamente", ""),
+    1: OptionEntry("undo", "Deshacer", "⌫"),
 }
 
 TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
@@ -275,19 +288,25 @@ TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
 }
 
 
-# PageBuilder: (habitos, tareas, plantillas, mapeo_habito->tecla, pagina)
+# PageBuilder: (habitos, tareas, plantillas, habitos_log, mapeo_habito->tecla, pagina)
 #   -> (habito_por_tecla, tarea_por_tecla, plantilla_por_tecla, total_de_paginas)
 #
-# Todos los builders reciben los tres conjuntos de datos aunque casi ninguno los
-# use enteros: es lo que permite que una vista nueva los cruce (p.ej. "Crear"
-# necesita las tareas para saber que plantillas ya tienen ocurrencia abierta).
+# Todos los builders reciben los cuatro conjuntos de datos aunque casi ninguno
+# los use enteros: es lo que permite que una vista nueva los cruce (p.ej.
+# "Crear" necesita las tareas para saber que plantillas ya tienen ocurrencia
+# abierta). ``habitos_log`` (``LogHabit``) va aparte de ``habitos`` a
+# proposito, igual que en ``HabitProvider``: ninguna vista existente los
+# esperaba mezclados con los habitos de objetivo (ver ``core.screens._log_items``).
+# Un LogHabit que acabe en una tecla cae igualmente en ``habito_por_tecla``:
+# ``_place_items`` reparte por ``isinstance(item.obj, Habit)``, y ``LogHabit``
+# es un ``Habit`` mas.
 PageBuilder = Callable[
-    [list[Habit], list[Task], list[Template], dict[str, int], int],
+    [list[Habit], list[Task], list[Template], list[Habit], dict[str, int], int],
     tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int],
 ]
 
 # La firma de la funcion de items que envuelve ``_flat_page_builder``.
-ItemsFn = Callable[[list[Habit], list[Task], list[Template]], list[ViewItem]]
+ItemsFn = Callable[[list[Habit], list[Task], list[Template], list[Habit]], list[ViewItem]]
 
 
 @dataclass(frozen=True)
@@ -351,6 +370,7 @@ def _tiered_page_builder() -> PageBuilder:
         habits: list[Habit],
         tasks: list[Task],
         templates: list[Template],
+        log_habits: list[Habit],
         habit_mapping: dict[str, int],
         page: int,
     ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int]:
@@ -381,17 +401,20 @@ def _flat_page_builder(items_fn: ItemsFn) -> PageBuilder:
         habits: list[Habit],
         tasks: list[Task],
         templates: list[Template],
+        log_habits: list[Habit],
         habit_mapping: dict[str, int],
         page: int,
     ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int]:
-        page_items, total_pages = paginate(items_fn(habits, tasks, templates), page, PAGE_SIZE)
+        page_items, total_pages = paginate(items_fn(habits, tasks, templates, log_habits), page, PAGE_SIZE)
         key_habit, key_task, key_template = _place_items(page_items)
         return key_habit, key_task, key_template, total_pages
 
     return build
 
 
-def _today_items(habits: list[Habit], tasks: list[Task], templates: list[Template]) -> list[ViewItem]:
+def _today_items(
+    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+) -> list[ViewItem]:
     """Items de la vista "Hoy": habitos pendientes (sin los ya completados
     hoy -- ``is_done``, booleano marcado o cuantificable que alcanzo su
     objetivo -- ordenados por ``(order, id)``, igual que un reparto de
@@ -407,13 +430,17 @@ def _today_items(habits: list[Habit], tasks: list[Task], templates: list[Templat
     return [ViewItem("habit", h) for h in pending_habits] + [ViewItem("task", t) for t in tasks]
 
 
-def _tasks_items(habits: list[Habit], tasks: list[Task], templates: list[Template]) -> list[ViewItem]:
+def _tasks_items(
+    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+) -> list[ViewItem]:
     """Items de la vista "Tareas": solo las tareas pendientes, en el orden que
     ya trae el proveedor."""
     return [ViewItem("task", t) for t in tasks]
 
 
-def _create_items(habits: list[Habit], tasks: list[Task], templates: list[Template]) -> list[ViewItem]:
+def _create_items(
+    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+) -> list[ViewItem]:
     """Items de la vista "Crear": las plantillas de creacion rapida, todas, en
     el orden que trae el proveedor.
 
@@ -436,11 +463,28 @@ def _create_items(habits: list[Habit], tasks: list[Task], templates: list[Templa
     return [ViewItem("template", tpl) for tpl in templates]
 
 
+def _log_items(
+    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+) -> list[ViewItem]:
+    """Items de la vista "Logs": los habitos de solo registro (``LogHabit``),
+    todos, ordenados por ``(order, id)`` -- mismo criterio que un reparto de
+    tecla nuevo en "Habitos", pero sin necesitar su mapeo persistido: un log
+    nunca desaparece de esta lista (no hay ``is_done`` que lo filtre, al
+    reves que en "Hoy"), asi que paginar de cero cada ciclo con el mismo
+    orden ya da la misma tecla de forma estable mientras no cambien los
+    habitos de registro que hay. Por eso esta vista usa ``_flat_page_builder``
+    en vez de ``_tiered_page_builder``: no hace falta la persistencia de
+    ``core.key_map`` para conseguir el mismo efecto.
+    """
+    return [ViewItem("habit", h) for h in sorted(log_habits, key=lambda h: (h.order, h.id))]
+
+
 VIEWS: dict[str, ViewSpec] = {
     "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
     "habits": ViewSpec("habits", "Habitos", "✅", _tiered_page_builder(), allows_undo=True),
     "tasks": ViewSpec("tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items)),
     "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
+    "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items)),
 }
 DEFAULT_VIEW_ID = "today"
 
@@ -449,6 +493,7 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry(VIEWS["habits"].menu_label, VIEWS["habits"].menu_emoji, "select_view", view_id="habits", key=2),
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
     MenuEntry(VIEWS["create"].menu_label, VIEWS["create"].menu_emoji, "select_view", view_id="create"),
+    MenuEntry(VIEWS["logs"].menu_label, VIEWS["logs"].menu_emoji, "select_view", view_id="logs"),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
@@ -503,6 +548,7 @@ def resolve_page(
     habits: list[Habit],
     tasks: list[Task],
     templates: list[Template],
+    log_habits: list[Habit],
     habit_mapping: dict[str, int],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
@@ -512,6 +558,10 @@ def resolve_page(
         habits: Habitos del ultimo ``get_habits()`` exitoso.
         tasks: Tareas del ultimo ``get_tasks()`` exitoso.
         templates: Plantillas del ultimo ``get_templates()`` exitoso.
+        log_habits: Habitos de solo registro (``LogHabit``) del ultimo
+            ``get_log_habits()`` exitoso. Solo los usa la vista "Logs", pero
+            todo ``PageBuilder`` los recibe igual que el resto de conjuntos
+            de datos (ver ``core.screens.PageBuilder``).
         habit_mapping: Mapeo persistido habito -> tecla vigente.
 
     Returns:
@@ -547,7 +597,7 @@ def resolve_page(
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
     key_habit, key_task, key_template, total_pages = spec.build_page(
-        habits, tasks, templates, habit_mapping, screen.page
+        habits, tasks, templates, log_habits, habit_mapping, screen.page
     )
     return ResolvedPage(
         key_habit=key_habit,
@@ -568,7 +618,7 @@ class PressAction:
             "shutdown" | "standby" | "wake" | "page_prev" | "page_next" |
             "numeric_digit" | "numeric_decimal" | "numeric_backspace" |
             "numeric_confirm" | "numeric_cancel" | "item_options_exit" |
-            "task_set_priority" | "task_skip" | "noop".
+            "task_set_priority" | "task_skip" | "habit_options_undo" | "noop".
         payload: Id del habito/tarea/plantilla si ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
             "numeric_confirm", el ``view_id`` destino si ``kind`` es
@@ -577,7 +627,12 @@ class PressAction:
             "task_set_priority" -- el id de la tarea no va aqui (ni en
             "task_skip", que no lleva payload), se lee de
             ``ScreenState.entry_item_id`` en el momento de ejecutar, igual
-            que "numeric_confirm" con ``entry_habit_id``. Vacio en el resto.
+            que "numeric_confirm" con ``entry_habit_id``. "habit_options_undo"
+            (el "Deshacer" del menu de opciones de un habito) tampoco lleva
+            payload, por el mismo motivo: el id del habito se lee de
+            ``ScreenState.entry_item_id``, no de aqui -- distinto de
+            "habit_undo" (el deshacer por tap corto en "Habitos"), que si
+            lleva el id en el payload. Vacio en el resto.
     """
 
     kind: str
@@ -650,6 +705,10 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             # Sin payload: skip_task solo necesita el id de la tarea, que el
             # llamador lee de screen.entry_item_id, igual que arriba.
             return PressAction("task_skip")
+        if entry.kind == "undo":
+            # Sin payload: igual que "task_skip", el id del habito se lee de
+            # screen.entry_item_id en el momento de ejecutar.
+            return PressAction("habit_options_undo")
         return PressAction("item_options_exit")
 
     if key == KEY_MENU:

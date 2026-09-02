@@ -12,6 +12,15 @@ COLOR_ERROR = (200, 40, 40)            # rojo: fallo al enviar
 COLOR_EMPTY = (0, 0, 0)
 COLOR_SHUTDOWN = (120, 15, 15)          # rojo oscuro de aviso: accion destructiva (apagar la Pi)
 
+# Un habito de solo registro (vista "Logs") no tiene estado pendiente/hecho
+# que pintar en blanco/gris: usa el color propio que trae la base
+# (``habits.color``), y este es solo el fallback para el que no tenga uno
+# definido -- un verde azulado que no choca con ninguna otra familia
+# (blanco/gris de habito, prioridades de tarea, morado de plantilla, azul de
+# nav, familia del teclado numerico, naranja de skip). Ver
+# ``deck.renderer.render_habit``.
+COLOR_HABIT_LOG_DEFAULT = (30, 140, 140)
+
 # --- Navegacion (menu, submenu Sistema, paginacion) --------------------------
 COLOR_MENU = (25, 25, 25)              # tecla 0: aspecto fijo en cualquier pantalla
 COLOR_NEUTRAL = (25, 25, 25)           # teclas 5/10 cuando no hace falta paginar
