@@ -15,16 +15,16 @@ Hay tres pantallas que no son menu/sistema/vista y no aparecen en ``VIEWS``:
 el teclado numerico (``ScreenKind.NUMERIC_ENTRY``, ver ``NUMERIC_KEYPAD``),
 que abre un habito ``manual_entry`` al pulsarlo; el menu de opciones de un
 habito/tarea (``ScreenKind.ITEM_OPTIONS``, ver ``HABIT_OPTIONS_LAYOUT``/
-``TASK_OPTIONS_LAYOUT``), que
-abre mantener pulsado un habito o una tarea (la duracion la mide
-``orchestrator.make_key_callback``, este modulo solo describe la pantalla); y
-el stand by (``ScreenKind.STANDBY``), en el que el deck esta apagado y
-**cualquier** tecla se limita a despertarlo.
+``REAL_HABIT_OPTIONS_LAYOUT``/``TASK_OPTIONS_LAYOUT`` -- un habito elige entre
+los dos primeros segun su tipo), que abre mantener pulsado un habito o una
+tarea (la duracion la mide ``orchestrator.make_key_callback``, este modulo
+solo describe la pantalla); y el stand by (``ScreenKind.STANDBY``), en el que
+el deck esta apagado y **cualquier** tecla se limita a despertarlo.
 
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
-(``paginate``) y ``provider.base`` (``Habit``/``Task``/``Template``), igual que
-el resto de ``core/``.
+(``paginate``) y ``provider.base`` (``Habit``/``RealHabit``/``Task``/
+``Template``), igual que el resto de ``core/``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from enum import Enum, auto
 
 from config import ALL_KEYS, AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.key_map import paginate
-from provider.base import BooleanHabit, Habit, Task, Template
+from provider.base import BooleanHabit, Habit, RealHabit, Task, Template
 
 
 class ScreenKind(Enum):
@@ -199,32 +199,42 @@ NUMERIC_KEYPAD: dict[int, NumericKey] = {
 @dataclass(frozen=True)
 class OptionEntry:
     """Una tecla de la pantalla de opciones de un habito o de una tarea (ver
-    ``HABIT_OPTIONS_LAYOUT``/``TASK_OPTIONS_LAYOUT``): lo que se abre al
-    mantener pulsado un habito o una tarea en cualquier vista que los muestre
-    (ver ``config.LONG_PRESS_SECONDS`` y ``orchestrator.make_key_callback``,
-    que es quien mide la duracion de la pulsacion -- este modulo solo
-    describe que hay en cada tecla).
+    ``HABIT_OPTIONS_LAYOUT``/``REAL_HABIT_OPTIONS_LAYOUT``/``TASK_OPTIONS_LAYOUT``):
+    lo que se abre al mantener pulsado un habito o una tarea en cualquier
+    vista que los muestre (ver ``config.LONG_PRESS_SECONDS`` y
+    ``orchestrator.make_key_callback``, que es quien mide la duracion de la
+    pulsacion -- este modulo solo describe que hay en cada tecla).
 
     Un habito y una tarea llevan a pantallas **distintas**
     (``ScreenState.entry_item_kind`` decide cual, ver ``resolve_page``),
     porque sus opciones futuras seran distintas -- una tarea no tiene
-    objetivo ni fecha de vencimiento. El menu de un habito ya tiene una
-    opcion real, "Deshacer" (retrocede un paso via ``HabitProvider.undo()``,
-    vale para cualquier ``Habit`` -- con objetivo o de solo registro, ver
-    ``orchestrator.press_habit_undo_option``); el de una tarea tiene dos:
-    cambiar la prioridad y omitirla (skip). Anadir una opcion mas es anadir
-    una entrada al layout que corresponda con su propio ``kind`` y darle
-    significado en ``resolve_press``, igual que cualquier otro layout fijo
-    de este modulo.
+    objetivo ni fecha de vencimiento. Un habito, ademas, se resuelve a uno de
+    **dos** layouts segun su tipo (ver ``resolve_page``): un ``RealHabit``
+    (cuantificable, con objetivo -- p.ej. "Flex") abre
+    ``REAL_HABIT_OPTIONS_LAYOUT``, con botones para ajustar el progreso de
+    hoy ademas de "Deshacer"; cualquier otro habito (``BooleanHabit`` o
+    ``LogHabit``, que no tienen un paso que ajustar en cantidades sueltas)
+    abre ``HABIT_OPTIONS_LAYOUT``, solo con "Deshacer". El de una tarea tiene
+    dos opciones: cambiar la prioridad y omitirla (skip). Anadir una opcion
+    mas es anadir una entrada al layout que corresponda con su propio
+    ``kind`` y darle significado en ``resolve_press``, igual que cualquier
+    otro layout fijo de este modulo.
 
     Attributes:
         kind: "back" (vuelve a la vista de origen sin tocar el habito/tarea;
             fija en la tecla 0, mismo lugar y mismo rol que la tecla de menu
             en el resto de pantallas), "message" (contenido informativo, no
             interactivo -- ``resolve_press`` la trata como "noop"), "undo"
-            (solo en ``HABIT_OPTIONS_LAYOUT``: retrocede un paso del habito
-            via ``HabitProvider.undo()`` -- ver ``resolve_press``), "priority"
-            (solo en ``TASK_OPTIONS_LAYOUT``: fija la prioridad de la tarea a
+            (retrocede un paso del habito via ``HabitProvider.undo()`` -- ver
+            ``resolve_press``), "add_value" (solo en
+            ``REAL_HABIT_OPTIONS_LAYOUT``: suma ``amount`` -- positivo o
+            negativo -- al progreso de hoy via ``HabitProvider.set_value()``,
+            sin bajar de 0 -- ver ``resolve_press``), "add_step" (solo en
+            ``REAL_HABIT_OPTIONS_LAYOUT``: igual que "add_value" pero el
+            delta es ``amount`` (``1.0``/``-1.0``, el signo) multiplicado por
+            el ``step`` propio del habito, no un valor fijo -- ver
+            ``orchestrator.press_habit_options_add_step``), "priority" (solo
+            en ``TASK_OPTIONS_LAYOUT``: fija la prioridad de la tarea a
             ``priority`` -- ver ``resolve_press``), "skip" (solo en
             ``TASK_OPTIONS_LAYOUT``: omite la tarea via ``skip_task`` -- ver
             ``resolve_press``) o "blank" (tecla vacia).
@@ -232,12 +242,20 @@ class OptionEntry:
         emoji: Icono a color, o cadena vacia.
         priority: Prioridad (``0``/``1``/``3``/``5``) que fija esta tecla.
             Solo tiene sentido si ``kind`` es "priority".
+        amount: Solo tiene sentido si ``kind`` es "add_value" (el delta
+            exacto a sumar, p.ej. ``1.0``/``-1.0``/``3.0``/``-3.0``/``5.0``/
+            ``-5.0``) o "add_step" (el signo por el que multiplicar el
+            ``step`` del habito, ``1.0`` o ``-1.0`` -- nunca otro valor).
+            ``deck.renderer.render_option_entry`` tambien lo usa para elegir
+            color (verde si es positivo, granate si es negativo), sin
+            distinguir "add_value" de "add_step".
     """
 
     kind: str
     label: str
     emoji: str = ""
     priority: int = 0
+    amount: float = 0.0
 
 
 _ITEM_OPTIONS_BACK = OptionEntry("back", "Volver", "↩️")
@@ -252,29 +270,65 @@ _ITEM_OPTIONS_BLANK = OptionEntry("blank", "", "")  # relleno de las teclas sin 
 # son el sitio a tocar para anadir opciones reales; las teclas que no
 # aparecen aqui se pintan vacias.
 #
-# HABIT_OPTIONS_LAYOUT tiene una opcion real, "Deshacer" (tecla 1, mismo
-# hueco que "Skip" en TASK_OPTIONS_LAYOUT): retrocede un paso del habito via
-# HabitProvider.undo() -- Boolean -> 0, cuantificable -> value-step sin bajar
-# de 0, ver provider.base.HabitProvider.undo. Es generico para CUALQUIER
-# Habit (con objetivo o de solo registro), no solo para el caso que lo motivo
-# (corregir una pulsacion de mas en un log acumulable como "Cocacola"): antes
-# de esto no habia ninguna forma de deshacer un habito cuantificable con
-# objetivo en ningun sitio del deck, ni siquiera en "Habitos" (su undo por
-# tap solo cubre BooleanHabit, ver ViewSpec.allows_undo/_undoes). Ver
-# orchestrator.press_habit_undo_option para el porque usa refresh() en vez
-# de exit_item_options().
+# HABIT_OPTIONS_LAYOUT tiene una opcion real, "Deshacer" (tecla 14, la mas
+# alejada de "Volver" en la tecla 0 -- separa a proposito una accion
+# irreversible-al-tacto de la que saca sin tocar nada): retrocede un paso del
+# habito via HabitProvider.undo() -- Boolean -> 0, cuantificable -> value-step
+# sin bajar de 0, ver provider.base.HabitProvider.undo. Es generico para
+# CUALQUIER Habit (con objetivo o de solo registro), no solo para el caso que
+# lo motivo (corregir una pulsacion de mas en un log acumulable como
+# "Cocacola"): antes de esto no habia ninguna forma de deshacer un habito
+# cuantificable con objetivo en ningun sitio del deck, ni siquiera en
+# "Habitos" (su undo por tap solo cubre BooleanHabit, ver
+# ViewSpec.allows_undo/_undoes). Ver orchestrator.press_habit_undo_option
+# para el porque usa refresh() en vez de exit_item_options().
 #
-# TASK_OPTIONS_LAYOUT tiene dos: "Skip" (tecla 1, omite la tarea via
-# skip_task) y cambiar la prioridad (cabecera en la tecla 5, botones en
-# las teclas 11-14: blanco/verde/amarillo/rojo, mismos colores que
-# ``deck.style.COLOR_TASK_BY_PRIORITY`` -- ver ``resolve_press`` y
-# ``deck.renderer.render_option_entry``). Las teclas 0/5/10 NO se
-# reinterpretan aqui como en NUMERIC_KEYPAD -- resolve_press resuelve
-# ITEM_OPTIONS antes de llegar a esa logica, asi que 5 puede llevar
-# contenido normal como cualquier otra.
+# Es el layout que abre un BooleanHabit o un LogHabit (ver resolve_page): no
+# tienen "step" en cantidades sueltas que ajustar, asi que la unica opcion
+# real es deshacer. Un RealHabit (cuantificable, con objetivo -- p.ej.
+# "Flex") abre en su lugar REAL_HABIT_OPTIONS_LAYOUT, mas abajo.
 HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
     KEY_MENU: _ITEM_OPTIONS_BACK,
-    1: OptionEntry("undo", "Deshacer", "⌫"),
+    14: OptionEntry("undo", "Deshacer", "⌫"),
+}
+
+# Layout de opciones de un habito REAL (cuantificable, con objetivo -- p.ej.
+# "Flex"): ademas de "Deshacer" (misma tecla 14 que en HABIT_OPTIONS_LAYOUT,
+# para que un habito no cambie de sitio la unica opcion que ambos layouts
+# comparten), permite ajustar el progreso de hoy en cantidades sueltas sin
+# tener que abrir el teclado numerico (que es solo para habitos
+# ``manual_entry``, que ni siquiera llegan a esta pantalla -- ver
+# ``resolve_press``). Dos familias de boton, ambas resueltas via
+# HabitProvider.set_value() en vez de una RPC nueva (ver
+# orchestrator.press_habit_options_add_value/_add_step):
+#
+# - "add_value" (teclas 1-3 y 6-8): suma/resta un delta fijo -- +1/+3/+5 en
+#   la fila de arriba, -1/-3/-5 justo debajo en la misma columna, para que el
+#   signo se lea de un vistazo por posicion ademas de por texto y color.
+# - "add_step" (teclas 4 y 9, misma columna que las anteriores): suma/resta
+#   el "step" propio del habito (el mismo que ya suma un toque corto), para
+#   corregir en la unidad natural del habito sin memorizar su valor.
+#
+# Las teclas 11, 12 y 13 quedan vacias: caben de sobra los 8 botones mas
+# "Deshacer" en las 14 teclas disponibles (todas salvo la 0 de "Volver"), y
+# dejar hueco alrededor evita que la pantalla se sienta abarrotada. Las
+# teclas 5 y 10 SI llevan contenido, pero no estan aqui: son puramente
+# informativas (el progreso de hoy sin unidad -- RealHabit.progress_label --
+# y la unidad sola, "message" -- resolve_press ya la trata como noop, no
+# interactiva) y dependen del habito concreto, asi que resolve_page las
+# anade sobre una copia de este dict en vez de vivir en el literal estatico
+# -- ver ahi mismo.
+REAL_HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
+    KEY_MENU: _ITEM_OPTIONS_BACK,
+    1: OptionEntry("add_value", "+1", amount=1.0),
+    2: OptionEntry("add_value", "+3", amount=3.0),
+    3: OptionEntry("add_value", "+5", amount=5.0),
+    4: OptionEntry("add_step", "+Paso", amount=1.0),
+    6: OptionEntry("add_value", "-1", amount=-1.0),
+    7: OptionEntry("add_value", "-3", amount=-3.0),
+    8: OptionEntry("add_value", "-5", amount=-5.0),
+    9: OptionEntry("add_step", "-Paso", amount=-1.0),
+    14: OptionEntry("undo", "Deshacer", "⌫"),
 }
 
 TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
@@ -590,8 +644,31 @@ def resolve_page(
         # (lo que el layout no define queda en blanco) para que la tecla 0 se
         # reinterprete como "Volver" y render_page trate la pantalla entera
         # como un bloque, sin recaer en menu/paginacion. Habito y tarea usan
-        # layouts distintos -- sus opciones futuras seran distintas.
-        layout = HABIT_OPTIONS_LAYOUT if screen.entry_item_kind == "habit" else TASK_OPTIONS_LAYOUT
+        # layouts distintos -- sus opciones futuras seran distintas -- y un
+        # habito, ademas, elige entre dos segun su tipo: un RealHabit (busca
+        # su objeto en habits+log_habits por entry_item_id, ya en memoria de
+        # este mismo ciclo/navegacion) abre REAL_HABIT_OPTIONS_LAYOUT, con
+        # botones para ajustar el progreso mas las teclas 5/10 informativas
+        # (progreso de hoy y unidad, ver mas abajo); cualquier otro
+        # (BooleanHabit, LogHabit, o si el habito ya desaparecio entre
+        # ciclos) cae al HABIT_OPTIONS_LAYOUT de siempre, solo con "Deshacer".
+        if screen.entry_item_kind == "habit":
+            habit = next((h for h in (*habits, *log_habits) if h.id == screen.entry_item_id), None)
+            if isinstance(habit, RealHabit):
+                # Copia porque las teclas 5/10 son informativas y dependen
+                # del habito concreto (progreso de hoy y unidad): no tiene
+                # sentido que vivan en el literal estatico de mas arriba, que
+                # no conoce ningun habito en particular. "message" ya se
+                # trata como noop en resolve_press, igual que la cabecera
+                # "Prioridad" de TASK_OPTIONS_LAYOUT. Sin emoji en ninguna de
+                # las dos: es contenido puramente textual, no un boton mas.
+                layout = dict(REAL_HABIT_OPTIONS_LAYOUT)
+                layout[5] = OptionEntry("message", habit.progress_label)
+                layout[10] = OptionEntry("message", habit.unit)
+            else:
+                layout = HABIT_OPTIONS_LAYOUT
+        else:
+            layout = TASK_OPTIONS_LAYOUT
         key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
@@ -618,14 +695,17 @@ class PressAction:
             "shutdown" | "standby" | "wake" | "page_prev" | "page_next" |
             "numeric_digit" | "numeric_decimal" | "numeric_backspace" |
             "numeric_confirm" | "numeric_cancel" | "item_options_exit" |
-            "task_set_priority" | "task_skip" | "habit_options_undo" | "noop".
+            "task_set_priority" | "task_skip" | "habit_options_undo" |
+            "habit_options_add_value" | "habit_options_add_step" | "noop".
         payload: Id del habito/tarea/plantilla si ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
             "numeric_confirm", el ``view_id`` destino si ``kind`` es
             "select_view", el digito tecleado si ``kind`` es "numeric_digit",
-            o la prioridad elegida (como texto) si ``kind`` es
-            "task_set_priority" -- el id de la tarea no va aqui (ni en
-            "task_skip", que no lleva payload), se lee de
+            la prioridad elegida (como texto) si ``kind`` es
+            "task_set_priority", o el ``amount``/multiplicador de ``step``
+            (como texto, ver ``OptionEntry.amount``) si ``kind`` es
+            "habit_options_add_value"/"habit_options_add_step" -- en los
+            cuatro ultimos casos el id del habito/tarea no va aqui, se lee de
             ``ScreenState.entry_item_id`` en el momento de ejecutar, igual
             que "numeric_confirm" con ``entry_habit_id``. "habit_options_undo"
             (el "Deshacer" del menu de opciones de un habito) tampoco lleva
@@ -709,6 +789,16 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             # Sin payload: igual que "task_skip", el id del habito se lee de
             # screen.entry_item_id en el momento de ejecutar.
             return PressAction("habit_options_undo")
+        if entry.kind == "add_value":
+            # El id del habito no va en el payload (igual que "undo"): solo
+            # el amount, el llamador lo lee de screen.entry_item_id.
+            return PressAction("habit_options_add_value", str(entry.amount))
+        if entry.kind == "add_step":
+            # Mismo patron: el payload es el signo a multiplicar por el
+            # step del habito, no el delta ya calculado -- eso lo hace
+            # orchestrator.press_habit_options_add_step, que es quien tiene
+            # el objeto Habit (con su step) a mano.
+            return PressAction("habit_options_add_step", str(entry.amount))
         return PressAction("item_options_exit")
 
     if key == KEY_MENU:

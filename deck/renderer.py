@@ -13,9 +13,11 @@ from deck.style import (
     COLOR_CONFIRM,
     COLOR_EMPTY,
     COLOR_ERROR,
+    COLOR_HABIT_ADD,
     COLOR_HABIT_DONE,
     COLOR_HABIT_LOG_DEFAULT,
     COLOR_HABIT_PENDING,
+    COLOR_HABIT_SUBTRACT,
     COLOR_MENU,
     COLOR_NAV,
     COLOR_NEUTRAL,
@@ -32,8 +34,10 @@ from deck.style import (
     COLOR_TEMPLATE_PENDING,
     COLOR_TEXT_ARROW,
     COLOR_TEXT_CONFIRM,
+    COLOR_TEXT_HABIT_ADD,
     COLOR_TEXT_HABIT_DONE,
     COLOR_TEXT_HABIT_PENDING,
+    COLOR_TEXT_HABIT_SUBTRACT,
     COLOR_TEXT_NAV,
     COLOR_TEXT_NUMERIC,
     COLOR_TEXT_NUMERIC_BACKSPACE,
@@ -305,21 +309,26 @@ def render_standby_key(deck: Any, key: int, sk: StandbyKey) -> None:
 
 def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
     """Pinta una tecla de la pantalla de opciones de un habito/tarea (ver
-    ``core.screens.HABIT_OPTIONS_LAYOUT``/``TASK_OPTIONS_LAYOUT``), la que se abre al mantener pulsado
-    un habito o una tarea.
+    ``core.screens.HABIT_OPTIONS_LAYOUT``/``REAL_HABIT_OPTIONS_LAYOUT``/
+    ``TASK_OPTIONS_LAYOUT``), la que se abre al mantener pulsado un habito o
+    una tarea.
 
     "Volver" reutiliza el azul generico de navegacion (``COLOR_NAV``): mismo
     rol que "Salir" en el teclado numerico, esto te saca de aqui sin tocar el
     habito/tarea que abrio el menu. Un mensaje informativo usa un color propio
-    apagado, para no parecer una tecla de contenido pulsable. "Deshacer" (solo
-    en ``HABIT_OPTIONS_LAYOUT``) reutiliza ``COLOR_NUMERIC_BACKSPACE`` tal
+    apagado, para no parecer una tecla de contenido pulsable. "Deshacer" (en
+    los dos layouts de habito) reutiliza ``COLOR_NUMERIC_BACKSPACE`` tal
     cual -- mismo significado ("borra/corrige algo reciente") que ya tiene en
     el teclado numerico; no hay colision posible porque las dos pantallas
-    nunca se pintan a la vez. Una tecla de prioridad (solo en
-    ``TASK_OPTIONS_LAYOUT``) reutiliza literalmente los colores de tarea por
-    prioridad (``COLOR_TASK_BY_PRIORITY``), para que se reconozca de un
-    vistazo con el mismo codigo de color que el resto del deck. "Skip" (solo
-    en ``TASK_OPTIONS_LAYOUT``) usa un naranja propio (``COLOR_TASK_SKIP``),
+    nunca se pintan a la vez. "+1/+3/+5/+Paso" y "-1/-3/-5/-Paso" (solo en
+    ``REAL_HABIT_OPTIONS_LAYOUT``) usan el par propio ``COLOR_HABIT_ADD``/
+    ``COLOR_HABIT_SUBTRACT``, elegido solo por el signo de ``entry.amount``
+    -- no distingue "add_value" de "add_step", el signo ya dice si suma o
+    resta. Una tecla de prioridad (solo en ``TASK_OPTIONS_LAYOUT``) reutiliza
+    literalmente los colores de tarea por prioridad
+    (``COLOR_TASK_BY_PRIORITY``), para que se reconozca de un vistazo con el
+    mismo codigo de color que el resto del deck. "Skip" (solo en
+    ``TASK_OPTIONS_LAYOUT``) usa un naranja propio (``COLOR_TASK_SKIP``),
     distinto del rojo de error/apagado y de los colores de prioridad. Una
     tecla sin contenido se pinta vacia.
     """
@@ -350,6 +359,10 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
             deck, COLOR_NUMERIC_BACKSPACE, entry.label, text_color=COLOR_TEXT_NUMERIC_BACKSPACE,
             font_size=FONT_SIZE_NAV, emoji=entry.emoji,
         )
+    elif entry.kind in ("add_value", "add_step"):
+        color = COLOR_HABIT_ADD if entry.amount >= 0 else COLOR_HABIT_SUBTRACT
+        text_color = COLOR_TEXT_HABIT_ADD if entry.amount >= 0 else COLOR_TEXT_HABIT_SUBTRACT
+        image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_NAV, emoji=entry.emoji)
     else:  # "blank"
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return

@@ -106,6 +106,19 @@ FONT_SIZE_OPTIONS = 13
 COLOR_TASK_SKIP = (190, 110, 20)
 COLOR_TEXT_TASK_SKIP = (255, 255, 255)
 
+# "+1/+3/+5/+Paso" y "-1/-3/-5/-Paso" (solo en REAL_HABIT_OPTIONS_LAYOUT):
+# verde para sumar, granate para restar -- un par propio que no choca con
+# ninguno de los verdes/rojos ya usados en esta pantalla o en otras
+# (COLOR_TASK_SENDING, COLOR_CONFIRM, COLOR_TASK_BY_PRIORITY, COLOR_ERROR,
+# COLOR_SHUTDOWN, COLOR_NUMERIC_BACKSPACE de "Deshacer", que convive en la
+# misma pantalla). deck.renderer.render_option_entry elige entre los dos
+# solo mirando el signo de OptionEntry.amount, sin distinguir "add_value" de
+# "add_step".
+COLOR_HABIT_ADD = (45, 150, 100)
+COLOR_TEXT_HABIT_ADD = (255, 255, 255)
+COLOR_HABIT_SUBTRACT = (150, 60, 80)
+COLOR_TEXT_HABIT_SUBTRACT = (255, 255, 255)
+
 # --- Stand by ---------------------------------------------------------------
 # La pantalla de suspension se ve con el brillo al minimo
 # (``deck.session.BRIGHTNESS_STANDBY``), asi que aqui no se busca contraste

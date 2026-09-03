@@ -148,6 +148,15 @@ class RealHabit(Habit):
         """Objetivo diario del habito (p.ej. ``8.0`` vasos)."""
         return self._goal
 
+    @property
+    def progress_label(self) -> str:
+        """Progreso de hoy sin unidad ni nombre (p.ej. ``"3/8"``, o ``"10/8"``
+        por encima del objetivo). Solo el numero: lo usa ``display_label()``
+        (que le añade la unidad) y la tecla informativa de
+        ``core.screens.REAL_HABIT_OPTIONS_LAYOUT`` (que la deja tal cual,
+        sin unidad -- la unidad va en su propia tecla ahi)."""
+        return f"{_format_number(self.current_value)}/{_format_number(self.goal)}"
+
     def display_label(self) -> str:
         """Progreso acumulado hoy, sin el nombre (p.ej. ``"3/8 Cups"``).
 
@@ -163,7 +172,7 @@ class RealHabit(Habit):
         """
         if self.manual_entry:
             return self.name
-        progress = f"{_format_number(self.current_value)}/{_format_number(self.goal)}"
+        progress = self.progress_label
         if self.unit:
             progress = f"{progress} {self.unit}"
         return progress

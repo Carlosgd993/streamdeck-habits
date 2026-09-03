@@ -34,6 +34,7 @@ from provider.base import (
     Habit,
     HabitProvider,
     ProviderError,
+    RealHabit,
     Task,
     TaskProvider,
     Template,
@@ -256,10 +257,10 @@ def make_key_callback(
     - **Menu de opciones de un habito/tarea** (mantener pulsado): "Volver"
       (tecla 0 dentro de esa pantalla) resuelve a ``"item_options_exit"`` y se
       delega en ``dispatch_navigation`` -- sin red, sin tocar el habito/tarea
-      que abrio el menu. El de un habito tiene una opcion real; el de una
-      tarea tiene dos:
+      que abrio el menu. Un habito abre uno de dos layouts segun su tipo (ver
+      ``core.screens.resolve_page``); el de una tarea tiene dos opciones:
 
-      - **Deshacer** (tecla 1, ambar -- solo en el menu de un habito) ->
+      - **Deshacer** (tecla 14, ambar -- en los dos layouts de habito) ->
         ``HabitProvider.undo()`` (``press_habit_undo_option``). Generico para
         cualquier ``Habit`` (con objetivo o de solo registro, ver
         ``provider.base.LogHabit``), no solo el ``BooleanHabit`` hecho que ya
@@ -270,6 +271,23 @@ def make_key_callback(
         del dia, y en un habito ``weekly_quota`` hay que releer el contador
         semanal real -- mismo motivo que el ``"habit_undo"`` de una pulsacion
         corta normal, ver ``press_habit``.
+      - **Ajustar el progreso** (teclas 1-4 y 6-9, verde/granate -- solo en
+        el menu de un ``RealHabit``, ver ``core.screens.REAL_HABIT_OPTIONS_LAYOUT``)
+        -> ``HabitProvider.set_value()`` con ``habit.current_value + delta``,
+        sin bajar de 0 (``press_habit_options_add_value``/
+        ``press_habit_options_add_step``, via el helper comun
+        ``_press_habit_options_delta``). "+1/+3/+5/-1/-3/-5" suman/restan un
+        delta fijo (el payload de la ``PressAction`` ya lo trae); "+Paso/-Paso"
+        suman/restan el ``step`` propio del habito (el payload es solo el
+        signo, el delta lo calcula ``press_habit_options_add_step`` con el
+        objeto ``Habit`` a mano). Exito -> mutacion optimista + ``refresh()``
+        completo (el valor fiable es el que devuelve ``habit_set``), pero **a
+        diferencia de "Deshacer" no sale de** ``ScreenKind.ITEM_OPTIONS``:
+        se queda en la pantalla para poder encadenar varios ajustes seguidos,
+        y como ``refresh()`` repinta la pantalla activa (que sigue siendo
+        esta), las teclas informativas 5/10 (progreso de hoy/unidad, ver
+        ``core.screens.resolve_page``) tambien se actualizan. Solo "Volver"
+        saca de aqui.
       - **Cambiar la prioridad** (teclas 11-14, blanco/verde/amarillo/rojo)
         -> ``TaskProvider.set_priority`` (``press_task_priority``). Exito ->
         mutacion optimista de ``task.priority`` + ``exit_item_options``.
@@ -278,10 +296,10 @@ def make_key_callback(
         (``press_task_skip``). Exito -> la tarea sale de ``tasks_ref``
         (igual que al completarla) + ``exit_item_options``.
 
-      Las tres comparten patron: sin id en el payload de la ``PressAction``
-      (se lee de ``screen.entry_item_id``), reservadas con
-      ``_claim``/``_release`` por ese id, y en caso de fallo la tecla queda
-      en rojo con el codigo sin salir del menu, para poder reintentar.
+      Todas comparten patron: sin id en el payload de la ``PressAction`` (se
+      lee de ``screen.entry_item_id``), reservadas con ``_claim``/``_release``
+      por ese id, y en caso de fallo la tecla queda en rojo con el codigo sin
+      salir del menu, para poder reintentar.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
@@ -433,6 +451,67 @@ def make_key_callback(
             refresh()
             print(f"Deshacer (opciones) OK: {habit.name} -> {new_value}", flush=True)
 
+    def _press_habit_options_delta(deck: Any, key: int, amount: float, label: str) -> None:
+        """Comun a los botones "+1/+3/+5/-1/-3/-5" y "+Paso/-Paso" del menu de
+        opciones de un habito real (``core.screens.REAL_HABIT_OPTIONS_LAYOUT``):
+        suma ``amount`` (puede ser negativo) al progreso de hoy via
+        ``HabitProvider.set_value`` -- misma RPC ``habit_set`` que ya usa el
+        teclado numerico de un habito ``manual_entry``, sin necesitar ninguna
+        nueva -- sin bajar de 0 (la base ya hace ``greatest(valor, 0)``, pero
+        clampear aqui tambien evita mandar un valor negativo que solo
+        rebotaria).
+
+        A diferencia de ``press_habit_undo_option``, aqui NO se sale de
+        ``ScreenKind.ITEM_OPTIONS``: el usuario quiere poder encadenar varios
+        ajustes (p.ej. "+1" tres veces) sin que cada uno lo devuelva a la
+        vista de origen -- solo "Volver" saca de esta pantalla. Aun asi se
+        llama a ``refresh()`` en vez de solo mutar de forma optimista: el
+        valor fiable es el que devuelve la base (p.ej. un habito
+        ``weekly_quota`` pinta el contador de la semana, no el delta suelto
+        que se acaba de mandar), y como ``screen.kind`` sigue en
+        ``ITEM_OPTIONS``, ``refresh()`` repinta esta misma pantalla -- con lo
+        que las teclas informativas 5/10 (progreso de hoy/unidad, ver
+        ``core.screens.resolve_page``) tambien quedan al dia.
+        """
+        with screen_lock:
+            habit_id = screen.entry_item_id
+        habit = habits_ref["value"].get(habit_id) or log_habits_ref["value"].get(habit_id)
+        if habit is None:
+            return  # habito desaparecido entre ciclos: se ignora
+        new_value = max(0.0, habit.current_value + amount)
+        try:
+            confirmed = provider.set_value(habit, new_value)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(habit_id, str(exc), kind="habit")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"{label} FALLO [{code}]: {habit_id}", flush=True)
+        else:
+            habit.current_value = confirmed
+            refresh()
+            print(f"{label} OK: {habit.name} -> {confirmed}", flush=True)
+
+    def press_habit_options_add_value(deck: Any, key: int, amount_str: str) -> None:
+        """Boton "+1/+3/+5/-1/-3/-5" (``OptionEntry.kind == "add_value"``):
+        el payload ya es el delta exacto a sumar, ver ``core.screens.resolve_press``."""
+        _press_habit_options_delta(deck, key, float(amount_str), f"Ajuste {amount_str}")
+
+    def press_habit_options_add_step(deck: Any, key: int, multiplier_str: str) -> None:
+        """Boton "+Paso/-Paso" (``OptionEntry.kind == "add_step"``): el
+        payload es el signo (``1.0``/``-1.0``) a multiplicar por el ``step``
+        propio del habito -- solo un ``RealHabit`` tiene ``step``, que es el
+        unico tipo que abre ``REAL_HABIT_OPTIONS_LAYOUT`` (ver
+        ``core.screens.resolve_page``), asi que el ``isinstance`` de aqui es
+        solo defensivo."""
+        with screen_lock:
+            habit_id = screen.entry_item_id
+        habit = habits_ref["value"].get(habit_id) or log_habits_ref["value"].get(habit_id)
+        if not isinstance(habit, RealHabit):
+            return  # defensivo: este boton solo deberia llegar a un RealHabit
+        multiplier = float(multiplier_str)
+        label = "Paso +" if multiplier > 0 else "Paso -"
+        _press_habit_options_delta(deck, key, multiplier * habit.step, label)
+
     def press_template(deck: Any, key: int, template_id: str) -> None:
         template = templates_ref["value"].get(template_id)
         if template is None:
@@ -496,7 +575,13 @@ def make_key_callback(
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
                 _release(item_id)
-        elif action.kind in ("task_set_priority", "task_skip", "habit_options_undo"):
+        elif action.kind in (
+            "task_set_priority",
+            "task_skip",
+            "habit_options_undo",
+            "habit_options_add_value",
+            "habit_options_add_step",
+        ):
             # Ninguna lleva el id del habito/tarea en el payload: se lee de
             # screen.entry_item_id, igual que "numeric_confirm" lee el valor
             # tecleado de screen.entry_value.
@@ -509,8 +594,12 @@ def make_key_callback(
                     press_task_priority(deck, key, action.payload)
                 elif action.kind == "task_skip":
                     press_task_skip(deck, key)
-                else:
+                elif action.kind == "habit_options_undo":
                     press_habit_undo_option(deck, key)
+                elif action.kind == "habit_options_add_value":
+                    press_habit_options_add_value(deck, key, action.payload)
+                else:
+                    press_habit_options_add_step(deck, key, action.payload)
             finally:
                 _release(item_id)
         elif action.kind != "noop":
