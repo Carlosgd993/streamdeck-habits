@@ -119,6 +119,22 @@ COLOR_TEXT_HABIT_ADD = (255, 255, 255)
 COLOR_HABIT_SUBTRACT = (150, 60, 80)
 COLOR_TEXT_HABIT_SUBTRACT = (255, 255, 255)
 
+# --- Cronometros (vista "Cronometros" + opcion "timer" de TASK_OPTIONS_LAYOUT) ---
+# Familia de ESTADO, no de identidad: con pocas etiquetas la posicion en la
+# rejilla ya dice cual es cual, y lo urgente de comunicar en una tecla es si
+# esta corriendo o no -- por eso el deck IGNORA TimerLabel.color (reservado
+# para un cliente de analitica futuro, ver provider.base.TimerLabel). Rosa/
+# magenta para "corriendo": no coincide con ningun rojo ya usado (COLOR_ERROR,
+# COLOR_SHUTDOWN, prioridad 5 de tarea). Turquesa apagado para "parado":
+# distinto de COLOR_TEMPLATE (morado) y COLOR_NAV/COLOR_ARROW (azul) -- mas
+# oscuro que COLOR_HABIT_LOG_DEFAULT (tambien teal) para no confundirse con
+# "Logs" al navegar entre las dos vistas, aunque nunca coincidan en pantalla.
+COLOR_TIMER_RUNNING = (210, 30, 100)
+COLOR_TEXT_TIMER_RUNNING = (255, 255, 255)
+COLOR_TIMER_STOPPED = (55, 110, 130)
+COLOR_TEXT_TIMER_STOPPED = (255, 255, 255)
+FONT_SIZE_TIMER = 13
+
 # --- Stand by ---------------------------------------------------------------
 # La pantalla de suspension se ve con el brillo al minimo
 # (``deck.session.BRIGHTNESS_STANDBY``), asi que aqui no se busca contraste

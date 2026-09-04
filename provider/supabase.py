@@ -1,20 +1,22 @@
 """Adaptador de Supabase: implementa los puertos ``HabitProvider``,
-``TaskProvider`` y ``TemplateProvider`` contra el contrato publico de la base de
-datos, expuesto via PostgREST (``<url>/rest/v1``).
+``TaskProvider``, ``TemplateProvider`` y ``TimerProvider`` contra el contrato
+publico de la base de datos, expuesto via PostgREST (``<url>/rest/v1``).
 
 Concentra TODO lo especifico de Supabase/PostgREST, aislado del resto del
 proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
 - Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits``,
-  ``v_log_habits``, ``v_today_tasks`` y ``v_templates``, y las funciones
-  ``rpc/habit_step``, ``rpc/habit_undo``, ``rpc/complete_task``,
-  ``rpc/skip_task``, ``rpc/set_task_priority`` e ``rpc/instantiate_task`` del
-  contrato. ``v_log_habits`` reutiliza ``rpc/habit_step`` para el press --
-  no hay una RPC de registro aparte, el contrato es el mismo.
+  ``v_log_habits``, ``v_today_tasks``, ``v_templates``, ``v_timer_labels`` y
+  ``v_running_timer``, y las funciones ``rpc/habit_step``, ``rpc/habit_undo``,
+  ``rpc/complete_task``, ``rpc/skip_task``, ``rpc/set_task_priority``,
+  ``rpc/instantiate_task`` y ``rpc/timer_toggle`` del contrato.
+  ``v_log_habits`` reutiliza ``rpc/habit_step`` para el press -- no hay una
+  RPC de registro aparte, el contrato es el mismo.
 - El mapeo de la fila cruda de la vista al modelo de dominio agnostico
   (``provider.base.Habit`` y subtipos, ``provider.base.Task``,
-  ``provider.base.Template``).
+  ``provider.base.Template``, ``provider.base.TimerLabel``,
+  ``provider.base.RunningTimer``).
 - La traduccion de cualquier fallo (``requests``, status, JSON) a la jerarquia
   de excepciones agnostica ``Provider*Error``.
 
@@ -43,10 +45,13 @@ from provider.base import (
     ProviderDataError,
     ProviderNetworkError,
     RealHabit,
+    RunningTimer,
     Task,
     TaskProvider,
     Template,
     TemplateProvider,
+    TimerLabel,
+    TimerProvider,
 )
 
 URL_ENV_VAR = "SUPABASE_URL"
@@ -56,6 +61,7 @@ DEFAULT_ACTIVE_ENV = "main"
 _ICON_TEXT_PREFIX = "txt_"  # prefijo de icon_res cuando el icono elegido es un emoji
 _TASKS_ORDER = "priority.desc,due_date.asc"  # v_today_tasks no ordena por si sola: lo mas urgente primero
 _TEMPLATES_ORDER = "title"  # v_templates si ordena por dentro, pero el orden va explicito como en el resto
+_TIMER_LABELS_ORDER = "sort_order"  # v_timer_labels si ordena por dentro, pero explicito como el resto
 
 
 def _load_config() -> tuple[str | None, str | None]:
@@ -203,13 +209,63 @@ def build_template(data: dict[str, Any]) -> Template:
     )
 
 
-class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
-    """Adaptador de los puertos ``HabitProvider``, ``TaskProvider`` y
-    ``TemplateProvider`` para Supabase via PostgREST.
+def build_timer_label(data: dict[str, Any]) -> TimerLabel:
+    """Mapea una fila cruda de ``v_timer_labels`` al modelo de dominio.
 
-    Implementa los tres porque habitos, tareas y plantillas salen del mismo
-    contrato y de la misma conexion; el resto del proyecto sigue dependiendo de
-    los puertos por separado.
+    Mismo criterio de emoji que ``build_task``/``build_template``: sin
+    columna de icono propia, se saca del nombre.
+
+    ``running``/``started_at`` NO se rellenan aqui: no salen de esta vista,
+    los calcula ``core.screens`` cruzando etiquetas con
+    ``get_running_timer()`` -- igual que ``Template.has_pending``.
+
+    Args:
+        data: Fila de la etiqueta devuelta por la vista.
+
+    Returns:
+        La instancia de ``TimerLabel`` correspondiente.
+    """
+    emoji, name = extract_emoji(str(data["name"]))
+    return TimerLabel(
+        id=data["id"],
+        name=name,
+        emoji=emoji,
+        order=int(data.get("sort_order") or 0),
+    )
+
+
+def build_running_timer(data: dict[str, Any]) -> RunningTimer:
+    """Mapea una fila cruda de ``v_running_timer`` al modelo de dominio.
+
+    ``title`` ya viene denormalizado desde la base (copiado de
+    ``tasks.title``/``timer_labels.name`` en el momento de arrancar); mismo
+    criterio de emoji que ``build_task``/``build_timer_label`` -- se separa
+    aqui y se descarta (esta pantalla no tiene icono propio donde pintarlo):
+    si el titulo lo llevaba, el texto que queda ya sale limpio.
+
+    Args:
+        data: Fila del cronometro en marcha devuelta por la vista.
+
+    Returns:
+        La instancia de ``RunningTimer`` correspondiente.
+    """
+    _, title = extract_emoji(str(data.get("title") or ""))
+    return RunningTimer(
+        id=data["id"],
+        task_id=str(data.get("task_id") or ""),
+        label_id=str(data.get("label_id") or ""),
+        title=title,
+        started_at=str(data.get("started_at") or ""),
+    )
+
+
+class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvider):
+    """Adaptador de los puertos ``HabitProvider``, ``TaskProvider``,
+    ``TemplateProvider`` y ``TimerProvider`` para Supabase via PostgREST.
+
+    Implementa los cuatro porque habitos, tareas, plantillas y cronometros
+    salen del mismo contrato y de la misma conexion; el resto del proyecto
+    sigue dependiendo de los puertos por separado.
     """
 
     def __init__(self) -> None:
@@ -504,3 +560,91 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider):
             return str(resp.json())
         except ValueError as exc:
             raise ProviderDataError("POST rpc/instantiate_task -> respuesta no es JSON valido") from exc
+
+    def get_timer_labels(self) -> list[TimerLabel]:
+        """Devuelve las etiquetas rapidas de cronometro, ya mapeadas a dominio.
+
+        Una sola peticion a ``v_timer_labels``, filtrando por ``show_in_deck``:
+        mismo patron que ``get_templates`` -- la vista devuelve todas las
+        etiquetas activas y el filtro es del cliente a proposito.
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_timer_labels",
+                headers=self._headers(Accept="application/json"),
+                params={
+                    "select": "id,name,sort_order",
+                    "show_in_deck": "eq.true",
+                    "order": _TIMER_LABELS_ORDER,
+                },
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_timer_labels")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_timer_labels -> respuesta no es JSON valido") from exc
+        return [build_timer_label(label) for label in raw]
+
+    def get_running_timer(self) -> RunningTimer | None:
+        """Devuelve el cronometro en marcha ahora mismo, o ``None``.
+
+        ``v_running_timer`` trae como mucho una fila (garantizado por la
+        base); ``None`` si la lista viene vacia.
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_running_timer",
+                headers=self._headers(Accept="application/json"),
+                params={"select": "id,task_id,label_id,title,started_at", "limit": "1"},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_running_timer")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_running_timer -> respuesta no es JSON valido") from exc
+        return build_running_timer(raw[0]) if raw else None
+
+    def toggle_task_timer(self, task: Task) -> None:
+        """Alterna el cronometro de ``task`` via ``rpc/timer_toggle``.
+
+        Misma forma que ``complete_task``: ``void`` en la base, 204 sin
+        cuerpo, nada que parsear. La base decide start-vs-stop mirando su
+        propio estado, no lo que este metodo asuma.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/timer_toggle",
+                headers=self._headers(**{"Content-Type": "application/json"}),
+                json={"p_task_id": task.id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/timer_toggle (task)")
+
+    def toggle_label_timer(self, label: TimerLabel) -> None:
+        """Alterna el cronometro de ``label`` via ``rpc/timer_toggle``.
+
+        Misma forma que ``toggle_task_timer``, con ``p_label_id`` en vez de
+        ``p_task_id`` -- la RPC exige exactamente uno de los dos.
+        """
+        try:
+            resp = requests.post(
+                f"{self._base}/rpc/timer_toggle",
+                headers=self._headers(**{"Content-Type": "application/json"}),
+                json={"p_label_id": label.id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "POST rpc/timer_toggle (label)")

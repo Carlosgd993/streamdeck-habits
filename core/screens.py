@@ -3,8 +3,8 @@ vistas de datos (Hoy/Habitos/Tareas/Crear...), todas resueltas con la misma
 pareja de funciones puras.
 
 Una pantalla resuelta en su pagina actual reparte las 15 teclas en varios
-cubos -- habito, tarea, plantilla, entrada de menu o boton del teclado
-numerico -- mas un total de paginas. Menu y Sistema son listas fijas de
+cubos -- habito, tarea, plantilla, etiqueta de cronometro, entrada de menu o
+boton del teclado numerico -- mas un total de paginas. Menu y Sistema son listas fijas de
 ``MenuEntry`` paginadas con ``core.key_map.paginate``; cada vista de datos se
 resuelve con la funcion ``build_page`` que registra su ``ViewSpec`` en
 ``VIEWS``. Anadir una vista nueva es registrar una entrada mas en ``VIEWS``
@@ -24,7 +24,7 @@ el deck esta apagado y **cualquier** tecla se limita a despertarlo.
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
 (``paginate``) y ``provider.base`` (``Habit``/``RealHabit``/``Task``/
-``Template``), igual que el resto de ``core/``.
+``Template``/``TimerLabel``/``RunningTimer``), igual que el resto de ``core/``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ from enum import Enum, auto
 
 from config import ALL_KEYS, AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.key_map import paginate
-from provider.base import BooleanHabit, Habit, RealHabit, Task, Template
+from provider.base import BooleanHabit, Habit, RealHabit, RunningTimer, Task, Template, TimerLabel, clip_title
 
 
 class ScreenKind(Enum):
@@ -92,12 +92,13 @@ class ScreenState:
 
 @dataclass(frozen=True)
 class ViewItem:
-    """Un habito, una tarea o una plantilla, envuelto para poder mezclarlos en
-    una sola lista paginable (p.ej. el sobrante que no cupo en el mapeo estable,
-    o la lista de "Hoy" que alterna habitos y tareas)."""
+    """Un habito, una tarea, una plantilla o una etiqueta de cronometro,
+    envuelto para poder mezclarlos en una sola lista paginable (p.ej. el
+    sobrante que no cupo en el mapeo estable, o la lista de "Hoy" que alterna
+    habitos y tareas)."""
 
-    kind: str  # "habit" | "task" | "template"
-    obj: Habit | Task | Template
+    kind: str  # "habit" | "task" | "template" | "timer_label"
+    obj: Habit | Task | Template | TimerLabel
 
 
 @dataclass(frozen=True)
@@ -215,10 +216,10 @@ class OptionEntry:
     hoy ademas de "Deshacer"; cualquier otro habito (``BooleanHabit`` o
     ``LogHabit``, que no tienen un paso que ajustar en cantidades sueltas)
     abre ``HABIT_OPTIONS_LAYOUT``, solo con "Deshacer". El de una tarea tiene
-    dos opciones: cambiar la prioridad y omitirla (skip). Anadir una opcion
-    mas es anadir una entrada al layout que corresponda con su propio
-    ``kind`` y darle significado en ``resolve_press``, igual que cualquier
-    otro layout fijo de este modulo.
+    tres opciones: cambiar la prioridad, omitirla (skip) e iniciar/detener su
+    cronometro. Anadir una opcion mas es anadir una entrada al layout que
+    corresponda con su propio ``kind`` y darle significado en
+    ``resolve_press``, igual que cualquier otro layout fijo de este modulo.
 
     Attributes:
         kind: "back" (vuelve a la vista de origen sin tocar el habito/tarea;
@@ -237,7 +238,17 @@ class OptionEntry:
             en ``TASK_OPTIONS_LAYOUT``: fija la prioridad de la tarea a
             ``priority`` -- ver ``resolve_press``), "skip" (solo en
             ``TASK_OPTIONS_LAYOUT``: omite la tarea via ``skip_task`` -- ver
-            ``resolve_press``) o "blank" (tecla vacia).
+            ``resolve_press``), "timer" (solo en ``TASK_OPTIONS_LAYOUT``:
+            inicia/detiene el cronometro de la tarea via
+            ``TimerProvider.toggle_task_timer()`` -- si esta corriendo,
+            ``running``/``started_at`` van rellenos y ``label`` pasa a ser
+            el titulo denormalizado de ``running_timer`` (no "Detener
+            cronometro"): ``deck.renderer.render_option_entry`` pinta
+            ``"titulo\n[tiempo]"`` para no tener que recordar cual esta
+            activo; si no, se pinta ``label`` ("Iniciar cronometro"). Lo
+            decide ``resolve_page`` sobre una copia del layout, segun si esa
+            tarea es la que esta corriendo ahora mismo, ver ahi mismo) o
+            "blank" (tecla vacia).
         label: Texto de la tecla.
         emoji: Icono a color, o cadena vacia.
         priority: Prioridad (``0``/``1``/``3``/``5``) que fija esta tecla.
@@ -249,6 +260,14 @@ class OptionEntry:
             ``deck.renderer.render_option_entry`` tambien lo usa para elegir
             color (verde si es positivo, granate si es negativo), sin
             distinguir "add_value" de "add_step".
+        running: Solo tiene sentido si ``kind`` es "timer": si ``True``, el
+            cronometro de esta tarea esta corriendo ahora mismo.
+        started_at: Solo tiene sentido si ``kind`` es "timer" y ``running``
+            es ``True``: cuando arranco (ISO 8601 con offset, tal cual lo da
+            el proveedor). ``deck.renderer.render_option_entry`` calcula el
+            tiempo transcurrido a partir de aqui en cada repintado -- nunca
+            un contador que incrementa en el cliente, mismo criterio que
+            ``provider.base.TimerLabel.started_at``.
     """
 
     kind: str
@@ -256,6 +275,8 @@ class OptionEntry:
     emoji: str = ""
     priority: int = 0
     amount: float = 0.0
+    running: bool = False
+    started_at: str = ""
 
 
 _ITEM_OPTIONS_BACK = OptionEntry("back", "Volver", "↩️")
@@ -331,9 +352,15 @@ REAL_HABIT_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
     14: OptionEntry("undo", "Deshacer", "⌫"),
 }
 
+# La tecla 2 ("timer") es un placeholder: si ESTA tarea es la que esta
+# corriendo ahora mismo -- algo que solo se sabe en resolve_page, que tiene
+# running_timer a mano -- se pinta el tiempo transcurrido en vez del label
+# "Iniciar cronometro"; se sobreescribe ahi sobre una copia de este dict,
+# mismo patron que las teclas 5/10 informativas de REAL_HABIT_OPTIONS_LAYOUT.
 TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
     KEY_MENU: _ITEM_OPTIONS_BACK,
     1: OptionEntry("skip", "Skip", "⏭️"),
+    2: OptionEntry("timer", "Iniciar cronometro", "▶️"),
     5: OptionEntry("message", "Prioridad", "🎚️"),
     11: OptionEntry("priority", "Ninguna", priority=0),
     12: OptionEntry("priority", "Baja", priority=1),
@@ -342,25 +369,30 @@ TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
 }
 
 
-# PageBuilder: (habitos, tareas, plantillas, habitos_log, mapeo_habito->tecla, pagina)
-#   -> (habito_por_tecla, tarea_por_tecla, plantilla_por_tecla, total_de_paginas)
+# PageBuilder: (habitos, tareas, plantillas, habitos_log, etiquetas_timer,
+#   cronometro_corriendo, mapeo_habito->tecla, pagina)
+#   -> (habito_por_tecla, tarea_por_tecla, plantilla_por_tecla,
+#       etiqueta_timer_por_tecla, total_de_paginas)
 #
-# Todos los builders reciben los cuatro conjuntos de datos aunque casi ninguno
+# Todos los builders reciben los seis conjuntos de datos aunque casi ninguno
 # los use enteros: es lo que permite que una vista nueva los cruce (p.ej.
 # "Crear" necesita las tareas para saber que plantillas ya tienen ocurrencia
-# abierta). ``habitos_log`` (``LogHabit``) va aparte de ``habitos`` a
-# proposito, igual que en ``HabitProvider``: ninguna vista existente los
+# abierta, y "Cronometros" necesita cronometro_corriendo para saber que
+# etiqueta resaltar). ``habitos_log`` (``LogHabit``) va aparte de ``habitos``
+# a proposito, igual que en ``HabitProvider``: ninguna vista existente los
 # esperaba mezclados con los habitos de objetivo (ver ``core.screens._log_items``).
 # Un LogHabit que acabe en una tecla cae igualmente en ``habito_por_tecla``:
 # ``_place_items`` reparte por ``isinstance(item.obj, Habit)``, y ``LogHabit``
 # es un ``Habit`` mas.
 PageBuilder = Callable[
-    [list[Habit], list[Task], list[Template], list[Habit], dict[str, int], int],
-    tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int],
+    [list[Habit], list[Task], list[Template], list[Habit], list[TimerLabel], RunningTimer | None, dict[str, int], int],
+    tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel], int],
 ]
 
 # La firma de la funcion de items que envuelve ``_flat_page_builder``.
-ItemsFn = Callable[[list[Habit], list[Task], list[Template], list[Habit]], list[ViewItem]]
+ItemsFn = Callable[
+    [list[Habit], list[Task], list[Template], list[Habit], list[TimerLabel], RunningTimer | None], list[ViewItem]
+]
 
 
 @dataclass(frozen=True)
@@ -387,20 +419,25 @@ class ViewSpec:
     allows_undo: bool = False
 
 
-def _place_items(items: list[ViewItem]) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template]]:
+def _place_items(
+    items: list[ViewItem],
+) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel]]:
     """Reparte ``items`` (ya recortados a una pagina) entre las teclas
     disponibles, en el orden en que llegan."""
     key_habit: dict[int, Habit] = {}
     key_task: dict[int, Task] = {}
     key_template: dict[int, Template] = {}
+    key_timer: dict[int, TimerLabel] = {}
     for key, item in zip(AVAILABLE_KEYS, items, strict=False):
         if isinstance(item.obj, Habit):
             key_habit[key] = item.obj
         elif isinstance(item.obj, Template):
             key_template[key] = item.obj
+        elif isinstance(item.obj, TimerLabel):
+            key_timer[key] = item.obj
         else:
             key_task[key] = item.obj
-    return key_habit, key_task, key_template
+    return key_habit, key_task, key_template, key_timer
 
 
 def _overflow_items(habits: list[Habit], habit_mapping: dict[str, int]) -> list[ViewItem]:
@@ -425,9 +462,11 @@ def _tiered_page_builder() -> PageBuilder:
         tasks: list[Task],
         templates: list[Template],
         log_habits: list[Habit],
+        timer_labels: list[TimerLabel],
+        running_timer: RunningTimer | None,
         habit_mapping: dict[str, int],
         page: int,
-    ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int]:
+    ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel], int]:
         overflow = _overflow_items(habits, habit_mapping)
         overflow_pages = paginate(overflow, 0, PAGE_SIZE)[1] if overflow else 0
         total_pages = 1 + overflow_pages
@@ -436,11 +475,11 @@ def _tiered_page_builder() -> PageBuilder:
         if page == 0:
             habits_by_id = {h.id: h for h in habits}
             key_habit = {key: habits_by_id[hid] for hid, key in habit_mapping.items() if hid in habits_by_id}
-            return key_habit, {}, {}, total_pages
+            return key_habit, {}, {}, {}, total_pages
 
         page_items, _ = paginate(overflow, page - 1, PAGE_SIZE)
-        key_habit, key_task, key_template = _place_items(page_items)
-        return key_habit, key_task, key_template, total_pages
+        key_habit, key_task, key_template, key_timer = _place_items(page_items)
+        return key_habit, key_task, key_template, key_timer, total_pages
 
     return build
 
@@ -456,18 +495,27 @@ def _flat_page_builder(items_fn: ItemsFn) -> PageBuilder:
         tasks: list[Task],
         templates: list[Template],
         log_habits: list[Habit],
+        timer_labels: list[TimerLabel],
+        running_timer: RunningTimer | None,
         habit_mapping: dict[str, int],
         page: int,
-    ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], int]:
-        page_items, total_pages = paginate(items_fn(habits, tasks, templates, log_habits), page, PAGE_SIZE)
-        key_habit, key_task, key_template = _place_items(page_items)
-        return key_habit, key_task, key_template, total_pages
+    ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel], int]:
+        page_items, total_pages = paginate(
+            items_fn(habits, tasks, templates, log_habits, timer_labels, running_timer), page, PAGE_SIZE
+        )
+        key_habit, key_task, key_template, key_timer = _place_items(page_items)
+        return key_habit, key_task, key_template, key_timer, total_pages
 
     return build
 
 
 def _today_items(
-    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
 ) -> list[ViewItem]:
     """Items de la vista "Hoy": habitos pendientes (sin los ya completados
     hoy -- ``is_done``, booleano marcado o cuantificable que alcanzo su
@@ -485,7 +533,12 @@ def _today_items(
 
 
 def _tasks_items(
-    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
 ) -> list[ViewItem]:
     """Items de la vista "Tareas": solo las tareas pendientes, en el orden que
     ya trae el proveedor."""
@@ -493,7 +546,12 @@ def _tasks_items(
 
 
 def _create_items(
-    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
 ) -> list[ViewItem]:
     """Items de la vista "Crear": las plantillas de creacion rapida, todas, en
     el orden que trae el proveedor.
@@ -518,7 +576,12 @@ def _create_items(
 
 
 def _log_items(
-    habits: list[Habit], tasks: list[Task], templates: list[Template], log_habits: list[Habit]
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
 ) -> list[ViewItem]:
     """Items de la vista "Logs": los habitos de solo registro (``LogHabit``),
     todos, ordenados por ``(order, id)`` -- mismo criterio que un reparto de
@@ -533,12 +596,42 @@ def _log_items(
     return [ViewItem("habit", h) for h in sorted(log_habits, key=lambda h: (h.order, h.id))]
 
 
+def _timer_items(
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
+) -> list[ViewItem]:
+    """Items de la vista "Cronometros": las etiquetas rapidas, todas, en el
+    orden que trae el proveedor (``sort_order``/``id``, mismo criterio que un
+    reparto de tecla nuevo).
+
+    Antes de repartirlas, se marca cual esta corriendo ahora mismo cruzando
+    contra ``running_timer`` (mutando ``running``/``started_at`` sobre cada
+    ``TimerLabel``, igual que ``_create_items`` mutando ``has_pending`` en
+    cada ``Template``) -- asi ``deck.renderer.render_timer`` no necesita saber
+    nada de ``RunningTimer``, solo mira el objeto que ya tiene.
+
+    Igual que "Logs": una etiqueta no desaparece de esta lista salvo que se
+    archive (fuera del alcance de este cliente), asi que paginar de cero cada
+    ciclo ya da tecla estable sin necesitar ``core.key_map``.
+    """
+    running_label_id = running_timer.label_id if running_timer else ""
+    for label in timer_labels:
+        label.running = bool(running_label_id) and label.id == running_label_id
+        label.started_at = running_timer.started_at if label.running else ""
+    return [ViewItem("timer_label", tl) for tl in sorted(timer_labels, key=lambda t: (t.order, t.id))]
+
+
 VIEWS: dict[str, ViewSpec] = {
     "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
     "habits": ViewSpec("habits", "Habitos", "✅", _tiered_page_builder(), allows_undo=True),
     "tasks": ViewSpec("tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items)),
     "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
     "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items)),
+    "timers": ViewSpec("timers", "Cronometros", "⏱️", _flat_page_builder(_timer_items)),
 }
 DEFAULT_VIEW_ID = "today"
 
@@ -548,6 +641,7 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
     MenuEntry(VIEWS["create"].menu_label, VIEWS["create"].menu_emoji, "select_view", view_id="create"),
     MenuEntry(VIEWS["logs"].menu_label, VIEWS["logs"].menu_emoji, "select_view", view_id="logs"),
+    MenuEntry(VIEWS["timers"].menu_label, VIEWS["timers"].menu_emoji, "select_view", view_id="timers"),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
@@ -568,6 +662,7 @@ class ResolvedPage:
     key_habit: dict[int, Habit] = field(default_factory=dict)
     key_task: dict[int, Task] = field(default_factory=dict)
     key_template: dict[int, Template] = field(default_factory=dict)
+    key_timer: dict[int, TimerLabel] = field(default_factory=dict)
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
     key_numeric: dict[int, NumericKey] = field(default_factory=dict)
     key_standby: dict[int, StandbyKey] = field(default_factory=dict)
@@ -603,6 +698,8 @@ def resolve_page(
     tasks: list[Task],
     templates: list[Template],
     log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
     habit_mapping: dict[str, int],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
@@ -616,6 +713,13 @@ def resolve_page(
             ``get_log_habits()`` exitoso. Solo los usa la vista "Logs", pero
             todo ``PageBuilder`` los recibe igual que el resto de conjuntos
             de datos (ver ``core.screens.PageBuilder``).
+        timer_labels: Etiquetas rapidas de cronometro del ultimo
+            ``get_timer_labels()`` exitoso. Solo las usa la vista
+            "Cronometros", mismo criterio que ``log_habits``.
+        running_timer: El cronometro en marcha ahora mismo (o ``None``) del
+            ultimo ``get_running_timer()`` exitoso. Lo usan tanto "Cronometros"
+            (que etiqueta resaltar) como el menu de opciones de una tarea (si
+            esta corriendo, para decidir "Iniciar" vs "Detener").
         habit_mapping: Mapeo persistido habito -> tecla vigente.
 
     Returns:
@@ -668,18 +772,31 @@ def resolve_page(
             else:
                 layout = HABIT_OPTIONS_LAYOUT
         else:
-            layout = TASK_OPTIONS_LAYOUT
+            # Tecla 2 ("timer"): si ESTA tarea es la que esta corriendo ahora
+            # mismo, se rellenan running/started_at y el label pasa a ser el
+            # titulo denormalizado de running_timer (no "Detener cronometro"):
+            # deck.renderer.render_option_entry pinta "titulo\n[tiempo]" para
+            # no tener que recordar cual esta activo -- copia del dict, mismo
+            # patron que las teclas 5/10 informativas del RealHabit de arriba.
+            layout = dict(TASK_OPTIONS_LAYOUT)
+            is_running = running_timer is not None and running_timer.task_id == screen.entry_item_id
+            layout[2] = (
+                OptionEntry("timer", clip_title(running_timer.title), running=True, started_at=running_timer.started_at)
+                if is_running
+                else OptionEntry("timer", "Iniciar cronometro", "▶️")
+            )
         key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
-    key_habit, key_task, key_template, total_pages = spec.build_page(
-        habits, tasks, templates, log_habits, habit_mapping, screen.page
+    key_habit, key_task, key_template, key_timer, total_pages = spec.build_page(
+        habits, tasks, templates, log_habits, timer_labels, running_timer, habit_mapping, screen.page
     )
     return ResolvedPage(
         key_habit=key_habit,
         key_task=key_task,
         key_template=key_template,
+        key_timer=key_timer,
         page=_clamp_page(screen.page, total_pages),
         total_pages=total_pages,
     )
@@ -691,20 +808,22 @@ class PressAction:
 
     Attributes:
         kind: "habit" | "habit_undo" | "habit_enter_value" | "task" |
-            "template" | "open_menu" | "open_system" | "select_view" |
-            "shutdown" | "standby" | "wake" | "page_prev" | "page_next" |
-            "numeric_digit" | "numeric_decimal" | "numeric_backspace" |
-            "numeric_confirm" | "numeric_cancel" | "item_options_exit" |
-            "task_set_priority" | "task_skip" | "habit_options_undo" |
-            "habit_options_add_value" | "habit_options_add_step" | "noop".
-        payload: Id del habito/tarea/plantilla si ``kind`` es
+            "template" | "timer_toggle" | "open_menu" | "open_system" |
+            "select_view" | "shutdown" | "standby" | "wake" | "page_prev" |
+            "page_next" | "numeric_digit" | "numeric_decimal" |
+            "numeric_backspace" | "numeric_confirm" | "numeric_cancel" |
+            "item_options_exit" | "task_set_priority" | "task_skip" |
+            "habit_options_undo" | "habit_options_add_value" |
+            "habit_options_add_step" | "noop".
+        payload: Id del habito/tarea/plantilla/etiqueta-de-cronometro si
+            ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
-            "numeric_confirm", el ``view_id`` destino si ``kind`` es
-            "select_view", el digito tecleado si ``kind`` es "numeric_digit",
-            la prioridad elegida (como texto) si ``kind`` es
+            "numeric_confirm"/"timer_toggle", el ``view_id`` destino si
+            ``kind`` es "select_view", el digito tecleado si ``kind`` es
+            "numeric_digit", la prioridad elegida (como texto) si ``kind`` es
             "task_set_priority", o el ``amount``/multiplicador de ``step``
             (como texto, ver ``OptionEntry.amount``) si ``kind`` es
-            "habit_options_add_value"/"habit_options_add_step" -- en los
+            "habit_options_add_value"/"habit_options_add_step" -- en estos
             cuatro ultimos casos el id del habito/tarea no va aqui, se lee de
             ``ScreenState.entry_item_id`` en el momento de ejecutar, igual
             que "numeric_confirm" con ``entry_habit_id``. "habit_options_undo"
@@ -712,7 +831,14 @@ class PressAction:
             payload, por el mismo motivo: el id del habito se lee de
             ``ScreenState.entry_item_id``, no de aqui -- distinto de
             "habit_undo" (el deshacer por tap corto en "Habitos"), que si
-            lleva el id en el payload. Vacio en el resto.
+            lleva el id en el payload. "timer_toggle" es la excepcion
+            deliberada a ese patron cuando se dispara desde el menu de
+            opciones de una tarea (``entry.kind == "timer"``): SI lleva el id
+            en el payload (leido de ``entry_item_id`` en ese momento, no
+            despues), para compartir el mismo camino de ejecucion que cuando
+            se pulsa directamente una tecla de "Cronometros" (que tambien
+            lleva id en el payload, como "task"/"template"). Vacio en el
+            resto.
     """
 
     kind: str
@@ -799,6 +925,14 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             # orchestrator.press_habit_options_add_step, que es quien tiene
             # el objeto Habit (con su step) a mano.
             return PressAction("habit_options_add_step", str(entry.amount))
+        if entry.kind == "timer":
+            # Excepcion deliberada al patron "sin id en el payload" de esta
+            # pantalla: timer_toggle necesita el mismo PressAction.kind tanto
+            # aqui como al pulsar una tecla de "Cronometros" (que si lleva id
+            # en el payload), para compartir un unico camino de ejecucion en
+            # orchestrator._run_action -- por eso el id se lee de
+            # entry_item_id AQUI, no se deja para mas tarde.
+            return PressAction("timer_toggle", screen.entry_item_id)
         return PressAction("item_options_exit")
 
     if key == KEY_MENU:
@@ -838,4 +972,7 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
         if template.has_pending:
             return PressAction("noop")
         return PressAction("template", template.id)
+    timer_label = page.key_timer.get(key)
+    if timer_label is not None:
+        return PressAction("timer_toggle", timer_label.id)
     return PressAction("noop")

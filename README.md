@@ -9,10 +9,13 @@ como servicio systemd en una Raspberry Pi y sondea la base via PostgREST cada
 Es un **menu de pantallas**, no una sola vista: por defecto muestra "Hoy"
 (habitos pendientes en blanco, hechos en gris oscuro; tareas coloreadas por
 prioridad), y desde el menu se llega a "Habitos" (con deshacer), "Tareas",
-"Crear" (instancia una tarea desde una plantilla) y un submenu "Sistema" con
-la suspension de la pantalla y el apagado de la Pi. Un habito cuantificable
-marcado `manual_entry` (p.ej. "Peso") abre un teclado numerico en vez de sumar
-de uno en uno. Detalle completo de pantallas y flujo en [CLAUDE.md](CLAUDE.md).
+"Crear" (instancia una tarea desde una plantilla), "Logs" (habitos de solo
+registro), "Cronometros" (cronometros tipo Toggl Track: un boton por etiqueta
+rapida o por tarea que alterna iniciar/detener, con como mucho uno corriendo a
+la vez) y un submenu "Sistema" con la suspension de la pantalla y el apagado
+de la Pi. Un habito cuantificable marcado `manual_entry` (p.ej. "Peso") abre
+un teclado numerico en vez de sumar de uno en uno. Detalle completo de
+pantallas y flujo en [CLAUDE.md](CLAUDE.md).
 
 ## Stand by
 
@@ -112,15 +115,16 @@ mypy .               # comprobacion de tipos
 El codigo esta organizado en tres capas por carpetas, con una regla de
 dependencia clara:
 
-- **`provider/`** — la API, aislada tras tres puertos abstractos (`base.py`:
-  `HabitProvider`, `TaskProvider`, `TemplateProvider` — separados porque un
-  backend puede ofrecer una capacidad sin las otras; modelos de dominio
-  `Habit`/`Task`/`Template` y excepciones agnosticas). Supabase es solo un
-  adaptador (`supabase.py`) que implementa los tres detras de esos puertos;
-  sustituirlo por otra API es escribir otro adaptador y cambiar una linea en
-  `orchestrator.py`. La logica de negocio (que dia es hoy, cual es el
-  siguiente valor de un habito, que tareas tocan) vive en la base de datos, no
-  aqui: el daemon es un renderizador tonto sobre un contrato de vistas y
+- **`provider/`** — la API, aislada tras cuatro puertos abstractos (`base.py`:
+  `HabitProvider`, `TaskProvider`, `TemplateProvider`, `TimerProvider` —
+  separados porque un backend puede ofrecer una capacidad sin las otras;
+  modelos de dominio `Habit`/`Task`/`Template`/`TimerLabel`/`RunningTimer` y
+  excepciones agnosticas). Supabase es solo un adaptador (`supabase.py`) que
+  implementa los cuatro detras de esos puertos; sustituirlo por otra API es
+  escribir otro adaptador y cambiar una linea en `orchestrator.py`. La logica
+  de negocio (que dia es hoy, cual es el siguiente valor de un habito, que
+  tareas tocan, cuando arranca/para un cronometro) vive en la base de datos,
+  no aqui: el daemon es un renderizador tonto sobre un contrato de vistas y
   funciones.
 - **`deck/`** — todo lo de la Stream Deck (hardware y pintado): `session`
   (incluido el brillo, y con el la suspension), `primitives`, `renderer`,

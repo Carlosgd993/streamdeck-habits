@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from typing import Any, Literal
 
 from config import KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV
@@ -49,6 +50,10 @@ from deck.style import (
     COLOR_TEXT_TASK_SKIP,
     COLOR_TEXT_TEMPLATE,
     COLOR_TEXT_TEMPLATE_PENDING,
+    COLOR_TEXT_TIMER_RUNNING,
+    COLOR_TEXT_TIMER_STOPPED,
+    COLOR_TIMER_RUNNING,
+    COLOR_TIMER_STOPPED,
     FONT_SIZE_HABIT_PENDING,
     FONT_SIZE_NAV,
     FONT_SIZE_NUMERIC,
@@ -57,8 +62,9 @@ from deck.style import (
     FONT_SIZE_STANDBY,
     FONT_SIZE_TASK,
     FONT_SIZE_TEMPLATE,
+    FONT_SIZE_TIMER,
 )
-from provider.base import Habit, LogHabit, Task, Template
+from provider.base import Habit, LogHabit, Task, Template, TimerLabel
 
 _DEFAULT_PRIORITY = 0  # al que cae una prioridad que no este en los diccionarios de estilo
 
@@ -198,6 +204,62 @@ def render_template(deck: Any, key: int, template: Template | None) -> None:
     deck.set_key_image(key, image)
 
 
+def _format_elapsed(started_at_iso: str) -> str:
+    """Tiempo transcurrido desde ``started_at_iso`` (ISO 8601 con offset, tal
+    cual lo da el proveedor) hasta ahora, como ``"mm:ss"`` o ``"h:mm"`` pasada
+    la hora. Recalculado en cada llamada -- nunca un contador que incrementa
+    en el cliente (ver ``provider.base.TimerLabel.started_at``). Es el unico
+    calculo derivado de tiempo en todo el proyecto del lado del cliente,
+    limitado a presentacion: no decide nada, solo se pinta.
+
+    Devuelve ``"--:--"`` si ``started_at_iso`` viene vacio o no se puede
+    interpretar (se degrada, no falla -- mismo criterio que
+    ``_parse_hex_color``)."""
+    if not started_at_iso:
+        return "--:--"
+    try:
+        started = datetime.fromisoformat(started_at_iso)
+    except ValueError:
+        return "--:--"
+    elapsed = datetime.now(timezone.utc) - started.astimezone(timezone.utc)
+    total_seconds = max(0, int(elapsed.total_seconds()))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
+def render_timer(deck: Any, key: int, timer: TimerLabel | None) -> None:
+    """Pinta una tecla de etiqueta de cronometro (vista "Cronometros").
+
+    Corriendo (``timer.running``): fondo ``COLOR_TIMER_RUNNING``, el nombre
+    arriba y el tiempo transcurrido debajo entre corchetes (p.ej.
+    ``"nombre\\n[00:05]"``) -- para no tener que recordar cual esta activo,
+    saberlo al leer la tecla. Sin emoji: con dos lineas ya no cabe comodo, y
+    el nombre solo ya identifica la etiqueta. El tiempo se recalcula en cada
+    repintado a partir de ``timer.started_at`` (ver ``_format_elapsed``,
+    ``config.TIMER_TICK_SECONDS``). Parado: fondo ``COLOR_TIMER_STOPPED``,
+    nombre + emoji, sin tiempo. El color es solo lo ultimo que se supo -- el
+    toggle real lo decide la base (``rpc/timer_toggle``), igual que
+    cualquier otra tecla del deck puede quedar desactualizada hasta el
+    proximo refresco. Si ``timer`` es ``None`` la tecla se pinta vacia.
+    """
+    if timer is None:
+        deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
+        return
+    if timer.running:
+        color, text_color = COLOR_TIMER_RUNNING, COLOR_TEXT_TIMER_RUNNING
+        label = f"{timer.display_label()}\n[{_format_elapsed(timer.started_at)}]"
+        image = text_tile(deck, color, label, text_color=text_color, font_size=FONT_SIZE_TIMER)
+    else:
+        color, text_color = COLOR_TIMER_STOPPED, COLOR_TEXT_TIMER_STOPPED
+        image = text_tile(
+            deck, color, timer.display_label(), text_color=text_color, font_size=FONT_SIZE_TIMER, emoji=timer.emoji
+        )
+    deck.set_key_image(key, image)
+
+
 def render_task_sending(deck: Any, key: int) -> None:
     """Pinta el acuse de recibo de una pulsacion de tarea: verde vivo y un check.
 
@@ -329,8 +391,18 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
     (``COLOR_TASK_BY_PRIORITY``), para que se reconozca de un vistazo con el
     mismo codigo de color que el resto del deck. "Skip" (solo en
     ``TASK_OPTIONS_LAYOUT``) usa un naranja propio (``COLOR_TASK_SKIP``),
-    distinto del rojo de error/apagado y de los colores de prioridad. Una
-    tecla sin contenido se pinta vacia.
+    distinto del rojo de error/apagado y de los colores de prioridad.
+    "timer" (solo en ``TASK_OPTIONS_LAYOUT``) reutiliza
+    ``COLOR_TIMER_RUNNING``/``COLOR_TIMER_STOPPED`` de la vista "Cronometros"
+    -- mismo significado ahi que aqui, corriendo o parado -- eligiendo entre
+    los dos segun ``entry.running``. Si esta corriendo, ``entry.label`` ya
+    trae el titulo de la tarea (lo pone ``resolve_page``, no "Detener
+    cronometro") y la tecla pinta ``"titulo\n[tiempo]"`` (tiempo =
+    ``_format_elapsed(entry.started_at)``, recalculado en cada repintado),
+    sin ``entry.emoji`` -- con dos lineas ya no cabe comodo -- mismo
+    tratamiento que ``deck.renderer.render_timer``. Si no, se pinta
+    ``entry.label`` ("Iniciar cronometro") con su emoji, en el tamano normal
+    de esta pantalla. Una tecla sin contenido se pinta vacia.
     """
     if entry.kind == "back":
         image = text_tile(
@@ -363,6 +435,16 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
         color = COLOR_HABIT_ADD if entry.amount >= 0 else COLOR_HABIT_SUBTRACT
         text_color = COLOR_TEXT_HABIT_ADD if entry.amount >= 0 else COLOR_TEXT_HABIT_SUBTRACT
         image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_NAV, emoji=entry.emoji)
+    elif entry.kind == "timer":
+        if entry.running:
+            color, text_color = COLOR_TIMER_RUNNING, COLOR_TEXT_TIMER_RUNNING
+            label = f"{entry.label}\n[{_format_elapsed(entry.started_at)}]"
+            image = text_tile(deck, color, label, text_color=text_color, font_size=FONT_SIZE_TIMER)
+        else:
+            color, text_color = COLOR_TIMER_STOPPED, COLOR_TEXT_TIMER_STOPPED
+            image = text_tile(
+                deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_NAV, emoji=entry.emoji
+            )
     else:  # "blank"
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
@@ -375,8 +457,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
     Cada tecla se resuelve en orden: stand by, teclado numerico y menu de
     opciones primero (cada uno cubre las 15 y van antes porque ahi 0/5/10 no
     son menu/paginacion), luego menu (fija), flecha de paginacion o neutra,
-    entrada de menu/sistema, habito, tarea, plantilla y, si no es nada de eso,
-    vacia.
+    entrada de menu/sistema, habito, tarea, plantilla, etiqueta de cronometro
+    y, si no es nada de eso, vacia.
     ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
@@ -403,6 +485,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
             render_task(deck, key, resolved.key_task[key])
         elif key in resolved.key_template:
             render_template(deck, key, resolved.key_template[key])
+        elif key in resolved.key_timer:
+            render_timer(deck, key, resolved.key_timer[key])
         else:
             render_empty(deck, key)
 

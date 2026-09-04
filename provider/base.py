@@ -10,13 +10,16 @@ particular:
   reves.
 - ``TemplateProvider``: el puerto de plantillas (crear una tarea a partir de una
   definicion reutilizable), separado de los otros dos por la misma razon.
-  Un adaptador concreto puede implementar los tres (es lo que hace
-  ``provider/supabase.py``, porque los tres salen del mismo contrato).
+- ``TimerProvider``: el puerto de cronometros (tipo Toggl Track), separado por
+  la misma razon. Un adaptador concreto puede implementar los cuatro (es lo
+  que hace ``provider/supabase.py``, porque los cuatro salen del mismo
+  contrato).
 - Jerarquia de excepciones agnostica (``ProviderError`` y subclases), compartida
-  por los tres puertos.
+  por los cuatro puertos.
 - Los modelos de dominio ``Habit`` (y sus subtipos ``BooleanHabit``/``RealHabit``/
-  ``LogHabit``), ``Task`` y ``Template``, construidos desde campos ya parseados --
-  nunca desde el JSON crudo de un backend.
+  ``LogHabit``), ``Task``, ``Template``, ``TimerLabel`` y ``RunningTimer``,
+  construidos desde campos ya parseados -- nunca desde el JSON crudo de un
+  backend.
 
 La logica de negocio (que dia es hoy, cual es el siguiente valor de un habito,
 que tareas estan pendientes) vive en la base de datos; estos puertos y sus
@@ -255,8 +258,13 @@ A partir de ahi el texto ya no cabe (el pintado envuelve en lineas cortas) y lo
 que sobra se recorta con una elipsis en vez de desbordarse en silencio."""
 
 
-def _clip_title(title: str) -> str:
-    """Recorta ``title`` a ``TITLE_MAX_CHARS`` con elipsis si no cabe en la tecla."""
+def clip_title(title: str) -> str:
+    """Recorta ``title`` a ``TITLE_MAX_CHARS`` con elipsis si no cabe en la tecla.
+
+    Publica (no ``_clip_title``): ademas de los tres ``display_label()`` de
+    abajo, la usa ``core.screens`` para recortar ``RunningTimer.title`` (el
+    titulo denormalizado que trae el cronometro en marcha, sin pasar por
+    ninguna de estas tres clases)."""
     if len(title) <= TITLE_MAX_CHARS:
         return title
     return title[: TITLE_MAX_CHARS - 1].rstrip() + "…"
@@ -312,7 +320,7 @@ class Task:
 
         El emoji va aparte (ver ``emoji``), como en los habitos.
         """
-        return _clip_title(self.title)
+        return clip_title(self.title)
 
 
 class Template:
@@ -363,7 +371,96 @@ class Template:
 
         El emoji va aparte (ver ``emoji``), igual que en habitos y tareas.
         """
-        return _clip_title(self.title)
+        return clip_title(self.title)
+
+
+class TimerLabel:
+    """Etiqueta rapida de cronometro (vista "Cronometros"), agnostica del
+    backend que la origino.
+
+    Es el catalogo de acceso rapido: mismo papel que ``Template`` para
+    tareas, pero para cronometros -- no desaparece al usarla, sigue ahi para
+    la proxima vez.
+
+    Attributes:
+        id: Identificador de la etiqueta en el proveedor.
+        name: Nombre legible, ya sin el emoji si lo llevaba.
+        emoji: Emoji del nombre para usar como icono, o cadena vacia. Mismo
+            criterio que en ``Task``/``Template``: no hay campo de icono
+            propio, se saca del nombre.
+        order: Pista de orden para repartir teclas de forma estable (mismo
+            papel que ``Habit.order``).
+        running: Si esta etiqueta es la que tiene el cronometro corriendo
+            ahora mismo. **Lo calcula el dominio en cada resolucion de
+            pantalla** (no viene del backend), cruzando las etiquetas con
+            ``RunningTimer`` -- igual que ``Template.has_pending``.
+        started_at: Cuando arranco el cronometro corriendo (ISO 8601 con
+            offset, tal cual lo da el proveedor), o cadena vacia si
+            ``running`` es ``False``. El pintado recalcula el tiempo
+            transcurrido a partir de aqui en cada repintado -- nunca un
+            contador que incrementa en el cliente.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        name: str,
+        emoji: str = "",
+        order: int = 0,
+        running: bool = False,
+        started_at: str = "",
+    ) -> None:
+        self.id = id
+        self.name = name
+        self.emoji = emoji
+        self.order = order
+        self.running = running
+        self.started_at = started_at
+
+    def display_label(self) -> str:
+        """Texto a mostrar en la tecla: el nombre, recortado si no cabe.
+
+        El emoji va aparte (ver ``emoji``); el tiempo transcurrido (si esta
+        corriendo) lo añade ``deck.renderer.render_timer``, no aqui -- este
+        metodo describe solo la identidad de la etiqueta.
+        """
+        return clip_title(self.name)
+
+
+class RunningTimer:
+    """El cronometro en marcha ahora mismo, o nada (ver
+    ``TimerProvider.get_running_timer``). Agnostico del backend.
+
+    Attributes:
+        id: Identificador de la entrada de tiempo en el proveedor.
+        task_id: Id de la tarea a la que esta asociado, o cadena vacia si es
+            de una etiqueta (o de ninguna de las dos).
+        label_id: Id de la ``TimerLabel`` a la que esta asociado, o cadena
+            vacia si es de una tarea (o de ninguna de las dos). Mutuamente
+            excluyente con ``task_id``.
+        title: Titulo ya denormalizado por el proveedor (copiado de la
+            tarea/etiqueta en el momento de arrancar), y ya sin emoji si lo
+            llevaba (el adaptador lo separa y lo descarta, mismo criterio
+            que ``Task``/``TimerLabel`` -- esta pantalla no tiene icono
+            propio donde pintarlo): ningun cliente necesita cruzar con
+            ``Task``/``TimerLabel`` para saber que esta corriendo.
+        started_at: Cuando arranco (ISO 8601 con offset, tal cual lo da el
+            proveedor). Unica fuente para calcular el tiempo transcurrido.
+    """
+
+    def __init__(
+        self,
+        id: str,
+        task_id: str = "",
+        label_id: str = "",
+        title: str = "",
+        started_at: str = "",
+    ) -> None:
+        self.id = id
+        self.task_id = task_id
+        self.label_id = label_id
+        self.title = title
+        self.started_at = started_at
 
 
 class HabitProvider(ABC):
@@ -587,6 +684,82 @@ class TemplateProvider(ABC):
 
         Returns:
             El id de la ocurrencia recien creada.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+
+class TimerProvider(ABC):
+    """Puerto: contrato que debe implementar un backend de cronometros.
+
+    Separado de los otros tres por la misma razon: es una capacidad propia
+    (tipo Toggl Track) y un adaptador puede ofrecerla o no independientemente
+    del resto. Comparte la jerarquia de excepciones ``Provider*``.
+
+    Dos metodos de escritura, no uno unificado (``toggle_task_timer``/
+    ``toggle_label_timer``): llevan payload distinto a la misma operacion de
+    backend, mismo criterio por el que ``TaskProvider.set_priority``/
+    ``skip_task`` siguen siendo metodos separados en vez de uno generico.
+    Ninguno de los dos devuelve nada util: el llamador siempre hace un
+    refresco completo tras un toggle exitoso (nunca mutacion optimista) --
+    el estado fiable de "que esta corriendo ahora" es el que devuelve el
+    proveedor, no lo que el cliente asumia antes de pulsar.
+    """
+
+    @abstractmethod
+    def get_timer_labels(self) -> list[TimerLabel]:
+        """Devuelve las etiquetas rapidas de cronometro, ya ordenadas.
+
+        Solo las que el proveedor marca como de acceso rapido: el filtrado y
+        el orden los decide el proveedor, igual que en ``get_templates``.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def get_running_timer(self) -> RunningTimer | None:
+        """Devuelve el cronometro en marcha ahora mismo, o ``None`` si no hay
+        ninguno corriendo. Como mucho hay uno a la vez (lo garantiza el
+        proveedor).
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def toggle_task_timer(self, task: Task) -> None:
+        """Alterna el cronometro de ``task``: si ya era el que corria, lo
+        para; si no, para el que hubiera y arranca uno nuevo para esta tarea.
+
+        El proveedor decide start-vs-stop mirando su propio estado real, no
+        lo que el llamador cree -- este metodo solo lo dispara. No devuelve
+        nada: el llamador debe refrescar (``get_running_timer()``) para saber
+        el resultado.
+
+        Args:
+            task: La tarea cuyo cronometro alternar.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def toggle_label_timer(self, label: TimerLabel) -> None:
+        """Alterna el cronometro de ``label``, igual que ``toggle_task_timer``
+        pero para una etiqueta rapida en vez de una tarea.
+
+        Args:
+            label: La etiqueta cuyo cronometro alternar.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.

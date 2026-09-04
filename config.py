@@ -27,3 +27,9 @@ STANDBY_SECONDS = 1800  # 30 min sin pulsar nada -> stand by (pantalla apagada, 
 LONG_PRESS_SECONDS = 0.6  # mantener pulsado un habito/tarea este tiempo abre su menu de opciones
 
 RESTORE_COOLDOWN_SECONDS = 1800  # 30 min minimo entre intentos de reactivar un proyecto Supabase pausado
+
+TIMER_TICK_SECONDS = 1  # repinta (sin refetch, calculo local a partir de running_timer_ref) mientras haya
+                         # un cronometro corriendo, para que el tiempo transcurrido se vea al segundo
+TIMER_SYNC_SECONDS = 60  # refetch real de get_running_timer() mientras haya un cronometro corriendo, para
+                          # corregir el calculo local (deriva de reloj, cambio hecho por otro cliente) sin
+                          # esperar a REFRESH_SECONDS (15 min)

@@ -1,15 +1,16 @@
 #!/opt/streamdeck-habits/venv/bin/python
 """Punto de entrada del daemon: bucle de refresco que sincroniza los habitos
-(con objetivo y de solo registro), las tareas pendientes y las plantillas de
-creacion rapida del proveedor con las teclas del Stream Deck, y gestiona la
-navegacion por menu, la paginacion y los pasos/deshaceres/cierres/creaciones
-al pulsar.
+(con objetivo y de solo registro), las tareas pendientes, las plantillas de
+creacion rapida y los cronometros (etiquetas rapidas + el que este corriendo)
+del proveedor con las teclas del Stream Deck, y gestiona la navegacion por
+menu, la paginacion y los pasos/deshaceres/cierres/creaciones/toggles al pulsar.
 
 El orquestador depende solo de los puertos abstractos de ``provider.base``
-(interfaces ``HabitProvider``/``TaskProvider``/``TemplateProvider``, modelos
-``Habit``/``Task``/``Template`` y excepciones ``Provider*``) y del registro de
-pantallas de ``core.screens``; la unica linea acoplada a un backend concreto es
-la construccion del proveedor (``SupabaseProvider()``). Sustituir de API =
+(interfaces ``HabitProvider``/``TaskProvider``/``TemplateProvider``/
+``TimerProvider``, modelos ``Habit``/``Task``/``Template``/``TimerLabel``/
+``RunningTimer`` y excepciones ``Provider*``) y del registro de pantallas de
+``core.screens``; la unica linea acoplada a un backend concreto es la
+construccion del proveedor (``SupabaseProvider()``). Sustituir de API =
 escribir otro adaptador que implemente esos puertos y cambiar esa linea.
 """
 
@@ -27,7 +28,15 @@ import core.screens as screens
 import deck.keys as deck_keys
 import deck.renderer as renderer
 import provider.keepalive as keepalive
-from config import AUTO_RETURN_SECONDS, LONG_PRESS_SECONDS, REFRESH_SECONDS, RESTORE_COOLDOWN_SECONDS, STANDBY_SECONDS
+from config import (
+    AUTO_RETURN_SECONDS,
+    LONG_PRESS_SECONDS,
+    REFRESH_SECONDS,
+    RESTORE_COOLDOWN_SECONDS,
+    STANDBY_SECONDS,
+    TIMER_SYNC_SECONDS,
+    TIMER_TICK_SECONDS,
+)
 from core.error_codes import CODES
 from deck.session import BRIGHTNESS, BRIGHTNESS_STANDBY, DeckSession
 from provider.base import (
@@ -35,15 +44,18 @@ from provider.base import (
     HabitProvider,
     ProviderError,
     RealHabit,
+    RunningTimer,
     Task,
     TaskProvider,
     Template,
     TemplateProvider,
+    TimerLabel,
+    TimerProvider,
 )
 from provider.supabase import SupabaseProvider
 
 state_lock = threading.Lock()
-pending_requests: set[str] = set()  # ids (habito, tarea, plantilla o el centinela de navegacion) en vuelo
+pending_requests: set[str] = set()  # ids (habito, tarea, plantilla, cronometro o el centinela de navegacion) en vuelo
 _NAV_SENTINEL = "__nav__"  # clave de _claim/_release para no duplicar una entrada a vista por doble toque
 _ENTRY_MAX_CHARS = 10  # limite del valor tecleado en el teclado numerico, para que quepa en el tile
 
@@ -122,11 +134,14 @@ def make_key_callback(
     provider: HabitProvider,
     task_provider: TaskProvider,
     template_provider: TemplateProvider,
+    timer_provider: TimerProvider,
     mapping: dict[str, int],
     habits_ref: dict[str, dict[str, Habit]],
     log_habits_ref: dict[str, dict[str, Habit]],
     tasks_ref: dict[str, dict[str, Task]],
     templates_ref: dict[str, dict[str, Template]],
+    timer_labels_ref: dict[str, dict[str, TimerLabel]],
+    running_timer_ref: dict[str, RunningTimer | None],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     reset_idle_timers: Callable[[], None],
@@ -173,6 +188,28 @@ def make_key_callback(
       ``instantiate_task`` no es idempotente. Ese gris sale solo de la tarea
       insertada, ver ``core.screens._create_items``, y ``core.screens`` ya
       devuelve "noop" en ese caso, asi que aqui no hay nada que comprobar.
+    - **Etiqueta de cronometro** (vista "Cronometros") o la opcion "Iniciar/
+      Detener cronometro" del menu de una tarea: ambas resuelven al mismo
+      ``PressAction("timer_toggle", item_id)`` (ver
+      ``core.screens.resolve_press``), asi que las ejecuta el mismo
+      ``press_timer_toggle`` sea cual sea el origen. Nunca mutacion
+      optimista (a diferencia de habito/tarea/plantilla): la base decide
+      start-vs-stop mirando su propio estado, y puede parar un cronometro
+      DISTINTO del que se pulso (el que estuviera corriendo antes) -- el
+      unico estado fiable es el que trae un ``refresh()`` completo. Sin
+      acuse verde propio: a diferencia de cerrar una tarea o crear desde
+      plantilla, aqui no hay "peticion en vuelo" que merezca su propio
+      color, el ``refresh()`` ya es casi inmediato. **No sale del menu de
+      opciones de la tarea** (a diferencia de "Skip"/"cambiar prioridad"):
+      se queda ahi para poder ver el cronometro corriendo o volver a
+      pulsarlo para pararlo, mismo criterio que "Ajustar el progreso" de un
+      habito real. Mientras haya un cronometro corriendo, dos temporizadores
+      aparte (ver mas abajo) lo mantienen al dia sin necesidad de pulsar
+      nada: uno repinta cada segundo (``config.TIMER_TICK_SECONDS``)
+      calculando el tiempo transcurrido en el cliente a partir del
+      ``started_at`` ya cacheado (sin refetch), y otro relee de verdad
+      ``get_running_timer()`` cada minuto (``config.TIMER_SYNC_SECONDS``)
+      para corregir esa cuenta local.
     - **Mantener pulsado un habito o una tarea**: las tres pulsaciones de
       arriba (paso/deshacer de habito, cierre de tarea) ya no se ejecutan al
       presionar, sino al **soltar** -- ver ``on_key_change`` mas abajo. Al
@@ -200,6 +237,7 @@ def make_key_callback(
         provider: Proveedor de habitos (puerto abstracto).
         task_provider: Proveedor de tareas (puerto abstracto).
         template_provider: Proveedor de plantillas (puerto abstracto).
+        timer_provider: Proveedor de cronometros (puerto abstracto).
         mapping: Mapeo habito -> tecla vigente para este ciclo.
         habits_ref: Wrapper de un solo campo ``{"value": {id: Habit}}`` para
             que el closure observe actualizaciones de ciclos posteriores.
@@ -210,6 +248,17 @@ def make_key_callback(
             porque un habito pulsado puede venir de cualquiera.
         tasks_ref: Idem para las tareas pendientes.
         templates_ref: Idem para las plantillas de creacion rapida.
+        timer_labels_ref: Idem para las etiquetas rapidas de cronometro
+            (vista "Cronometros"). ``press_timer_toggle`` busca el id pulsado
+            primero en ``tasks_ref`` (viene del menu de opciones de una
+            tarea) y si no lo encuentra aqui (viene de una tecla de
+            "Cronometros"), igual que ``press_habit`` mira dos ``*_ref``.
+        running_timer_ref: Wrapper ``{"value": RunningTimer | None}`` (uno
+            solo, no un dict por id: como mucho hay un cronometro corriendo)
+            con el cronometro en marcha del ultimo ``get_running_timer()``
+            exitoso. Lo usa ``on_key_change`` al resolver una pulsacion
+            (``core.screens.resolve_page`` lo necesita para decidir "Iniciar"
+            vs "Detener" en el menu de opciones de una tarea).
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
@@ -295,8 +344,14 @@ def make_key_callback(
         (``render_task_sending``), luego ``TaskProvider.skip_task``
         (``press_task_skip``). Exito -> la tarea sale de ``tasks_ref``
         (igual que al completarla) + ``exit_item_options``.
+      - **Iniciar/Detener cronometro** (tecla 2, rosa/turquesa segun el
+        estado) -> es la UNICA opcion de esta pantalla que SI lleva el id en
+        el payload de la ``PressAction`` (``core.screens.resolve_press`` lo
+        lee de ``entry_item_id`` en ese momento, ver ahi el porque): resuelve
+        al mismo ``"timer_toggle"`` que una tecla de "Cronometros", asi que
+        lo ejecuta ``press_timer_toggle`` por la rama de arriba, no por esta.
 
-      Todas comparten patron: sin id en el payload de la ``PressAction`` (se
+      Todas las demas comparten patron: sin id en el payload de la ``PressAction`` (se
       lee de ``screen.entry_item_id``), reservadas con ``_claim``/``_release``
       por ese id, y en caso de fallo la tecla queda en rojo con el codigo sin
       salir del menu, para poder reintentar.
@@ -549,6 +604,48 @@ def make_key_callback(
             _safe_render(repaint)
             print(f"Tarea creada desde plantilla: {template.title} -> {new_task_id}", flush=True)
 
+    def press_timer_toggle(deck: Any, key: int, item_id: str) -> None:
+        """Alterna el cronometro de una tarea o de una etiqueta rapida --
+        ``item_id`` sirve para las dos, asi que primero se busca en
+        ``tasks_ref`` (llega aqui desde el menu de opciones de una tarea) y,
+        si no esta, en ``timer_labels_ref`` (llega desde una tecla de
+        "Cronometros"), mismo patron que ``press_habit`` mirando dos ``*_ref``.
+
+        Nunca mutacion optimista: ``rpc/timer_toggle`` puede parar un
+        cronometro DISTINTO del que se pulso (el que estuviera corriendo
+        antes, si no era este), asi que el unico estado fiable es el que
+        trae un ``refresh()`` completo.
+
+        A diferencia de "Deshacer" o "Skip", **no sale de**
+        ``ScreenKind.ITEM_OPTIONS`` cuando se pulsa desde el menu de opciones
+        de una tarea: se queda ahi para poder ver el cronometro corriendo (o
+        volver a pulsar para pararlo) sin tener que reabrir el menu -- mismo
+        patron que "Ajustar el progreso" de un habito real
+        (``_press_habit_options_delta``). Como ``screen.kind`` no cambia,
+        ``refresh()`` repinta la misma pantalla en la que se pulso (menu de
+        opciones o "Cronometros"), y la tecla 2 ya sale con el label/tiempo
+        al dia (``core.screens.resolve_page`` los recalcula en cada
+        resolucion). Solo "Volver" saca del menu de opciones.
+        """
+        task = tasks_ref["value"].get(item_id)
+        label = None if task is not None else timer_labels_ref["value"].get(item_id)
+        if task is None and label is None:
+            return  # tarea/etiqueta desaparecida entre ciclos: se ignora
+        what = task.title if task is not None else label.name
+        try:
+            if task is not None:
+                timer_provider.toggle_task_timer(task)
+            else:
+                timer_provider.toggle_label_timer(label)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(item_id, str(exc), kind="timer")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Cronometro FALLO [{code}]: {item_id}", flush=True)
+        else:
+            refresh()
+            print(f"Cronometro alternado: {what}", flush=True)
+
     _HOLD_KINDS = ("habit", "habit_undo", "task")  # las unicas que distinguen corta de mantenida
     _pending_hold: dict[int, tuple[screens.PressAction, threading.Timer]] = {}  # tecla -> (accion, temporizador)
     _hold_lock = threading.Lock()  # protege _pending_hold frente al hilo del temporizador
@@ -556,11 +653,13 @@ def make_key_callback(
     def _run_action(deck: Any, key: int, action: screens.PressAction) -> None:
         """Ejecuta una ``PressAction`` ya resuelta (la accion corta de un
         habito/tarea, o cualquier otra que no distinga corta de mantenida)."""
-        if action.kind in ("habit", "habit_undo", "task", "template", "numeric_confirm"):
+        if action.kind in ("habit", "habit_undo", "task", "template", "numeric_confirm", "timer_toggle"):
             # Un habito reserva su id sea cual sea la operacion, asi que un
             # paso/deshacer/confirmacion de entrada manual del mismo habito
             # tampoco pueden solaparse ("numeric_confirm" lleva el habit_id
-            # como payload, ver core.screens.resolve_press).
+            # como payload, ver core.screens.resolve_press). "timer_toggle"
+            # lleva el id de la tarea/etiqueta en el payload sea cual sea su
+            # origen (tecla de "Cronometros" o menu de opciones de una tarea).
             item_id = action.payload
             if not _claim(item_id):
                 return  # ya hay una peticion en vuelo para este elemento
@@ -571,6 +670,8 @@ def make_key_callback(
                     press_template(deck, key, item_id)
                 elif action.kind == "numeric_confirm":
                     press_habit_value(deck, key, item_id)
+                elif action.kind == "timer_toggle":
+                    press_timer_toggle(deck, key, item_id)
                 else:
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
@@ -649,7 +750,18 @@ def make_key_callback(
             tasks_list = list(tasks_ref["value"].values())
             templates_list = list(templates_ref["value"].values())
             log_habits_list = list(log_habits_ref["value"].values())
-            resolved = screens.resolve_page(screen, habits_list, tasks_list, templates_list, log_habits_list, mapping)
+            timer_labels_list = list(timer_labels_ref["value"].values())
+            running_timer = running_timer_ref["value"]
+            resolved = screens.resolve_page(
+                screen,
+                habits_list,
+                tasks_list,
+                templates_list,
+                log_habits_list,
+                timer_labels_list,
+                running_timer,
+                mapping,
+            )
             action = screens.resolve_press(screen, key, resolved)
 
         if action.kind in _HOLD_KINDS:
@@ -676,6 +788,7 @@ def main() -> None:
     habit_provider: HabitProvider = provider
     task_provider: TaskProvider = provider
     template_provider: TemplateProvider = provider
+    timer_provider: TimerProvider = provider
 
     session = DeckSession()
     session.open()
@@ -685,6 +798,8 @@ def main() -> None:
     log_habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # idem para los LogHabit de get_log_habits()
     tasks_ref: dict[str, dict[str, Task]] = {"value": {}}  # task_id -> objeto Task, actualizado cada ciclo
     templates_ref: dict[str, dict[str, Template]] = {"value": {}}  # template_id -> Template, idem
+    timer_labels_ref: dict[str, dict[str, TimerLabel]] = {"value": {}}  # label_id -> TimerLabel, idem
+    running_timer_ref: dict[str, RunningTimer | None] = {"value": None}  # uno solo, no por id: a lo sumo uno corre
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
@@ -692,6 +807,8 @@ def main() -> None:
     last_log_habits_code: str | None = None  # idem para los habitos de solo registro
     last_tasks_code: str | None = None  # idem para tareas
     last_templates_code: str | None = None  # idem para plantillas
+    last_timer_labels_code: str | None = None  # idem para etiquetas de cronometro
+    last_running_timer_code: str | None = None  # idem para el cronometro en marcha (nunca se pinta en tecla, ver refresh_cycle)
     last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
 
     def _paint_current_screen() -> None:
@@ -708,6 +825,8 @@ def main() -> None:
             list(tasks_ref["value"].values()),
             list(templates_ref["value"].values()),
             list(log_habits_ref["value"].values()),
+            list(timer_labels_ref["value"].values()),
+            running_timer_ref["value"],
             mapping,
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
@@ -731,6 +850,12 @@ def main() -> None:
         if last_templates_code is not None and is_view and screen.view_id == "create":
             code = last_templates_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_template.keys(), code))
+        if last_timer_labels_code is not None and is_view and screen.view_id == "timers":
+            # Solo el catalogo de etiquetas pinta rojo: sin el no hay nada que
+            # ofrecer. Un fallo de get_running_timer() (last_running_timer_code)
+            # NO se pinta aqui a proposito -- ver el comentario en refresh_cycle.
+            code = last_timer_labels_code
+            _safe_render(lambda: renderer.render_error_all(deck, resolved.key_timer.keys(), code))
 
         deck.set_key_callback(
             make_key_callback(
@@ -738,11 +863,14 @@ def main() -> None:
                 habit_provider,
                 task_provider,
                 template_provider,
+                timer_provider,
                 mapping,
                 habits_ref,
                 log_habits_ref,
                 tasks_ref,
                 templates_ref,
+                timer_labels_ref,
+                running_timer_ref,
                 screen,
                 screen_lock,
                 _reset_idle_timers,
@@ -767,7 +895,7 @@ def main() -> None:
 
     def _maybe_restore_project() -> None:
         """Si el ciclo que acaba de terminar trajo NET en cualquiera de las
-        cuatro lecturas, intenta reactivar el proyecto Supabase activo (ver
+        seis lecturas, intenta reactivar el proyecto Supabase activo (ver
         ``provider.keepalive``): un NET persistente es el sintoma de un
         proyecto pausado por inactividad tanto como el de "sin red", y no
         hay forma de distinguirlos desde el propio checkin, asi que se
@@ -781,7 +909,14 @@ def main() -> None:
         ni una pulsacion en curso con una llamada de red que no las afecta.
         """
         nonlocal last_restore_attempt
-        if "NET" not in (last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code):
+        if "NET" not in (
+            last_habits_code,
+            last_log_habits_code,
+            last_tasks_code,
+            last_templates_code,
+            last_timer_labels_code,
+            last_running_timer_code,
+        ):
             return
         now = time.monotonic()
         if now - last_restore_attempt < RESTORE_COOLDOWN_SECONDS:
@@ -805,9 +940,11 @@ def main() -> None:
         Termina, ya sin el lock, intentando reactivar el proyecto Supabase si
         el ciclo trajo NET (``_maybe_restore_project``, ver su docstring).
         """
-        nonlocal mapping, last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code
+        nonlocal mapping
+        nonlocal last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code
+        nonlocal last_timer_labels_code, last_running_timer_code
         with screen_lock:
-            # Las cuatro lecturas se hacen por separado y fallan por separado:
+            # Las seis lecturas se hacen por separado y fallan por separado:
             # un fallo leyendo tareas deja su codigo aparte y no toca los
             # habitos ni las plantillas, y asi con cualquiera. La lectura que
             # falla no toca su mapeo ni sus datos (se conservan los del ciclo
@@ -855,6 +992,31 @@ def main() -> None:
             else:
                 last_templates_code = None
                 templates_ref["value"] = {t.id: t for t in templates}
+
+            try:
+                timer_labels = timer_provider.get_timer_labels()
+            except ProviderError as exc:
+                _, last_timer_labels_code = health.classify(exc)
+                print(f"[{last_timer_labels_code}] {CODES[last_timer_labels_code]} (cronometros): {exc}", flush=True)
+            else:
+                last_timer_labels_code = None
+                timer_labels_ref["value"] = {tl.id: tl for tl in timer_labels}
+
+            try:
+                # A diferencia de las otras cinco lecturas, un fallo aqui NO
+                # se pinta en tecla (ver _paint_current_screen): se pierde
+                # solo el resaltado de "cual esta corriendo", pero el toggle
+                # sigue siendo correcto porque lo decide rpc/timer_toggle
+                # contra el estado real, no contra este valor cacheado.
+                running_timer_ref["value"] = timer_provider.get_running_timer()
+            except ProviderError as exc:
+                _, last_running_timer_code = health.classify(exc)
+                print(
+                    f"[{last_running_timer_code}] {CODES[last_running_timer_code]} (cronometro activo): {exc}",
+                    flush=True,
+                )
+            else:
+                last_running_timer_code = None
 
             _paint_current_screen()
 
@@ -1056,6 +1218,39 @@ def main() -> None:
 
     _reset_idle_timers()  # armados desde el arranque
 
+    # Dos temporizadores periodicos mientras haya un cronometro corriendo,
+    # para que el tiempo transcurrido se vea al dia sin esperar a
+    # REFRESH_SECONDS (15 min) ni a que el usuario pulse algo. A diferencia
+    # de auto_return_timer/standby_timer, ninguno de los dos se reprograma
+    # con la actividad del usuario: son ciclos propios, independientes, que
+    # se paran solos (_timer_tick_stop) al cerrar el daemon.
+    _timer_tick_stop = threading.Event()
+
+    def _timer_tick() -> None:
+        """Cada ``TIMER_TICK_SECONDS`` (1s): repinta sin refetch. Usa
+        running_timer_ref ya cacheado -- el calculo del tiempo transcurrido
+        lo hace deck.renderer a partir de su started_at en cada repintado,
+        nunca un contador que incrementa aqui."""
+        if not _is_standby() and running_timer_ref["value"] is not None:
+            _repaint_locked()
+        if not _timer_tick_stop.is_set():
+            threading.Timer(TIMER_TICK_SECONDS, _timer_tick).start()
+
+    def _timer_sync() -> None:
+        """Cada ``TIMER_SYNC_SECONDS`` (60s): ciclo de refresco completo
+        (refetch + repintado, ``refresh_cycle``) para corregir el tiempo que
+        viene calculando ``_timer_tick`` en el cliente -- deriva de reloj, o
+        que otro cliente haya parado/arrancado el cronometro entre medias.
+        Mismo gasto de red que un ciclo normal; se acepta porque solo corre
+        mientras hay un cronometro corriendo, no todo el rato."""
+        if not _is_standby() and running_timer_ref["value"] is not None:
+            refresh_cycle()
+        if not _timer_tick_stop.is_set():
+            threading.Timer(TIMER_SYNC_SECONDS, _timer_sync).start()
+
+    threading.Timer(TIMER_TICK_SECONDS, _timer_tick).start()
+    threading.Timer(TIMER_SYNC_SECONDS, _timer_sync).start()
+
     try:
         while True:
             try:
@@ -1082,6 +1277,7 @@ def main() -> None:
     finally:
         auto_return_timer.cancel()
         standby_timer.cancel()
+        _timer_tick_stop.set()
         session.close()
 
 
