@@ -612,6 +612,55 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
             raise ProviderDataError("GET v_running_timer -> respuesta no es JSON valido") from exc
         return build_running_timer(raw[0]) if raw else None
 
+    def get_daily_totals(self) -> dict[str, int]:
+        """Devuelve los segundos acumulados hoy, por tarea o etiqueta.
+
+        Una sola peticion a ``v_timer_daily_totals``: cada fila trae
+        ``task_id`` XOR ``label_id`` (garantizado por la base, igual que en
+        ``v_running_timer``), asi que el id no nulo de cada fila basta como
+        clave -- no hay que distinguir de cual de las dos tablas viene.
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_timer_daily_totals",
+                headers=self._headers(Accept="application/json"),
+                params={"select": "task_id,label_id,seconds_today"},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_timer_daily_totals")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_timer_daily_totals -> respuesta no es JSON valido") from exc
+        return {row["task_id"] or row["label_id"]: row["seconds_today"] for row in raw}
+
+    def get_task_totals(self) -> dict[str, int]:
+        """Devuelve los segundos acumulados de siempre, por tarea.
+
+        Una sola peticion a ``v_task_timer_totals``: al reves que
+        ``get_daily_totals``, aqui solo hay ``task_id`` (una etiqueta no
+        tiene "acumulado de siempre" en el contrato, solo el de hoy).
+        """
+        try:
+            resp = requests.get(
+                f"{self._base}/v_task_timer_totals",
+                headers=self._headers(Accept="application/json"),
+                params={"select": "task_id,seconds_total"},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            raise ProviderNetworkError(str(exc)) from exc
+
+        self._check_status(resp, "GET v_task_timer_totals")
+        try:
+            raw = resp.json()
+        except ValueError as exc:
+            raise ProviderDataError("GET v_task_timer_totals -> respuesta no es JSON valido") from exc
+        return {row["task_id"]: row["seconds_total"] for row in raw}
+
     def toggle_task_timer(self, task: Task) -> None:
         """Alterna el cronometro de ``task`` via ``rpc/timer_toggle``.
 

@@ -295,6 +295,24 @@ class Task:
             cadena vacia si es una tarea unica. Es lo que permite saber si una
             plantilla ya tiene una ocurrencia pendiente sin preguntar otra vez
             al proveedor (ver ``core.screens``).
+        timer_running: Si esta tarea es la que tiene el cronometro corriendo
+            ahora mismo. **Lo calcula el dominio en cada resolucion de
+            pantalla** (no viene del backend), cruzando las tareas con
+            ``RunningTimer`` -- igual que ``Template.has_pending``/
+            ``TimerLabel.running``. Solo lo usa
+            ``deck.renderer.render_task`` para pintar el borde de aviso; no
+            cambia nada del pulsado (eso lo sigue decidiendo el menu de
+            opciones de la tarea, tecla "timer").
+        total_seconds: Segundos acumulados de SIEMPRE en el cronometro de
+            esta tarea (todos sus bloques, sin filtrar por dia -- al reves
+            que ``TimerLabel.today_seconds``: una tarea es una ocurrencia
+            concreta, no un cajon recurrente entre dias como una etiqueta).
+            **Lo calcula el dominio** (no viene del backend en este objeto):
+            sale de ``TimerProvider.get_task_totals()``, cruzado por
+            ``core.screens._mark_running_task``. Lo usa
+            ``deck.renderer.render_task`` para anteponer ``"[total] "`` al
+            titulo si es mayor que 0 -- si es 0 (nunca se ha cronometrado
+            esta tarea), la tecla se pinta igual que siempre.
     """
 
     def __init__(
@@ -314,6 +332,8 @@ class Task:
         self.overdue = overdue
         self.due_day = due_day
         self.template_id = template_id
+        self.timer_running = False
+        self.total_seconds = 0
 
     def display_label(self) -> str:
         """Texto a mostrar en la tecla: el titulo, recortado si no cabe.
@@ -399,6 +419,16 @@ class TimerLabel:
             ``running`` es ``False``. El pintado recalcula el tiempo
             transcurrido a partir de aqui en cada repintado -- nunca un
             contador que incrementa en el cliente.
+        today_seconds: Segundos acumulados HOY en esta etiqueta (suma de
+            todos sus bloques del dia, ``v_timer_daily_totals``). **Lo
+            calcula el dominio en cada resolucion de pantalla** (no viene
+            del backend en este objeto: sale de
+            ``TimerProvider.get_daily_totals()``, cruzado por
+            ``core.screens._timer_items``/``_timer_shortcut_item``), igual
+            que ``running``/``started_at``. Solo tiene sentido pintarlo
+            mientras ``running`` es ``False`` -- corriendo ya se ve el
+            tiempo transcurrido de esta sesion, no el total del dia (ver
+            ``deck.renderer.render_timer``).
     """
 
     def __init__(
@@ -409,6 +439,7 @@ class TimerLabel:
         order: int = 0,
         running: bool = False,
         started_at: str = "",
+        today_seconds: int = 0,
     ) -> None:
         self.id = id
         self.name = name
@@ -416,6 +447,7 @@ class TimerLabel:
         self.order = order
         self.running = running
         self.started_at = started_at
+        self.today_seconds = today_seconds
 
     def display_label(self) -> str:
         """Texto a mostrar en la tecla: el nombre, recortado si no cabe.
@@ -727,6 +759,38 @@ class TimerProvider(ABC):
         """Devuelve el cronometro en marcha ahora mismo, o ``None`` si no hay
         ninguno corriendo. Como mucho hay uno a la vez (lo garantiza el
         proveedor).
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def get_daily_totals(self) -> dict[str, int]:
+        """Devuelve los segundos acumulados HOY, por tarea o etiqueta.
+
+        La clave es el id de la tarea o de la etiqueta (nunca colisionan
+        entre si: son ids de tablas distintas) y el valor los segundos
+        acumulados hoy en ese id (``v_timer_daily_totals.seconds_today``).
+        Una tarea/etiqueta sin ningun bloque hoy simplemente no tiene
+        entrada -- el llamador trata la ausencia como 0, no como fallo.
+
+        Raises:
+            ProviderAuthError: Si las credenciales son invalidas o caducaron.
+            ProviderNetworkError: Si falla la conexion con el proveedor.
+            ProviderDataError: Si la respuesta no tiene el formato esperado.
+        """
+
+    @abstractmethod
+    def get_task_totals(self) -> dict[str, int]:
+        """Devuelve los segundos acumulados de SIEMPRE, por tarea.
+
+        Al reves que ``get_daily_totals``, sin filtrar por dia: la clave es
+        el id de la tarea y el valor la suma de TODOS sus bloques
+        (``v_task_timer_totals.seconds_total``). Una tarea sin ningun
+        bloque nunca simplemente no tiene entrada -- el llamador trata la
+        ausencia como 0, no como fallo.
 
         Raises:
             ProviderAuthError: Si las credenciales son invalidas o caducaron.

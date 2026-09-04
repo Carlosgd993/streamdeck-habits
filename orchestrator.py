@@ -1,9 +1,10 @@
 #!/opt/streamdeck-habits/venv/bin/python
 """Punto de entrada del daemon: bucle de refresco que sincroniza los habitos
 (con objetivo y de solo registro), las tareas pendientes, las plantillas de
-creacion rapida y los cronometros (etiquetas rapidas + el que este corriendo)
-del proveedor con las teclas del Stream Deck, y gestiona la navegacion por
-menu, la paginacion y los pasos/deshaceres/cierres/creaciones/toggles al pulsar.
+creacion rapida y los cronometros (etiquetas rapidas + el que este corriendo +
+el total de hoy por tarea/etiqueta + el acumulado de siempre por tarea) del
+proveedor con las teclas del Stream Deck, y gestiona la navegacion por menu,
+la paginacion y los pasos/deshaceres/cierres/creaciones/toggles al pulsar.
 
 El orquestador depende solo de los puertos abstractos de ``provider.base``
 (interfaces ``HabitProvider``/``TaskProvider``/``TemplateProvider``/
@@ -142,6 +143,8 @@ def make_key_callback(
     templates_ref: dict[str, dict[str, Template]],
     timer_labels_ref: dict[str, dict[str, TimerLabel]],
     running_timer_ref: dict[str, RunningTimer | None],
+    daily_totals_ref: dict[str, dict[str, int]],
+    task_totals_ref: dict[str, dict[str, int]],
     last_timer_ref: dict[str, RunningTimer | None],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
@@ -270,6 +273,19 @@ def make_key_callback(
             (``core.screens.resolve_page`` lo necesita para decidir "Iniciar"
             vs "Detener" en el menu de opciones de una tarea, y para saber si
             el atajo de la tecla 7 del menu esta corriendo ahora mismo).
+        daily_totals_ref: Wrapper ``{"value": {id: segundos}}`` con los
+            segundos acumulados hoy del ultimo ``get_daily_totals()`` exitoso
+            (ver ``provider.base.TimerLabel.today_seconds``). Lo usa
+            ``on_key_change`` al resolver una pulsacion, igual que
+            ``running_timer_ref``: ``core.screens.resolve_page`` lo necesita
+            para pintar el total del dia en una tecla de cronometro parada
+            (vista "Cronometros" y atajo de la tecla 7).
+        task_totals_ref: Wrapper ``{"value": {id: segundos}}`` con los
+            segundos acumulados de SIEMPRE por tarea (sin filtrar por dia) del
+            ultimo ``get_task_totals()`` exitoso (ver
+            ``provider.base.Task.total_seconds``). Mismo uso que
+            ``daily_totals_ref``, pero para "Hoy"/"Tareas" en vez de
+            "Cronometros"/tecla 7.
         last_timer_ref: Wrapper ``{"value": RunningTimer | None}`` con el
             ultimo cronometro NO vacio visto (se actualiza en
             ``refresh_cycle``, nunca se pone a ``None`` salvo que
@@ -820,6 +836,8 @@ def make_key_callback(
                 log_habits_list,
                 timer_labels_list,
                 running_timer,
+                daily_totals_ref["value"],
+                task_totals_ref["value"],
                 last_timer_ref["value"],
                 mapping,
             )
@@ -861,6 +879,8 @@ def main() -> None:
     templates_ref: dict[str, dict[str, Template]] = {"value": {}}  # template_id -> Template, idem
     timer_labels_ref: dict[str, dict[str, TimerLabel]] = {"value": {}}  # label_id -> TimerLabel, idem
     running_timer_ref: dict[str, RunningTimer | None] = {"value": None}  # uno solo, no por id: a lo sumo uno corre
+    daily_totals_ref: dict[str, dict[str, int]] = {"value": {}}  # id tarea/etiqueta -> segundos acumulados hoy
+    task_totals_ref: dict[str, dict[str, int]] = {"value": {}}  # task_id -> segundos acumulados de siempre
     # Ultimo running_timer_ref["value"] NO vacio visto (atajo tecla 7 del
     # menu, ver core.screens.KEY_TIMER_SHORTCUT): se actualiza junto con
     # running_timer_ref en refresh_cycle, pero nunca se pone a None solo
@@ -877,6 +897,8 @@ def main() -> None:
     last_templates_code: str | None = None  # idem para plantillas
     last_timer_labels_code: str | None = None  # idem para etiquetas de cronometro
     last_running_timer_code: str | None = None  # idem para el cronometro en marcha (nunca se pinta en tecla, ver refresh_cycle)
+    last_daily_totals_code: str | None = None  # idem para los totales de hoy (tampoco se pinta en tecla, mismo motivo)
+    last_task_totals_code: str | None = None  # idem para los totales de siempre por tarea (tampoco se pinta)
     last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
 
     def _prune_stale_last_timer() -> None:
@@ -926,6 +948,8 @@ def main() -> None:
             list(log_habits_ref["value"].values()),
             list(timer_labels_ref["value"].values()),
             running_timer_ref["value"],
+            daily_totals_ref["value"],
+            task_totals_ref["value"],
             last_timer_ref["value"],
             mapping,
         )
@@ -971,6 +995,8 @@ def main() -> None:
                 templates_ref,
                 timer_labels_ref,
                 running_timer_ref,
+                daily_totals_ref,
+                task_totals_ref,
                 last_timer_ref,
                 screen,
                 screen_lock,
@@ -996,7 +1022,7 @@ def main() -> None:
 
     def _maybe_restore_project() -> None:
         """Si el ciclo que acaba de terminar trajo NET en cualquiera de las
-        seis lecturas, intenta reactivar el proyecto Supabase activo (ver
+        ocho lecturas, intenta reactivar el proyecto Supabase activo (ver
         ``provider.keepalive``): un NET persistente es el sintoma de un
         proyecto pausado por inactividad tanto como el de "sin red", y no
         hay forma de distinguirlos desde el propio checkin, asi que se
@@ -1017,6 +1043,8 @@ def main() -> None:
             last_templates_code,
             last_timer_labels_code,
             last_running_timer_code,
+            last_daily_totals_code,
+            last_task_totals_code,
         ):
             return
         now = time.monotonic()
@@ -1035,89 +1063,145 @@ def main() -> None:
 
         La llama el bucle principal cada ``REFRESH_SECONDS``, pero tambien el
         hilo de callbacks del deck: al entrar en una vista desde el menu
-        (``_enter_view``) y al deshacer un habito. Adquiere ``screen_lock``
-        ella misma, asi que solo puede llamarse SIN el lock ya adquirido.
+        (``_enter_view``) y al deshacer un habito, y ``_timer_sync`` cada
+        ``TIMER_SYNC_SECONDS`` mientras haya un cronometro corriendo.
+
+        Las ocho lecturas de red se hacen SIN sujetar ``screen_lock`` --
+        cada una puede tardar hasta 10s (timeout de ``provider/supabase.py``)
+        antes de fallar, y ``on_key_change`` necesita el mismo lock para
+        resolver una pulsacion: si el lock se sujetara mientras dura la red,
+        una tecla no respondería hasta que las ocho terminaran, y con
+        ``TIMER_SYNC_SECONDS`` = 60s esto se repetiria cada minuto entero
+        mientras un cronometro siguiera corriendo (se detecto asi: un
+        timeout de 10s en ``get_daily_totals`` y un fallo de DNS en
+        ``get_log_habits`` en el mismo arranque, cada uno dejando el deck sin
+        responder mientras duraba). Cada lectura sigue fallando por separado
+        en su propio ``try/except``, igual que antes -- el resultado (o el
+        codigo de error) se guarda en una variable local aqui fuera; solo se
+        aplica al estado compartido (``mapping``, cada ``*_ref``, cada
+        ``last_*_code``) dentro del ``with screen_lock`` de mas abajo, que es
+        sincrono y rapido (sin red) y por tanto apenas compite con una
+        pulsacion.
 
         Termina, ya sin el lock, intentando reactivar el proyecto Supabase si
         el ciclo trajo NET (``_maybe_restore_project``, ver su docstring).
         """
         nonlocal mapping
         nonlocal last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code
-        nonlocal last_timer_labels_code, last_running_timer_code
+        nonlocal last_timer_labels_code, last_running_timer_code, last_daily_totals_code, last_task_totals_code
+
+        habits = habits_code = None
+        try:
+            habits = habit_provider.get_habits()
+        except ProviderError as exc:
+            _, habits_code = health.classify(exc)
+            print(f"[{habits_code}] {CODES[habits_code]} (habitos): {exc}", flush=True)
+
+        # Los habitos de solo registro no usan el mapeo persistido de
+        # core.key_map: "Logs" pagina de cero cada vez (igual que
+        # "Hoy"/"Tareas"), y como nunca desaparecen de su propia lista eso ya
+        # les da tecla estable sin necesitar el fichero (ver
+        # core.screens._log_items).
+        log_habits = log_habits_code = None
+        try:
+            log_habits = habit_provider.get_log_habits()
+        except ProviderError as exc:
+            _, log_habits_code = health.classify(exc)
+            print(f"[{log_habits_code}] {CODES[log_habits_code]} (logs): {exc}", flush=True)
+
+        tasks = tasks_code = None
+        try:
+            tasks = task_provider.get_tasks()
+        except ProviderError as exc:
+            _, tasks_code = health.classify(exc)
+            print(f"[{tasks_code}] {CODES[tasks_code]} (tareas): {exc}", flush=True)
+
+        templates = templates_code = None
+        try:
+            templates = template_provider.get_templates()
+        except ProviderError as exc:
+            _, templates_code = health.classify(exc)
+            print(f"[{templates_code}] {CODES[templates_code]} (plantillas): {exc}", flush=True)
+
+        timer_labels = timer_labels_code = None
+        try:
+            timer_labels = timer_provider.get_timer_labels()
+        except ProviderError as exc:
+            _, timer_labels_code = health.classify(exc)
+            print(f"[{timer_labels_code}] {CODES[timer_labels_code]} (cronometros): {exc}", flush=True)
+
+        # A diferencia de las otras cinco lecturas anteriores (esta y los dos
+        # totales, justo debajo, tampoco se pintan en tecla), un fallo aqui
+        # NO se pinta en tecla (ver _paint_current_screen): se pierde solo
+        # el resaltado de "cual esta corriendo", pero el toggle sigue siendo
+        # correcto porque lo decide rpc/timer_toggle contra el estado real,
+        # no contra este valor cacheado.
+        running_timer_ok = False
+        running_timer = running_timer_code = None
+        try:
+            running_timer = timer_provider.get_running_timer()
+            running_timer_ok = True
+        except ProviderError as exc:
+            _, running_timer_code = health.classify(exc)
+            print(
+                f"[{running_timer_code}] {CODES[running_timer_code]} (cronometro activo): {exc}",
+                flush=True,
+            )
+
+        # Igual que running_timer: un fallo aqui NO se pinta en tecla (ver
+        # _paint_current_screen), solo se pierde el total del dia hasta el
+        # proximo ciclo con exito -- la tecla sigue mostrando el nombre solo,
+        # nunca un numero obsoleto (se conserva el dict del ciclo anterior).
+        daily_totals = daily_totals_code = None
+        try:
+            daily_totals = timer_provider.get_daily_totals()
+        except ProviderError as exc:
+            _, daily_totals_code = health.classify(exc)
+            print(
+                f"[{daily_totals_code}] {CODES[daily_totals_code]} (totales de hoy): {exc}",
+                flush=True,
+            )
+
+        # Mismo tratamiento que daily_totals justo encima: un fallo aqui
+        # tampoco se pinta en tecla, solo se pierde el acumulado de siempre
+        # hasta el proximo ciclo con exito.
+        task_totals = task_totals_code = None
+        try:
+            task_totals = timer_provider.get_task_totals()
+        except ProviderError as exc:
+            _, task_totals_code = health.classify(exc)
+            print(
+                f"[{task_totals_code}] {CODES[task_totals_code]} (totales de siempre): {exc}",
+                flush=True,
+            )
+
         with screen_lock:
-            # Las seis lecturas se hacen por separado y fallan por separado:
-            # un fallo leyendo tareas deja su codigo aparte y no toca los
-            # habitos ni las plantillas, y asi con cualquiera. La lectura que
-            # falla no toca su mapeo ni sus datos (se conservan los del ciclo
-            # anterior).
-            try:
-                habits = habit_provider.get_habits()
-            except ProviderError as exc:
-                _, last_habits_code = health.classify(exc)
-                print(f"[{last_habits_code}] {CODES[last_habits_code]} (habitos): {exc}", flush=True)
-            else:
-                last_habits_code = None
+            last_habits_code = habits_code
+            if habits_code is None:
                 mapping = key_map.update_mapping(habits, mapping)
                 habits_ref["value"] = {h.id: h for h in habits}
 
-            try:
-                # Los habitos de solo registro no usan el mapeo persistido de
-                # core.key_map: "Logs" pagina de cero cada vez (igual que
-                # "Hoy"/"Tareas"), y como nunca desaparecen de su propia lista
-                # eso ya les da tecla estable sin necesitar el fichero (ver
-                # core.screens._log_items).
-                log_habits = habit_provider.get_log_habits()
-            except ProviderError as exc:
-                _, last_log_habits_code = health.classify(exc)
-                print(f"[{last_log_habits_code}] {CODES[last_log_habits_code]} (logs): {exc}", flush=True)
-            else:
-                last_log_habits_code = None
+            last_log_habits_code = log_habits_code
+            if log_habits_code is None:
                 log_habits_ref["value"] = {h.id: h for h in log_habits}
 
-            try:
-                tasks = task_provider.get_tasks()
-            except ProviderError as exc:
-                _, last_tasks_code = health.classify(exc)
-                print(f"[{last_tasks_code}] {CODES[last_tasks_code]} (tareas): {exc}", flush=True)
-            else:
-                last_tasks_code = None
+            last_tasks_code = tasks_code
+            if tasks_code is None:
                 tasks_ref["value"] = {t.id: t for t in tasks}
                 if tasks:
                     print(f"{len(tasks)} tarea(s) pendientes", flush=True)
 
-            try:
-                templates = template_provider.get_templates()
-            except ProviderError as exc:
-                _, last_templates_code = health.classify(exc)
-                print(f"[{last_templates_code}] {CODES[last_templates_code]} (plantillas): {exc}", flush=True)
-            else:
-                last_templates_code = None
+            last_templates_code = templates_code
+            if templates_code is None:
                 templates_ref["value"] = {t.id: t for t in templates}
 
-            try:
-                timer_labels = timer_provider.get_timer_labels()
-            except ProviderError as exc:
-                _, last_timer_labels_code = health.classify(exc)
-                print(f"[{last_timer_labels_code}] {CODES[last_timer_labels_code]} (cronometros): {exc}", flush=True)
-            else:
-                last_timer_labels_code = None
+            last_timer_labels_code = timer_labels_code
+            if timer_labels_code is None:
                 timer_labels_ref["value"] = {tl.id: tl for tl in timer_labels}
 
-            try:
-                # A diferencia de las otras cinco lecturas, un fallo aqui NO
-                # se pinta en tecla (ver _paint_current_screen): se pierde
-                # solo el resaltado de "cual esta corriendo", pero el toggle
-                # sigue siendo correcto porque lo decide rpc/timer_toggle
-                # contra el estado real, no contra este valor cacheado.
-                running_timer_ref["value"] = timer_provider.get_running_timer()
-            except ProviderError as exc:
-                _, last_running_timer_code = health.classify(exc)
-                print(
-                    f"[{last_running_timer_code}] {CODES[last_running_timer_code]} (cronometro activo): {exc}",
-                    flush=True,
-                )
-            else:
-                last_running_timer_code = None
+            last_running_timer_code = running_timer_code
+            if running_timer_ok:
+                running_timer_ref["value"] = running_timer
                 if running_timer_ref["value"] is not None:
                     # last_timer_ref se queda con el ultimo valor NO vacio:
                     # nunca se pisa con None solo porque el cronometro pare
@@ -1125,6 +1209,14 @@ def main() -> None:
                     # core.screens.KEY_TIMER_SHORTCUT). Solo lo limpia
                     # _prune_stale_last_timer, en _paint_current_screen.
                     last_timer_ref["value"] = running_timer_ref["value"]
+
+            last_daily_totals_code = daily_totals_code
+            if daily_totals_code is None:
+                daily_totals_ref["value"] = daily_totals
+
+            last_task_totals_code = task_totals_code
+            if task_totals_code is None:
+                task_totals_ref["value"] = task_totals
 
             _paint_current_screen()
 

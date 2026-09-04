@@ -31,6 +31,8 @@ from deck.style import (
     COLOR_TASK_BY_PRIORITY,
     COLOR_TASK_SENDING,
     COLOR_TASK_SKIP,
+    COLOR_TASK_TIMER_BORDER,
+    COLOR_TASK_TIMER_BORDER_HIGH_PRIORITY,
     COLOR_TEMPLATE,
     COLOR_TEMPLATE_PENDING,
     COLOR_TEXT_ARROW,
@@ -65,6 +67,7 @@ from deck.style import (
     FONT_SIZE_TASK,
     FONT_SIZE_TEMPLATE,
     FONT_SIZE_TIMER,
+    TASK_TIMER_BORDER_WIDTH,
 )
 from provider.base import Habit, LogHabit, Task, Template, TimerLabel
 
@@ -163,15 +166,37 @@ def render_task(deck: Any, key: int, task: Task | None) -> None:
 
     El texto es ``task.display_label()`` (el titulo, ya recortado si era largo)
     y el emoji que llevara el titulo, si lo habia, se pinta aparte como icono a
-    color -- igual que en un habito.
+    color -- igual que en un habito. Si ``task.total_seconds`` (segundos
+    acumulados de SIEMPRE en su cronometro, sin filtrar por dia -- ver
+    ``provider.base.Task.total_seconds``) es mayor que 0, se antepone entre
+    corchetes (``_time_prefixed_label``, p.ej. ``"[00:25] Lectura"``); si
+    nunca se ha cronometrado esta tarea, la tecla se pinta igual que siempre.
+
+    Si ``task.timer_running`` (calculado por ``core.screens._mark_running_task``
+    cruzando contra ``RunningTimer``), se superpone un marco de aviso -- para
+    ver que esta tarea tiene el cronometro corriendo sin tener que abrir su
+    menu de opciones. ``COLOR_TASK_TIMER_BORDER`` (el mismo rosa que
+    "corriendo" en Cronometros) sobre blanco/verde/amarillo, pero
+    ``COLOR_TASK_TIMER_BORDER_HIGH_PRIORITY`` (blanco) en prioridad alta: ese
+    fondo ya es un rojo solido y el marco rosa se fundiria con el.
     """
     if task is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
     color = COLOR_TASK_BY_PRIORITY.get(task.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
     text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(task.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+    border_color = None
+    if task.timer_running:
+        border_color = COLOR_TASK_TIMER_BORDER_HIGH_PRIORITY if task.priority == 5 else COLOR_TASK_TIMER_BORDER
     image = text_tile(
-        deck, color, task.display_label(), text_color=text_color, font_size=FONT_SIZE_TASK, emoji=task.emoji
+        deck,
+        color,
+        _time_prefixed_label(task.total_seconds, task.display_label()),
+        text_color=text_color,
+        font_size=FONT_SIZE_TASK,
+        emoji=task.emoji,
+        border_color=border_color,
+        border_width=TASK_TIMER_BORDER_WIDTH,
     )
     deck.set_key_image(key, image)
 
@@ -206,11 +231,27 @@ def render_template(deck: Any, key: int, template: Template | None) -> None:
     deck.set_key_image(key, image)
 
 
+def _format_duration(total_seconds: int) -> str:
+    """``total_seconds`` como ``"mm:ss"``, o ``"h:mm"`` pasada la hora.
+
+    Formato compartido por ``_format_elapsed`` (tiempo transcurrido de un
+    cronometro corriendo) y ``_daily_total_label`` (total acumulado hoy de
+    uno parado) -- misma lectura en las dos pantallas, solo cambia de donde
+    sale el numero de segundos.
+    """
+    total_seconds = max(0, total_seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}:{minutes:02d}"
+    return f"{minutes:02d}:{seconds:02d}"
+
+
 def _format_elapsed(started_at_iso: str) -> str:
     """Tiempo transcurrido desde ``started_at_iso`` (ISO 8601 con offset, tal
-    cual lo da el proveedor) hasta ahora, como ``"mm:ss"`` o ``"h:mm"`` pasada
-    la hora. Recalculado en cada llamada -- nunca un contador que incrementa
-    en el cliente (ver ``provider.base.TimerLabel.started_at``). Es el unico
+    cual lo da el proveedor) hasta ahora (ver ``_format_duration``).
+    Recalculado en cada llamada -- nunca un contador que incrementa en el
+    cliente (ver ``provider.base.TimerLabel.started_at``). Es el unico
     calculo derivado de tiempo en todo el proyecto del lado del cliente,
     limitado a presentacion: no decide nada, solo se pinta.
 
@@ -224,12 +265,31 @@ def _format_elapsed(started_at_iso: str) -> str:
     except ValueError:
         return "--:--"
     elapsed = datetime.now(timezone.utc) - started.astimezone(timezone.utc)
-    total_seconds = max(0, int(elapsed.total_seconds()))
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}"
-    return f"{minutes:02d}:{seconds:02d}"
+    return _format_duration(int(elapsed.total_seconds()))
+
+
+def _time_prefixed_label(seconds: int, label: str) -> str:
+    """``label`` tal cual si ``seconds`` es 0 (nada acumulado todavia), o
+    ``"[total] label"`` si no -- una sola cadena, sin salto de linea forzado:
+    ``text_tile`` ya envuelve por ancho si no cabe entera. Comun a
+    ``_stopped_timer_label`` (total de HOY de una etiqueta/atajo parado) y
+    ``render_task`` (total de SIEMPRE de una tarea, sin importar el dia).
+    """
+    if seconds <= 0:
+        return label
+    return f"[{_format_duration(seconds)}] {label}"
+
+
+def _stopped_timer_label(timer: TimerLabel) -> str:
+    """Texto de una tecla de cronometro PARADA: el nombre solo si hoy no
+    tiene nada acumulado (``today_seconds`` en 0 -- p.ej. una etiqueta que
+    todavia no se ha usado hoy), o ``"[total] nombre"`` si si (ver
+    ``provider.base.TimerLabel.today_seconds``, calculado por
+    ``core.screens._timer_items``/``_timer_shortcut_item`` cruzando contra
+    ``TimerProvider.get_daily_totals()``). Lo usan ``render_timer`` (vista
+    "Cronometros") y ``render_timer_shortcut`` (atajo del menu, tecla 7).
+    """
+    return _time_prefixed_label(timer.today_seconds, timer.display_label())
 
 
 def _timer_running_image(deck: Any, timer: TimerLabel) -> bytes:
@@ -251,8 +311,9 @@ def render_timer(deck: Any, key: int, timer: TimerLabel | None) -> None:
     """Pinta una tecla de etiqueta de cronometro (vista "Cronometros").
 
     Corriendo, ver ``_timer_running_image``. Parado: fondo
-    ``COLOR_TIMER_STOPPED``, nombre + emoji, sin tiempo. El color es solo lo
-    ultimo que se supo -- el toggle real lo decide la base
+    ``COLOR_TIMER_STOPPED``, con ``_stopped_timer_label`` (nombre solo, o
+    ``"[total] nombre"`` si ya tiene algo acumulado hoy) + emoji. El color es
+    solo lo ultimo que se supo -- el toggle real lo decide la base
     (``rpc/timer_toggle``), igual que cualquier otra tecla del deck puede
     quedar desactualizada hasta el proximo refresco. Si ``timer`` es ``None``
     la tecla se pinta vacia.
@@ -266,7 +327,7 @@ def render_timer(deck: Any, key: int, timer: TimerLabel | None) -> None:
         image = text_tile(
             deck,
             COLOR_TIMER_STOPPED,
-            timer.display_label(),
+            _stopped_timer_label(timer),
             text_color=COLOR_TEXT_TIMER_STOPPED,
             font_size=FONT_SIZE_TIMER,
             emoji=timer.emoji,
@@ -286,6 +347,10 @@ def render_timer_shortcut(deck: Any, key: int, timer: TimerLabel) -> None:
     uso ninguno" -- usa ``COLOR_TIMER_SHORTCUT_IDLE`` (gris), NO
     ``COLOR_TIMER_STOPPED`` (turquesa): ese turquesa significa "listo para
     arrancar" en la vista "Cronometros", que no es lo que esta tecla ofrece.
+    El texto sale de ``_stopped_timer_label``, igual que ``render_timer``: si
+    lo recordado ya acumulo algo hoy, se ve el total (el aviso "Sin
+    cronometro" nunca lo tiene -- su ``today_seconds`` es siempre 0, ver
+    ``core.screens._timer_shortcut_item``).
     """
     if timer.running:
         image = _timer_running_image(deck, timer)
@@ -293,7 +358,7 @@ def render_timer_shortcut(deck: Any, key: int, timer: TimerLabel) -> None:
         image = text_tile(
             deck,
             COLOR_TIMER_SHORTCUT_IDLE,
-            timer.display_label(),
+            _stopped_timer_label(timer),
             text_color=COLOR_TEXT_TIMER_SHORTCUT_IDLE,
             font_size=FONT_SIZE_TIMER,
         )

@@ -370,28 +370,56 @@ TASK_OPTIONS_LAYOUT: dict[int, OptionEntry] = {
 
 
 # PageBuilder: (habitos, tareas, plantillas, habitos_log, etiquetas_timer,
-#   cronometro_corriendo, mapeo_habito->tecla, pagina)
+#   cronometro_corriendo, totales_de_hoy, totales_de_tarea, mapeo_habito->tecla,
+#   pagina)
 #   -> (habito_por_tecla, tarea_por_tecla, plantilla_por_tecla,
 #       etiqueta_timer_por_tecla, total_de_paginas)
 #
-# Todos los builders reciben los seis conjuntos de datos aunque casi ninguno
+# Todos los builders reciben los ocho conjuntos de datos aunque casi ninguno
 # los use enteros: es lo que permite que una vista nueva los cruce (p.ej.
 # "Crear" necesita las tareas para saber que plantillas ya tienen ocurrencia
-# abierta, y "Cronometros" necesita cronometro_corriendo para saber que
-# etiqueta resaltar). ``habitos_log`` (``LogHabit``) va aparte de ``habitos``
-# a proposito, igual que en ``HabitProvider``: ninguna vista existente los
-# esperaba mezclados con los habitos de objetivo (ver ``core.screens._log_items``).
-# Un LogHabit que acabe en una tecla cae igualmente en ``habito_por_tecla``:
-# ``_place_items`` reparte por ``isinstance(item.obj, Habit)``, y ``LogHabit``
-# es un ``Habit`` mas.
+# abierta, y "Cronometros" necesita cronometro_corriendo/totales_de_hoy para
+# saber que etiqueta resaltar y cuanto tiempo lleva hoy). ``habitos_log``
+# (``LogHabit``) va aparte de ``habitos`` a proposito, igual que en
+# ``HabitProvider``: ninguna vista existente los esperaba mezclados con los
+# habitos de objetivo (ver ``core.screens._log_items``). Un LogHabit que
+# acabe en una tecla cae igualmente en ``habito_por_tecla``: ``_place_items``
+# reparte por ``isinstance(item.obj, Habit)``, y ``LogHabit`` es un ``Habit``
+# mas. ``totales_de_hoy`` es ``TimerProvider.get_daily_totals()`` tal cual:
+# segundos acumulados hoy por id de tarea/etiqueta (ver
+# ``provider.base.TimerLabel.today_seconds``). ``totales_de_tarea`` es
+# ``TimerProvider.get_task_totals()`` tal cual: segundos acumulados de
+# SIEMPRE por id de tarea, sin filtrar por dia (ver
+# ``provider.base.Task.total_seconds``) -- solo lo usan "Hoy"/"Tareas".
 PageBuilder = Callable[
-    [list[Habit], list[Task], list[Template], list[Habit], list[TimerLabel], RunningTimer | None, dict[str, int], int],
+    [
+        list[Habit],
+        list[Task],
+        list[Template],
+        list[Habit],
+        list[TimerLabel],
+        RunningTimer | None,
+        dict[str, int],
+        dict[str, int],
+        dict[str, int],
+        int,
+    ],
     tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel], int],
 ]
 
 # La firma de la funcion de items que envuelve ``_flat_page_builder``.
 ItemsFn = Callable[
-    [list[Habit], list[Task], list[Template], list[Habit], list[TimerLabel], RunningTimer | None], list[ViewItem]
+    [
+        list[Habit],
+        list[Task],
+        list[Template],
+        list[Habit],
+        list[TimerLabel],
+        RunningTimer | None,
+        dict[str, int],
+        dict[str, int],
+    ],
+    list[ViewItem],
 ]
 
 
@@ -464,6 +492,8 @@ def _tiered_page_builder() -> PageBuilder:
         log_habits: list[Habit],
         timer_labels: list[TimerLabel],
         running_timer: RunningTimer | None,
+        daily_totals: dict[str, int],
+        task_totals: dict[str, int],
         habit_mapping: dict[str, int],
         page: int,
     ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel], int]:
@@ -497,16 +527,39 @@ def _flat_page_builder(items_fn: ItemsFn) -> PageBuilder:
         log_habits: list[Habit],
         timer_labels: list[TimerLabel],
         running_timer: RunningTimer | None,
+        daily_totals: dict[str, int],
+        task_totals: dict[str, int],
         habit_mapping: dict[str, int],
         page: int,
     ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel], int]:
         page_items, total_pages = paginate(
-            items_fn(habits, tasks, templates, log_habits, timer_labels, running_timer), page, PAGE_SIZE
+            items_fn(habits, tasks, templates, log_habits, timer_labels, running_timer, daily_totals, task_totals),
+            page,
+            PAGE_SIZE,
         )
         key_habit, key_task, key_template, key_timer = _place_items(page_items)
         return key_habit, key_task, key_template, key_timer, total_pages
 
     return build
+
+
+def _mark_running_task(
+    tasks: list[Task], running_timer: RunningTimer | None, task_totals: dict[str, int]
+) -> None:
+    """Marca ``Task.timer_running``/``total_seconds`` cruzando ``tasks`` con
+    ``running_timer``/``task_totals``, igual que ``_create_items`` marca
+    ``Template.has_pending`` o ``_timer_items`` marca ``TimerLabel.running``:
+    se muta el objeto antes de envolverlo en un ``ViewItem``, asi
+    ``deck.renderer.render_task`` no necesita saber nada de ``RunningTimer``
+    ni de ``TimerProvider.get_task_totals()``, solo mira la tarea que ya tiene.
+
+    La usan ``_today_items``/``_tasks_items`` -- las dos vistas que pintan
+    tareas como tecla -- no ``_create_items`` (plantillas, no tareas ya
+    creadas) ni ``_timer_items`` (etiquetas, no tareas)."""
+    running_task_id = running_timer.task_id if running_timer else ""
+    for task in tasks:
+        task.timer_running = bool(running_task_id) and task.id == running_task_id
+        task.total_seconds = task_totals.get(task.id, 0)
 
 
 def _today_items(
@@ -516,6 +569,8 @@ def _today_items(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
 ) -> list[ViewItem]:
     """Items de la vista "Hoy": habitos pendientes (sin los ya completados
     hoy -- ``is_done``, booleano marcado o cuantificable que alcanzo su
@@ -529,6 +584,7 @@ def _today_items(
     disponible, sin dejar hueco -- "Hoy" es la vista que se va vaciando
     durante el dia, no la que conserva la tecla de cada habito."""
     pending_habits = sorted((h for h in habits if not h.is_done), key=lambda h: (h.order, h.id))
+    _mark_running_task(tasks, running_timer, task_totals)
     return [ViewItem("habit", h) for h in pending_habits] + [ViewItem("task", t) for t in tasks]
 
 
@@ -539,9 +595,12 @@ def _tasks_items(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
 ) -> list[ViewItem]:
     """Items de la vista "Tareas": solo las tareas pendientes, en el orden que
     ya trae el proveedor."""
+    _mark_running_task(tasks, running_timer, task_totals)
     return [ViewItem("task", t) for t in tasks]
 
 
@@ -552,6 +611,8 @@ def _create_items(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
 ) -> list[ViewItem]:
     """Items de la vista "Crear": las plantillas de creacion rapida, todas, en
     el orden que trae el proveedor.
@@ -582,6 +643,8 @@ def _log_items(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
 ) -> list[ViewItem]:
     """Items de la vista "Logs": los habitos de solo registro (``LogHabit``),
     todos, ordenados por ``(order, id)`` -- mismo criterio que un reparto de
@@ -603,6 +666,8 @@ def _timer_items(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
 ) -> list[ViewItem]:
     """Items de la vista "Cronometros": las etiquetas rapidas, todas, en el
     orden que trae el proveedor (``sort_order``/``id``, mismo criterio que un
@@ -612,7 +677,11 @@ def _timer_items(
     contra ``running_timer`` (mutando ``running``/``started_at`` sobre cada
     ``TimerLabel``, igual que ``_create_items`` mutando ``has_pending`` en
     cada ``Template``) -- asi ``deck.renderer.render_timer`` no necesita saber
-    nada de ``RunningTimer``, solo mira el objeto que ya tiene.
+    nada de ``RunningTimer``, solo mira el objeto que ya tiene. Se cruza
+    tambien contra ``daily_totals`` (``today_seconds``, ver
+    ``provider.base.TimerLabel``): ``deck.renderer.render_timer`` solo lo
+    pinta si la etiqueta NO esta corriendo -- mientras corre ya se ve el
+    tiempo transcurrido de esta sesion.
 
     Igual que "Logs": una etiqueta no desaparece de esta lista salvo que se
     archive (fuera del alcance de este cliente), asi que paginar de cero cada
@@ -622,6 +691,7 @@ def _timer_items(
     for label in timer_labels:
         label.running = bool(running_label_id) and label.id == running_label_id
         label.started_at = running_timer.started_at if label.running else ""
+        label.today_seconds = daily_totals.get(label.id, 0)
     return [ViewItem("timer_label", tl) for tl in sorted(timer_labels, key=lambda t: (t.order, t.id))]
 
 
@@ -667,7 +737,9 @@ nada -- sin necesitar ningun caso especial en el pulsado."""
 _TIMER_SHORTCUT_EMPTY_LABEL = "Sin cronometro"
 
 
-def _timer_shortcut_item(last_timer: RunningTimer | None, running_timer: RunningTimer | None) -> TimerLabel:
+def _timer_shortcut_item(
+    last_timer: RunningTimer | None, running_timer: RunningTimer | None, daily_totals: dict[str, int]
+) -> TimerLabel:
     """Contenido de la tecla 7 del menu principal (``KEY_TIMER_SHORTCUT``):
     acceso directo al cronometro actual o al ultimo que se uso, para no tener
     que acordarse de que hay uno corriendo en segundo plano.
@@ -683,16 +755,21 @@ def _timer_shortcut_item(last_timer: RunningTimer | None, running_timer: Running
     y se decide correr/parado SOLO mirando si ``running_timer`` es ``None``:
     por construccion (ver ``orchestrator.refresh_cycle``), cuando hay un
     cronometro corriendo ``last_timer`` y ``running_timer`` son siempre el
-    mismo objeto, asi que no hace falta comparar sus ids.
+    mismo objeto, asi que no hace falta comparar sus ids. ``today_seconds``
+    sale de ``daily_totals`` por el mismo id -- igual que en "Cronometros"
+    (``_timer_items``), solo tiene efecto visible mientras esta parado (ver
+    ``deck.renderer.render_timer_shortcut``).
     """
     if last_timer is None:
         return TimerLabel(id=_TIMER_SHORTCUT_EMPTY_ID, name=_TIMER_SHORTCUT_EMPTY_LABEL)
     is_running = running_timer is not None
+    entity_id = last_timer.task_id or last_timer.label_id
     return TimerLabel(
-        id=last_timer.task_id or last_timer.label_id,
+        id=entity_id,
         name=clip_title(last_timer.title),
         running=is_running,
         started_at=last_timer.started_at if is_running else "",
+        today_seconds=daily_totals.get(entity_id, 0),
     )
 
 
@@ -766,6 +843,8 @@ def resolve_page(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
     last_timer: RunningTimer | None,
     habit_mapping: dict[str, int],
 ) -> ResolvedPage:
@@ -789,6 +868,16 @@ def resolve_page(
             esta corriendo, para decidir "Iniciar" vs "Detener") y el atajo
             de la tecla 7 del menu (para saber si lo que recuerda esta
             corriendo ahora mismo, ver ``_timer_shortcut_item``).
+        daily_totals: Segundos acumulados hoy por id de tarea/etiqueta, del
+            ultimo ``get_daily_totals()`` exitoso (``id -> segundos``, ausente
+            = 0). Lo usan "Cronometros" (``_timer_items``) y el atajo de la
+            tecla 7 (``_timer_shortcut_item``) para pintar el total del dia
+            en una tecla parada -- ver ``provider.base.TimerLabel.today_seconds``.
+        task_totals: Segundos acumulados de SIEMPRE por id de tarea (sin
+            filtrar por dia, al reves que ``daily_totals``), del ultimo
+            ``get_task_totals()`` exitoso. Solo lo usan "Hoy"/"Tareas"
+            (``_mark_running_task``) para pintar el acumulado historico en la
+            propia tecla de la tarea -- ver ``provider.base.Task.total_seconds``.
         last_timer: El ultimo cronometro no vacio visto por
             ``orchestrator`` (``last_timer_ref``, ver ahi mismo), o ``None``
             si no se ha usado ninguno todavia (o el que se recordaba dejo de
@@ -815,7 +904,9 @@ def resolve_page(
         # la pagina 0 -- reservarla en _nav_page ya la deja fuera de key_nav
         # en cualquier pagina, esto es solo lo que la rellena en la primera.
         key_timer_shortcut = (
-            {KEY_TIMER_SHORTCUT: _timer_shortcut_item(last_timer, running_timer)} if clamped_page == 0 else {}
+            {KEY_TIMER_SHORTCUT: _timer_shortcut_item(last_timer, running_timer, daily_totals)}
+            if clamped_page == 0
+            else {}
         )
         return ResolvedPage(
             key_nav=key_nav, key_timer_shortcut=key_timer_shortcut, page=clamped_page, total_pages=total_pages
@@ -874,7 +965,16 @@ def resolve_page(
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
     key_habit, key_task, key_template, key_timer, total_pages = spec.build_page(
-        habits, tasks, templates, log_habits, timer_labels, running_timer, habit_mapping, screen.page
+        habits,
+        tasks,
+        templates,
+        log_habits,
+        timer_labels,
+        running_timer,
+        daily_totals,
+        task_totals,
+        habit_mapping,
+        screen.page,
     )
     return ResolvedPage(
         key_habit=key_habit,

@@ -135,6 +135,19 @@ COLOR_TIMER_STOPPED = (55, 110, 130)
 COLOR_TEXT_TIMER_STOPPED = (255, 255, 255)
 FONT_SIZE_TIMER = 13
 
+# Borde que resalta una tarea (vista "Hoy"/"Tareas") cuyo cronometro esta
+# corriendo ahora mismo (ver deck.renderer.render_task/Task.timer_running):
+# para verlo sin tener que abrir su menu de opciones. Un marco, no un
+# relleno -- la tarea sigue pintandose con su color de prioridad de siempre.
+# Reutiliza COLOR_TIMER_RUNNING tal cual (mismo "esto esta corriendo" que en
+# Cronometros/tecla 7), SALVO sobre prioridad alta
+# (COLOR_TASK_BY_PRIORITY[5], un rojo ya solido): ahi un marco de este mismo
+# rosa/rojo se fundiria con el fondo, asi que se usa blanco -- ya es el color
+# de texto de esa misma tecla, no suma una familia de color nueva.
+TASK_TIMER_BORDER_WIDTH = 5
+COLOR_TASK_TIMER_BORDER = COLOR_TIMER_RUNNING
+COLOR_TASK_TIMER_BORDER_HIGH_PRIORITY = (255, 255, 255)
+
 # Atajo al cronometro actual en el menu principal (tecla 7, ver
 # core.screens.KEY_TIMER_SHORTCUT/deck.renderer.render_timer_shortcut).
 # Corriendo reutiliza COLOR_TIMER_RUNNING tal cual -- mismo significado.

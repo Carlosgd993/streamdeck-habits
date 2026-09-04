@@ -72,6 +72,8 @@ def text_tile(
     text_color: tuple[int, int, int] = (255, 255, 255),
     font_size: int | None = None,
     emoji: str = "",
+    border_color: tuple[int, int, int] | None = None,
+    border_width: int = 5,
 ) -> bytes:
     """Genera una imagen de tecla con texto centrado sobre un color.
 
@@ -89,6 +91,16 @@ def text_tile(
         font_size: Tamano de fuente; si es ``None`` usa la fuente por
             defecto de Pillow (pequena, para textos secundarios).
         emoji: Emoji a pintar como icono, o cadena vacia para no pintar ninguno.
+        border_color: Color RGB de un marco pegado al borde de la tecla, o
+            ``None`` para no pintar ninguno (el caso normal). Se dibuja
+            despues del texto/emoji, por encima -- al ser solo un contorno
+            (``border_width`` px hacia dentro) nunca tapa el contenido
+            central. Pensado para superponer una senal de estado (p.ej.
+            "esta tarea tiene el cronometro corriendo", ver
+            ``deck.renderer.render_task``) sin tocar el color de fondo que ya
+            significa otra cosa (la prioridad de la tarea).
+        border_width: Grosor del marco en pixeles. Sin efecto si
+            ``border_color`` es ``None``.
 
     Returns:
         La imagen en el formato nativo que espera ``set_key_image``.
@@ -104,25 +116,30 @@ def text_tile(
             image.paste(glyph, ((w - icon_size) // 2, 2), glyph)
             emoji_h = icon_size + 2
 
-    if not text:
-        return PILHelper.to_native_format(deck, image)
+    if text:
+        draw = ImageDraw.Draw(image)
+        if font_size is None:
+            font = ImageFont.load_default()
+            wrap_width = 10
+            line_h = 12
+        else:
+            font = ImageFont.load_default(size=font_size)
+            wrap_width = max(4, round(110 / font_size))
+            line_h = round(font_size * 1.15)
+        lines = textwrap.wrap(text, width=wrap_width)
+        total_h = len(lines) * line_h
+        available_h = h - emoji_h
+        y = emoji_h + max(0, (available_h - total_h) // 2)
+        for line in lines:
+            bbox = draw.textbbox((0, 0), line, font=font)
+            line_w = bbox[2] - bbox[0]
+            draw.text(((w - line_w) // 2, y), line, font=font, fill=text_color)
+            y += line_h
 
-    draw = ImageDraw.Draw(image)
-    if font_size is None:
-        font = ImageFont.load_default()
-        wrap_width = 10
-        line_h = 12
-    else:
-        font = ImageFont.load_default(size=font_size)
-        wrap_width = max(4, round(110 / font_size))
-        line_h = round(font_size * 1.15)
-    lines = textwrap.wrap(text, width=wrap_width)
-    total_h = len(lines) * line_h
-    available_h = h - emoji_h
-    y = emoji_h + max(0, (available_h - total_h) // 2)
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=font)
-        line_w = bbox[2] - bbox[0]
-        draw.text(((w - line_w) // 2, y), line, font=font, fill=text_color)
-        y += line_h
+    if border_color is not None:
+        inset = border_width // 2
+        ImageDraw.Draw(image).rectangle(
+            [inset, inset, w - 1 - inset, h - 1 - inset], outline=border_color, width=border_width
+        )
+
     return PILHelper.to_native_format(deck, image)
