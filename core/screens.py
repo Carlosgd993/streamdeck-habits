@@ -641,9 +641,60 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
     MenuEntry(VIEWS["create"].menu_label, VIEWS["create"].menu_emoji, "select_view", view_id="create"),
     MenuEntry(VIEWS["logs"].menu_label, VIEWS["logs"].menu_emoji, "select_view", view_id="logs"),
-    MenuEntry(VIEWS["timers"].menu_label, VIEWS["timers"].menu_emoji, "select_view", view_id="timers"),
+    # Tecla fija 8, junto al atajo de cronometro fijo en la 7 (ver
+    # KEY_TIMER_SHORTCUT/_timer_shortcut_item): las dos van pegadas a
+    # proposito, la vista completa al lado de su acceso directo.
+    MenuEntry(VIEWS["timers"].menu_label, VIEWS["timers"].menu_emoji, "select_view", view_id="timers", key=8),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
+
+KEY_TIMER_SHORTCUT = 7
+"""Tecla fija del menu principal para el atajo al cronometro (ver
+``_timer_shortcut_item``): reservada solo en ``ScreenKind.MENU``, junto a la
+tecla 8 fija de "Cronometros" (``MENU_ENTRIES``) -- no es un ``MenuEntry``
+(no navega a ninguna vista, alterna un cronometro), asi que se excluye del
+reparto automatico via ``reserved_keys`` en vez de ocupar una entrada."""
+
+_TIMER_SHORTCUT_EMPTY_ID = "__timer_shortcut_empty__"
+"""Id que nunca coincide con una tarea/etiqueta real (ver
+``provider.base.TimerLabel``/``TimerProvider``): lo que pinta la tecla 7
+cuando ``last_timer`` es ``None`` (nunca se ha usado ningun cronometro desde
+que arranco el daemon, o el que se recordaba ya no existe -- ver
+``orchestrator._prune_stale_last_timer``). Pulsarla no encuentra tarea ni
+etiqueta con ese id (``orchestrator.press_timer_toggle``), asi que no hace
+nada -- sin necesitar ningun caso especial en el pulsado."""
+
+_TIMER_SHORTCUT_EMPTY_LABEL = "Sin cronometro"
+
+
+def _timer_shortcut_item(last_timer: RunningTimer | None, running_timer: RunningTimer | None) -> TimerLabel:
+    """Contenido de la tecla 7 del menu principal (``KEY_TIMER_SHORTCUT``):
+    acceso directo al cronometro actual o al ultimo que se uso, para no tener
+    que acordarse de que hay uno corriendo en segundo plano.
+
+    Devuelve siempre un ``TimerLabel`` (nunca ``None``): si ``last_timer`` es
+    ``None`` -- nunca se ha usado un cronometro desde que arranco el daemon,
+    o el que se recordaba ya no existe y ``orchestrator._prune_stale_last_timer``
+    lo olvido -- se pinta un aviso fijo ("Sin cronometro", id que no coincide
+    con nada real) en vez de dejar la tecla vacia.
+
+    Si no, se reutiliza el titulo/started_at de ``last_timer`` (ya
+    denormalizado, sin emoji -- ver ``provider.supabase.build_running_timer``)
+    y se decide correr/parado SOLO mirando si ``running_timer`` es ``None``:
+    por construccion (ver ``orchestrator.refresh_cycle``), cuando hay un
+    cronometro corriendo ``last_timer`` y ``running_timer`` son siempre el
+    mismo objeto, asi que no hace falta comparar sus ids.
+    """
+    if last_timer is None:
+        return TimerLabel(id=_TIMER_SHORTCUT_EMPTY_ID, name=_TIMER_SHORTCUT_EMPTY_LABEL)
+    is_running = running_timer is not None
+    return TimerLabel(
+        id=last_timer.task_id or last_timer.label_id,
+        name=clip_title(last_timer.title),
+        running=is_running,
+        started_at=last_timer.started_at if is_running else "",
+    )
+
 
 # "Suspender" va antes que "Apagar" a proposito: la accion reversible se queda
 # con la tecla mas accesible y la irreversible no hereda la posicion de la que
@@ -663,6 +714,13 @@ class ResolvedPage:
     key_task: dict[int, Task] = field(default_factory=dict)
     key_template: dict[int, Template] = field(default_factory=dict)
     key_timer: dict[int, TimerLabel] = field(default_factory=dict)
+    # Solo lo rellena ScreenKind.MENU, en KEY_TIMER_SHORTCUT (ver
+    # _timer_shortcut_item): aparte de key_timer (las etiquetas de la vista
+    # "Cronometros") porque su pintado es distinto -- gris de "en espera" en
+    # vez de turquesa de "parado, listo para arrancar" (ver
+    # deck.renderer.render_timer_shortcut) -- aunque el objeto sea el mismo
+    # tipo, TimerLabel.
+    key_timer_shortcut: dict[int, TimerLabel] = field(default_factory=dict)
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
     key_numeric: dict[int, NumericKey] = field(default_factory=dict)
     key_standby: dict[int, StandbyKey] = field(default_factory=dict)
@@ -675,8 +733,16 @@ def _clamp_page(page: int, total_pages: int) -> int:
     return max(0, min(page, total_pages - 1))
 
 
-def _nav_page(entries: list[MenuEntry], page: int) -> tuple[dict[int, MenuEntry], int]:
+def _nav_page(
+    entries: list[MenuEntry], page: int, reserved_keys: frozenset[int] = frozenset()
+) -> tuple[dict[int, MenuEntry], int]:
     """Reparte ``entries`` entre las teclas de la pagina.
+
+    ``reserved_keys`` se excluye del reparto automatico igual que una tecla
+    fija (``MenuEntry.key``), pero sin ocupar ninguna entrada: la usa
+    ``ScreenKind.MENU`` para reservar ``KEY_TIMER_SHORTCUT``, que no es un
+    ``MenuEntry`` (ver ``resolve_page``). ``ScreenKind.SYSTEM`` la deja vacia,
+    sin reservar nada.
 
     Las que traen ``key`` fijo (ver ``MenuEntry.key``) van siempre ahi, y solo
     en la pagina 0; el resto se reparte por las teclas restantes en el orden
@@ -684,7 +750,7 @@ def _nav_page(entries: list[MenuEntry], page: int) -> tuple[dict[int, MenuEntry]
     """
     fixed = {entry.key: entry for entry in entries if entry.key is not None}
     auto_entries = [entry for entry in entries if entry.key is None]
-    free_keys = [key for key in AVAILABLE_KEYS if key not in fixed]
+    free_keys = [key for key in AVAILABLE_KEYS if key not in fixed and key not in reserved_keys]
     auto_page, total_pages = paginate(auto_entries, page, len(free_keys))
     key_nav = dict(zip(free_keys, auto_page, strict=False))
     if page == 0:
@@ -700,6 +766,7 @@ def resolve_page(
     log_habits: list[Habit],
     timer_labels: list[TimerLabel],
     running_timer: RunningTimer | None,
+    last_timer: RunningTimer | None,
     habit_mapping: dict[str, int],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
@@ -719,7 +786,15 @@ def resolve_page(
         running_timer: El cronometro en marcha ahora mismo (o ``None``) del
             ultimo ``get_running_timer()`` exitoso. Lo usan tanto "Cronometros"
             (que etiqueta resaltar) como el menu de opciones de una tarea (si
-            esta corriendo, para decidir "Iniciar" vs "Detener").
+            esta corriendo, para decidir "Iniciar" vs "Detener") y el atajo
+            de la tecla 7 del menu (para saber si lo que recuerda esta
+            corriendo ahora mismo, ver ``_timer_shortcut_item``).
+        last_timer: El ultimo cronometro no vacio visto por
+            ``orchestrator`` (``last_timer_ref``, ver ahi mismo), o ``None``
+            si no se ha usado ninguno todavia (o el que se recordaba dejo de
+            existir y se olvido, ver ``orchestrator._prune_stale_last_timer``).
+            Solo lo usa ``ScreenKind.MENU`` para la tecla 7
+            (``KEY_TIMER_SHORTCUT``).
         habit_mapping: Mapeo persistido habito -> tecla vigente.
 
     Returns:
@@ -734,8 +809,17 @@ def resolve_page(
         key_standby = {key: STANDBY_LAYOUT.get(key, _STANDBY_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_standby=key_standby, page=0, total_pages=1)
     if screen.kind is ScreenKind.MENU:
-        key_nav, total_pages = _nav_page(MENU_ENTRIES, screen.page)
-        return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
+        key_nav, total_pages = _nav_page(MENU_ENTRIES, screen.page, reserved_keys=frozenset({KEY_TIMER_SHORTCUT}))
+        clamped_page = _clamp_page(screen.page, total_pages)
+        # KEY_TIMER_SHORTCUT, como las teclas fijas de MENU_ENTRIES, solo en
+        # la pagina 0 -- reservarla en _nav_page ya la deja fuera de key_nav
+        # en cualquier pagina, esto es solo lo que la rellena en la primera.
+        key_timer_shortcut = (
+            {KEY_TIMER_SHORTCUT: _timer_shortcut_item(last_timer, running_timer)} if clamped_page == 0 else {}
+        )
+        return ResolvedPage(
+            key_nav=key_nav, key_timer_shortcut=key_timer_shortcut, page=clamped_page, total_pages=total_pages
+        )
     if screen.kind is ScreenKind.SYSTEM:
         key_nav, total_pages = _nav_page(SYSTEM_ENTRIES, screen.page)
         return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
@@ -946,6 +1030,13 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
         return PressAction("page_prev" if key == KEY_PAGE_PREV else "page_next")
 
     if screen.kind in (ScreenKind.MENU, ScreenKind.SYSTEM):
+        # Comprobado antes que key_nav (que en SYSTEM siempre esta vacio, asi
+        # que aqui no cambia nada): KEY_TIMER_SHORTCUT no es un MenuEntry, y
+        # el atajo generico de key_timer al final de esta funcion nunca se
+        # alcanza para MENU/SYSTEM porque este bloque ya devuelve antes.
+        shortcut = page.key_timer_shortcut.get(key)
+        if shortcut is not None:
+            return PressAction("timer_toggle", shortcut.id)
         entry = page.key_nav.get(key)
         if entry is None:
             return PressAction("noop")

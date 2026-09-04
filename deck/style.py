@@ -135,6 +135,18 @@ COLOR_TIMER_STOPPED = (55, 110, 130)
 COLOR_TEXT_TIMER_STOPPED = (255, 255, 255)
 FONT_SIZE_TIMER = 13
 
+# Atajo al cronometro actual en el menu principal (tecla 7, ver
+# core.screens.KEY_TIMER_SHORTCUT/deck.renderer.render_timer_shortcut).
+# Corriendo reutiliza COLOR_TIMER_RUNNING tal cual -- mismo significado.
+# Parado/en espera usa un gris propio, NO COLOR_TIMER_STOPPED: aqui "parado"
+# no significa "listo para arrancar" (como en la vista "Cronometros"), sino
+# "recordando el ultimo, a la espera de que lo reactives" -- y tambien es el
+# color del aviso "Sin cronometro" cuando no hay ningun recuerdo todavia.
+# Mas claro que COLOR_HABIT_DONE (casi negro): aqui la tecla si tiene algo
+# que decir (un titulo, o el aviso), no es "ya esta, ignorala".
+COLOR_TIMER_SHORTCUT_IDLE = (90, 90, 90)
+COLOR_TEXT_TIMER_SHORTCUT_IDLE = (220, 220, 220)
+
 # --- Stand by ---------------------------------------------------------------
 # La pantalla de suspension se ve con el brillo al minimo
 # (``deck.session.BRIGHTNESS_STANDBY``), asi que aqui no se busca contraste

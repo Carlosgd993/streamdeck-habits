@@ -142,6 +142,7 @@ def make_key_callback(
     templates_ref: dict[str, dict[str, Template]],
     timer_labels_ref: dict[str, dict[str, TimerLabel]],
     running_timer_ref: dict[str, RunningTimer | None],
+    last_timer_ref: dict[str, RunningTimer | None],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     reset_idle_timers: Callable[[], None],
@@ -188,8 +189,10 @@ def make_key_callback(
       ``instantiate_task`` no es idempotente. Ese gris sale solo de la tarea
       insertada, ver ``core.screens._create_items``, y ``core.screens`` ya
       devuelve "noop" en ese caso, asi que aqui no hay nada que comprobar.
-    - **Etiqueta de cronometro** (vista "Cronometros") o la opcion "Iniciar/
-      Detener cronometro" del menu de una tarea: ambas resuelven al mismo
+    - **Etiqueta de cronometro** (vista "Cronometros"), la opcion "Iniciar/
+      Detener cronometro" del menu de una tarea, o el **atajo de la tecla 7
+      del menu principal** (``core.screens.KEY_TIMER_SHORTCUT``, junto a
+      "Cronometros" fija en la 8): las tres resuelven al mismo
       ``PressAction("timer_toggle", item_id)`` (ver
       ``core.screens.resolve_press``), asi que las ejecuta el mismo
       ``press_timer_toggle`` sea cual sea el origen. Nunca mutacion
@@ -209,7 +212,14 @@ def make_key_callback(
       calculando el tiempo transcurrido en el cliente a partir del
       ``started_at`` ya cacheado (sin refetch), y otro relee de verdad
       ``get_running_timer()`` cada minuto (``config.TIMER_SYNC_SECONDS``)
-      para corregir esa cuenta local.
+      para corregir esa cuenta local. La tecla 7 en concreto pinta
+      ``last_timer_ref`` (el ultimo cronometro no vacio visto, corriendo o
+      no -- ver ``main()``): si al pulsarla la tarea/etiqueta que recordaba
+      ya no existe (completada, omitida, archivada -- carrera rara, lo
+      normal es que ``_prune_stale_last_timer`` ya la haya limpiado antes de
+      que la vieras), ``press_timer_toggle`` lo detecta, olvida
+      ``last_timer_ref`` y repinta: la tecla vuelve sola al aviso "Sin
+      cronometro" en vez de quedarse pulsable sin hacer nada.
     - **Mantener pulsado un habito o una tarea**: las tres pulsaciones de
       arriba (paso/deshacer de habito, cierre de tarea) ya no se ejecutan al
       presionar, sino al **soltar** -- ver ``on_key_change`` mas abajo. Al
@@ -258,7 +268,16 @@ def make_key_callback(
             con el cronometro en marcha del ultimo ``get_running_timer()``
             exitoso. Lo usa ``on_key_change`` al resolver una pulsacion
             (``core.screens.resolve_page`` lo necesita para decidir "Iniciar"
-            vs "Detener" en el menu de opciones de una tarea).
+            vs "Detener" en el menu de opciones de una tarea, y para saber si
+            el atajo de la tecla 7 del menu esta corriendo ahora mismo).
+        last_timer_ref: Wrapper ``{"value": RunningTimer | None}`` con el
+            ultimo cronometro NO vacio visto (se actualiza en
+            ``refresh_cycle``, nunca se pone a ``None`` salvo que
+            ``_prune_stale_last_timer`` detecte que ya no existe): a
+            diferencia de ``running_timer_ref``, sobrevive a que el
+            cronometro pare. Solo lo usa ``core.screens.resolve_page`` para
+            la tecla 7 del menu (``KEY_TIMER_SHORTCUT``) -- ver su docstring
+            y el de ``_prune_stale_last_timer``.
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
@@ -411,6 +430,32 @@ def make_key_callback(
             _safe_render(exit_numeric_entry)
             print(f"Entrada manual OK: {habit.name} -> {new_value}", flush=True)
 
+    def _clear_running_timer_if_task(task_id: str) -> None:
+        """Si ``running_timer_ref`` es justo el cronometro de ``task_id``, lo
+        pone a ``None`` -- reflejando localmente lo que ``complete_task``/
+        ``skip_task`` ya hicieron en el mismo commit en la base (paran
+        cualquier cronometro abierto de esa tarea antes de cerrarla, ver
+        ``habits-core``): sin este aviso, ``running_timer_ref`` seguiria
+        diciendo "corriendo" hasta el proximo refresco real (hasta
+        ``TIMER_SYNC_SECONDS`` si habia un cronometro corriendo, o
+        ``REFRESH_SECONDS`` si no), y mientras tanto la tecla 7 del menu (y
+        "Cronometros"/la opcion de la tarea, si siguieras viendola) seguiria
+        en rosa como si el cronometro no se hubiera parado.
+
+        Llamarlo SIEMPRE que se cierre/omita una tarea (tenga o no cronometro
+        propio) es barato -- un chequeo de identidad -- y no toca nada si esa
+        tarea no era la que estaba corriendo. La llaman ``press_task`` y
+        ``press_task_skip``, antes del repintado optimista: el siguiente
+        ``_paint_current_screen`` (via ``repaint``/``exit_item_options``) ya
+        llama a ``_prune_stale_last_timer``, que con ``running_timer_ref`` a
+        ``None`` puede entonces limpiar tambien ``last_timer_ref`` si la
+        tarea ya no esta en ``tasks_ref`` -- la tecla 7 vuelve a "Sin
+        cronometro" en el mismo repintado, no en el siguiente ciclo.
+        """
+        running = running_timer_ref["value"]
+        if running is not None and running.task_id == task_id:
+            running_timer_ref["value"] = None
+
     def press_task(deck: Any, key: int, task_id: str) -> None:
         task = tasks_ref["value"].get(task_id)
         if task is None:
@@ -428,6 +473,7 @@ def make_key_callback(
             # quita de tasks_ref para que otra pulsacion no reintente cerrarla,
             # y se repinta la pantalla entera para que lo que quede se recoloque.
             tasks_ref["value"].pop(task_id, None)
+            _clear_running_timer_if_task(task_id)
             _safe_render(repaint)
             print(f"Tarea completada: {task.title}", flush=True)
 
@@ -469,6 +515,7 @@ def make_key_callback(
             # pulsacion no reintente omitirla, y exit_item_options repinta la
             # vista de origen ya sin ella (se recoloca sin dejar hueco).
             tasks_ref["value"].pop(task_id, None)
+            _clear_running_timer_if_task(task_id)
             _safe_render(exit_item_options)
             print(f"Tarea omitida: {task.title}", flush=True)
 
@@ -609,7 +656,8 @@ def make_key_callback(
         ``item_id`` sirve para las dos, asi que primero se busca en
         ``tasks_ref`` (llega aqui desde el menu de opciones de una tarea) y,
         si no esta, en ``timer_labels_ref`` (llega desde una tecla de
-        "Cronometros"), mismo patron que ``press_habit`` mirando dos ``*_ref``.
+        "Cronometros" o del atajo de la tecla 7 del menu), mismo patron que
+        ``press_habit`` mirando dos ``*_ref``.
 
         Nunca mutacion optimista: ``rpc/timer_toggle`` puede parar un
         cronometro DISTINTO del que se pulso (el que estuviera corriendo
@@ -630,7 +678,19 @@ def make_key_callback(
         task = tasks_ref["value"].get(item_id)
         label = None if task is not None else timer_labels_ref["value"].get(item_id)
         if task is None and label is None:
-            return  # tarea/etiqueta desaparecida entre ciclos: se ignora
+            # No es una tarea/etiqueta viva. El caso normal es el sentinel de
+            # core.screens._TIMER_SHORTCUT_EMPTY_ID (tecla 7 en "Sin
+            # cronometro": no hace nada, a proposito). El caso raro es una
+            # carrera con _prune_stale_last_timer: si item_id es justo lo que
+            # recordaba last_timer_ref, lo olvida y repinta para que la
+            # tecla 7 vuelva sola al aviso, en vez de quedarse pulsable sin
+            # hacer nada -- sin llamar al proveedor, no hubo ninguna
+            # mutacion que deshacer, un repintado local basta.
+            last = last_timer_ref["value"]
+            if last is not None and item_id and item_id in (last.task_id, last.label_id):
+                last_timer_ref["value"] = None
+                _safe_render(repaint)
+            return
         what = task.title if task is not None else label.name
         try:
             if task is not None:
@@ -760,6 +820,7 @@ def make_key_callback(
                 log_habits_list,
                 timer_labels_list,
                 running_timer,
+                last_timer_ref["value"],
                 mapping,
             )
             action = screens.resolve_press(screen, key, resolved)
@@ -800,6 +861,13 @@ def main() -> None:
     templates_ref: dict[str, dict[str, Template]] = {"value": {}}  # template_id -> Template, idem
     timer_labels_ref: dict[str, dict[str, TimerLabel]] = {"value": {}}  # label_id -> TimerLabel, idem
     running_timer_ref: dict[str, RunningTimer | None] = {"value": None}  # uno solo, no por id: a lo sumo uno corre
+    # Ultimo running_timer_ref["value"] NO vacio visto (atajo tecla 7 del
+    # menu, ver core.screens.KEY_TIMER_SHORTCUT): se actualiza junto con
+    # running_timer_ref en refresh_cycle, pero nunca se pone a None solo
+    # porque el cronometro pare -- solo _prune_stale_last_timer lo hace, y
+    # solo si la tarea/etiqueta que recordaba ya no existe. Arranca vacio: el
+    # daemon no sabe que corria antes de este arranque.
+    last_timer_ref: dict[str, RunningTimer | None] = {"value": None}
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
@@ -811,6 +879,36 @@ def main() -> None:
     last_running_timer_code: str | None = None  # idem para el cronometro en marcha (nunca se pinta en tecla, ver refresh_cycle)
     last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
 
+    def _prune_stale_last_timer() -> None:
+        """Si ``last_timer_ref`` recuerda una tarea ya completada/omitida o
+        una etiqueta ya archivada (o borrada), la olvida: la tecla 7 del
+        menu vuelve sola al aviso "Sin cronometro" en el siguiente
+        repintado, sin esperar a que alguien la pulse (ver
+        ``core.screens.KEY_TIMER_SHORTCUT``/``_timer_shortcut_item``).
+
+        Se llama al PRINCIPIO de todo repintado (``_paint_current_screen``),
+        no solo dentro de ``refresh_cycle``: completar/omitir una tarea desde
+        el propio deck (``press_task``/``press_task_skip``) solo repinta con
+        mutacion optimista local, sin pasar por ``refresh_cycle`` -- si esta
+        comprobacion viviera solo alli, la tecla 7 podria seguir enseñando el
+        titulo de una tarea ya cerrada hasta el proximo refresco (hasta 15
+        min). Aqui se comprueba contra lo que haya en ``tasks_ref``/
+        ``timer_labels_ref`` EN ESE MOMENTO, frescos o no -- si la ultima
+        lectura fallo y se conserva la anterior, como mucho se retrasa la
+        limpieza al proximo ciclo que si tenga exito, nunca se limpia de mas.
+
+        No toca nada si lo recordado es justo lo que esta corriendo ahora
+        (comparacion por identidad, ver ``refresh_cycle``): eso lo decide
+        siempre ``running_timer_ref``, nunca esta poda.
+        """
+        last = last_timer_ref["value"]
+        if last is None or last is running_timer_ref["value"]:
+            return
+        if last.task_id and last.task_id not in tasks_ref["value"]:
+            last_timer_ref["value"] = None
+        elif last.label_id and last.label_id not in timer_labels_ref["value"]:
+            last_timer_ref["value"] = None
+
     def _paint_current_screen() -> None:
         """Resuelve la pantalla activa contra los datos vigentes, la pinta y
         re-registra el callback de tecla.
@@ -818,6 +916,7 @@ def main() -> None:
         PRECONDICION: se llama siempre con ``screen_lock`` ya adquirido por
         el llamador (nunca lo adquiere el mismo).
         """
+        _prune_stale_last_timer()
         deck = session.deck
         resolved = screens.resolve_page(
             screen,
@@ -827,6 +926,7 @@ def main() -> None:
             list(log_habits_ref["value"].values()),
             list(timer_labels_ref["value"].values()),
             running_timer_ref["value"],
+            last_timer_ref["value"],
             mapping,
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
@@ -871,6 +971,7 @@ def main() -> None:
                 templates_ref,
                 timer_labels_ref,
                 running_timer_ref,
+                last_timer_ref,
                 screen,
                 screen_lock,
                 _reset_idle_timers,
@@ -1017,6 +1118,13 @@ def main() -> None:
                 )
             else:
                 last_running_timer_code = None
+                if running_timer_ref["value"] is not None:
+                    # last_timer_ref se queda con el ultimo valor NO vacio:
+                    # nunca se pisa con None solo porque el cronometro pare
+                    # (eso es lo que permite el atajo de la tecla 7, ver
+                    # core.screens.KEY_TIMER_SHORTCUT). Solo lo limpia
+                    # _prune_stale_last_timer, en _paint_current_screen.
+                    last_timer_ref["value"] = running_timer_ref["value"]
 
             _paint_current_screen()
 

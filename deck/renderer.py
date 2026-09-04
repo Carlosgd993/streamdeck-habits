@@ -51,8 +51,10 @@ from deck.style import (
     COLOR_TEXT_TEMPLATE,
     COLOR_TEXT_TEMPLATE_PENDING,
     COLOR_TEXT_TIMER_RUNNING,
+    COLOR_TEXT_TIMER_SHORTCUT_IDLE,
     COLOR_TEXT_TIMER_STOPPED,
     COLOR_TIMER_RUNNING,
+    COLOR_TIMER_SHORTCUT_IDLE,
     COLOR_TIMER_STOPPED,
     FONT_SIZE_HABIT_PENDING,
     FONT_SIZE_NAV,
@@ -230,32 +232,70 @@ def _format_elapsed(started_at_iso: str) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 
-def render_timer(deck: Any, key: int, timer: TimerLabel | None) -> None:
-    """Pinta una tecla de etiqueta de cronometro (vista "Cronometros").
-
-    Corriendo (``timer.running``): fondo ``COLOR_TIMER_RUNNING``, el nombre
+def _timer_running_image(deck: Any, timer: TimerLabel) -> bytes:
+    """Imagen compartida de "corriendo": ``COLOR_TIMER_RUNNING``, el nombre
     arriba y el tiempo transcurrido debajo entre corchetes (p.ej.
     ``"nombre\\n[00:05]"``) -- para no tener que recordar cual esta activo,
     saberlo al leer la tecla. Sin emoji: con dos lineas ya no cabe comodo, y
-    el nombre solo ya identifica la etiqueta. El tiempo se recalcula en cada
-    repintado a partir de ``timer.started_at`` (ver ``_format_elapsed``,
-    ``config.TIMER_TICK_SECONDS``). Parado: fondo ``COLOR_TIMER_STOPPED``,
-    nombre + emoji, sin tiempo. El color es solo lo ultimo que se supo -- el
-    toggle real lo decide la base (``rpc/timer_toggle``), igual que
-    cualquier otra tecla del deck puede quedar desactualizada hasta el
-    proximo refresco. Si ``timer`` es ``None`` la tecla se pinta vacia.
+    el nombre solo ya identifica la etiqueta/tarea. El tiempo se recalcula en
+    cada llamada a partir de ``timer.started_at`` (ver ``_format_elapsed``,
+    ``config.TIMER_TICK_SECONDS``). La usan ``render_timer`` (vista
+    "Cronometros") y ``render_timer_shortcut`` (atajo del menu, tecla 7):
+    corriendo se ve igual en los dos sitios, solo cambia el color de parado.
+    """
+    label = f"{timer.display_label()}\n[{_format_elapsed(timer.started_at)}]"
+    return text_tile(deck, COLOR_TIMER_RUNNING, label, text_color=COLOR_TEXT_TIMER_RUNNING, font_size=FONT_SIZE_TIMER)
+
+
+def render_timer(deck: Any, key: int, timer: TimerLabel | None) -> None:
+    """Pinta una tecla de etiqueta de cronometro (vista "Cronometros").
+
+    Corriendo, ver ``_timer_running_image``. Parado: fondo
+    ``COLOR_TIMER_STOPPED``, nombre + emoji, sin tiempo. El color es solo lo
+    ultimo que se supo -- el toggle real lo decide la base
+    (``rpc/timer_toggle``), igual que cualquier otra tecla del deck puede
+    quedar desactualizada hasta el proximo refresco. Si ``timer`` es ``None``
+    la tecla se pinta vacia.
     """
     if timer is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
     if timer.running:
-        color, text_color = COLOR_TIMER_RUNNING, COLOR_TEXT_TIMER_RUNNING
-        label = f"{timer.display_label()}\n[{_format_elapsed(timer.started_at)}]"
-        image = text_tile(deck, color, label, text_color=text_color, font_size=FONT_SIZE_TIMER)
+        image = _timer_running_image(deck, timer)
     else:
-        color, text_color = COLOR_TIMER_STOPPED, COLOR_TEXT_TIMER_STOPPED
         image = text_tile(
-            deck, color, timer.display_label(), text_color=text_color, font_size=FONT_SIZE_TIMER, emoji=timer.emoji
+            deck,
+            COLOR_TIMER_STOPPED,
+            timer.display_label(),
+            text_color=COLOR_TEXT_TIMER_STOPPED,
+            font_size=FONT_SIZE_TIMER,
+            emoji=timer.emoji,
+        )
+    deck.set_key_image(key, image)
+
+
+def render_timer_shortcut(deck: Any, key: int, timer: TimerLabel) -> None:
+    """Pinta la tecla 7 del menu principal (``core.screens.KEY_TIMER_SHORTCUT``):
+    atajo al cronometro actual o al ultimo usado, para no olvidar que hay uno
+    corriendo en segundo plano. ``timer`` nunca es ``None`` (a diferencia de
+    ``render_timer``): ``core.screens._timer_shortcut_item`` siempre devuelve
+    algo, aunque sea el aviso "Sin cronometro".
+
+    Corriendo, se ve identico a la vista "Cronometros" (``_timer_running_image``).
+    Parado -- que aqui significa "recordando el ultimo, en espera" o "nunca se
+    uso ninguno" -- usa ``COLOR_TIMER_SHORTCUT_IDLE`` (gris), NO
+    ``COLOR_TIMER_STOPPED`` (turquesa): ese turquesa significa "listo para
+    arrancar" en la vista "Cronometros", que no es lo que esta tecla ofrece.
+    """
+    if timer.running:
+        image = _timer_running_image(deck, timer)
+    else:
+        image = text_tile(
+            deck,
+            COLOR_TIMER_SHORTCUT_IDLE,
+            timer.display_label(),
+            text_color=COLOR_TEXT_TIMER_SHORTCUT_IDLE,
+            font_size=FONT_SIZE_TIMER,
         )
     deck.set_key_image(key, image)
 
@@ -457,8 +497,9 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
     Cada tecla se resuelve en orden: stand by, teclado numerico y menu de
     opciones primero (cada uno cubre las 15 y van antes porque ahi 0/5/10 no
     son menu/paginacion), luego menu (fija), flecha de paginacion o neutra,
-    entrada de menu/sistema, habito, tarea, plantilla, etiqueta de cronometro
-    y, si no es nada de eso, vacia.
+    entrada de menu/sistema, habito, tarea, plantilla, etiqueta de cronometro,
+    atajo de cronometro del menu (tecla 7, ``ScreenKind.MENU`` unicamente) y,
+    si no es nada de eso, vacia.
     ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
@@ -487,6 +528,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
             render_template(deck, key, resolved.key_template[key])
         elif key in resolved.key_timer:
             render_timer(deck, key, resolved.key_timer[key])
+        elif key in resolved.key_timer_shortcut:
+            render_timer_shortcut(deck, key, resolved.key_timer_shortcut[key])
         else:
             render_empty(deck, key)
 
