@@ -962,7 +962,7 @@ def main() -> None:
         # core/screens.py que los conoce, y una vista nueva tiene que decidir
         # explicitamente que codigos le afectan.
         is_view = screen.kind is screens.ScreenKind.VIEW
-        if last_habits_code is not None and is_view and screen.view_id in ("today", "habits"):
+        if last_habits_code is not None and is_view and screen.view_id in ("today", "habits", "mornings"):
             code = last_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
         if last_log_habits_code is not None and is_view and screen.view_id == "logs":

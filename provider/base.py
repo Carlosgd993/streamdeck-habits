@@ -75,6 +75,12 @@ class Habit(ABC):
             (``HabitProvider.set_value``). Solo tiene sentido en un habito
             cuantificable; vive en la clase base para que ``core.screens``
             pueda leerlo sin ``isinstance``, igual que ``goal``/``is_done``.
+        section_name: Nombre de la seccion (``habit_sections.name`` en la
+            base) a la que pertenece el habito, o cadena vacia si no tiene
+            seccion asignada. Vive en la clase base (no solo en
+            ``BooleanHabit``/``RealHabit``) para que una vista filtrada por
+            seccion (ver ``core.screens``) pueda leerlo sin ``isinstance``,
+            igual que ``manual_entry``.
     """
 
     def __init__(
@@ -85,6 +91,7 @@ class Habit(ABC):
         order: int = 0,
         current_value: float = 0.0,
         manual_entry: bool = False,
+        section_name: str = "",
     ) -> None:
         self.id = id
         self.name = name
@@ -92,6 +99,7 @@ class Habit(ABC):
         self.order = order
         self.current_value = current_value
         self.manual_entry = manual_entry
+        self.section_name = section_name
 
     @property
     def goal(self) -> float:
@@ -140,8 +148,9 @@ class RealHabit(Habit):
         step: float = 1.0,
         unit: str = "",
         manual_entry: bool = False,
+        section_name: str = "",
     ) -> None:
-        super().__init__(id, name, emoji, order, current_value, manual_entry)
+        super().__init__(id, name, emoji, order, current_value, manual_entry, section_name)
         self._goal = goal
         self.step = step
         self.unit = unit

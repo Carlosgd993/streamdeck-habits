@@ -659,6 +659,42 @@ def _log_items(
     return [ViewItem("habit", h) for h in sorted(log_habits, key=lambda h: (h.order, h.id))]
 
 
+_MORNINGS_SECTION_NAME = "Mornings"
+"""Nombre de la seccion (``habit_sections.name`` en la base) que filtra la
+vista "Mornings" (ver ``_mornings_items``). Vive aqui, no en ``config.py``:
+es un literal propio de esta vista, mismo criterio que ``NUMERIC_KEYPAD``/
+``STANDBY_LAYOUT``. La seccion la crea y asigna el usuario a mano por SQL en
+``../habits-core`` (igual que ``task_templates.show_in_deck``); aqui no hay
+nada que migrar si cambia de nombre, solo tocar esta constante."""
+
+
+def _mornings_items(
+    habits: list[Habit],
+    tasks: list[Task],
+    templates: list[Template],
+    log_habits: list[Habit],
+    timer_labels: list[TimerLabel],
+    running_timer: RunningTimer | None,
+    daily_totals: dict[str, int],
+    task_totals: dict[str, int],
+) -> list[ViewItem]:
+    """Items de la vista "Mornings": los habitos con objetivo (``BooleanHabit``/
+    ``RealHabit``, los mismos que "Habitos") cuya ``section_name`` coincide con
+    ``_MORNINGS_SECTION_NAME``, todos -- sin filtrar por ``is_done``, al reves
+    que "Hoy" -- ordenados por ``(order, id)``.
+
+    Comparacion insensible a mayusculas/minusculas: no depende de que la
+    seccion se escriba exactamente igual en cada proyecto Supabase (produccion
+    y test pueden diferir en el capitalizado sin que esta vista se rompa).
+
+    Mismo criterio que "Logs"/"Cronometros": ningun habito desaparece de aqui
+    solo por completarse hoy (queda en gris), asi que paginar de cero cada
+    ciclo con ``_flat_page_builder`` ya da tecla estable sin necesitar el
+    mapeo persistido de ``core.key_map`` que usa "Habitos"."""
+    mornings = [h for h in habits if h.section_name.strip().lower() == _MORNINGS_SECTION_NAME.lower()]
+    return [ViewItem("habit", h) for h in sorted(mornings, key=lambda h: (h.order, h.id))]
+
+
 def _timer_items(
     habits: list[Habit],
     tasks: list[Task],
@@ -701,6 +737,9 @@ VIEWS: dict[str, ViewSpec] = {
     "tasks": ViewSpec("tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items)),
     "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
     "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items)),
+    # allows_undo=True replica el mismo comportamiento que "Habitos" (pulsar un
+    # booleano ya hecho lo deshace) para el subconjunto de la seccion Mornings.
+    "mornings": ViewSpec("mornings", "Mornings", "🌅", _flat_page_builder(_mornings_items), allows_undo=True),
     "timers": ViewSpec("timers", "Cronometros", "⏱️", _flat_page_builder(_timer_items)),
 }
 DEFAULT_VIEW_ID = "today"
@@ -711,6 +750,7 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
     MenuEntry(VIEWS["create"].menu_label, VIEWS["create"].menu_emoji, "select_view", view_id="create"),
     MenuEntry(VIEWS["logs"].menu_label, VIEWS["logs"].menu_emoji, "select_view", view_id="logs"),
+    MenuEntry(VIEWS["mornings"].menu_label, VIEWS["mornings"].menu_emoji, "select_view", view_id="mornings"),
     # Tecla fija 8, junto al atajo de cronometro fijo en la 7 (ver
     # KEY_TIMER_SHORTCUT/_timer_shortcut_item): las dos van pegadas a
     # proposito, la vista completa al lado de su acceso directo.

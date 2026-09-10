@@ -112,6 +112,7 @@ def build_habit(data: dict[str, Any]) -> Habit:
     emoji = _extract_emoji_icon(str(data.get("icon_res") or ""))
     order = int(data.get("sort_order") or 0)
     current_value = float(data.get("current_value") or 0.0)
+    section_name = str(data.get("section_name") or "")
 
     if data.get("type") == "Real":
         return RealHabit(
@@ -124,8 +125,11 @@ def build_habit(data: dict[str, Any]) -> Habit:
             step=float(data.get("step", 1.0)),
             unit=str(data.get("unit") or ""),
             manual_entry=bool(data.get("manual_entry", False)),
+            section_name=section_name,
         )
-    return BooleanHabit(id=id, name=name, emoji=emoji, order=order, current_value=current_value)
+    return BooleanHabit(
+        id=id, name=name, emoji=emoji, order=order, current_value=current_value, section_name=section_name
+    )
 
 
 def build_log_habit(data: dict[str, Any]) -> LogHabit:
@@ -313,7 +317,9 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
                 f"{self._base}/v_today_habits",
                 headers=self._headers(Accept="application/json"),
                 params={
-                    "select": "id,name,icon_res,type,goal,step,unit,manual_entry,sort_order,current_value",
+                    "select": (
+                        "id,name,icon_res,type,goal,step,unit,manual_entry,sort_order,current_value,section_name"
+                    ),
                     "order": "sort_order",
                 },
                 timeout=10,
