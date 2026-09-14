@@ -507,7 +507,13 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
     sin ``entry.emoji`` -- con dos lineas ya no cabe comodo -- mismo
     tratamiento que ``deck.renderer.render_timer``. Si no, se pinta
     ``entry.label`` ("Iniciar cronometro") con su emoji, en el tamano normal
-    de esta pantalla. Una tecla sin contenido se pinta vacia.
+    de esta pantalla. "toggle_pin" (solo en la pantalla de opciones de una
+    seccion, ``core.screens.ScreenKind.SECTION_OPTIONS``) reutiliza
+    ``COLOR_CONFIRM`` (verde, mismo significado que "OK": esto la anade) si la
+    seccion NO esta fijada todavia, o ``COLOR_NUMERIC_BACKSPACE`` (ambar,
+    mismo significado que "Deshacer"/"Borrar": esto la quita) si ya lo esta --
+    sin colores nuevos, los dos ya significan justo eso en el resto del deck.
+    Una tecla sin contenido se pinta vacia.
     """
     if entry.kind == "back":
         image = text_tile(
@@ -539,6 +545,13 @@ def render_option_entry(deck: Any, key: int, entry: OptionEntry) -> None:
     elif entry.kind in ("add_value", "add_step"):
         color = COLOR_HABIT_ADD if entry.amount >= 0 else COLOR_HABIT_SUBTRACT
         text_color = COLOR_TEXT_HABIT_ADD if entry.amount >= 0 else COLOR_TEXT_HABIT_SUBTRACT
+        image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_NAV, emoji=entry.emoji)
+    elif entry.kind == "toggle_pin":
+        color, text_color = (
+            (COLOR_NUMERIC_BACKSPACE, COLOR_TEXT_NUMERIC_BACKSPACE)
+            if entry.active
+            else (COLOR_CONFIRM, COLOR_TEXT_CONFIRM)
+        )
         image = text_tile(deck, color, entry.label, text_color=text_color, font_size=FONT_SIZE_NAV, emoji=entry.emoji)
     elif entry.kind == "timer":
         if entry.running:

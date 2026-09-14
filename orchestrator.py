@@ -25,6 +25,7 @@ from typing import Any
 
 import core.health as health
 import core.key_map as key_map
+import core.pinned_sections as pinned_sections_store
 import core.screens as screens
 import deck.keys as deck_keys
 import deck.renderer as renderer
@@ -146,6 +147,7 @@ def make_key_callback(
     daily_totals_ref: dict[str, dict[str, int]],
     task_totals_ref: dict[str, dict[str, int]],
     last_timer_ref: dict[str, RunningTimer | None],
+    pinned_sections: frozenset[str],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     reset_idle_timers: Callable[[], None],
@@ -155,6 +157,7 @@ def make_key_callback(
     exit_numeric_entry: Callable[[], None],
     enter_item_options: Callable[[str, str], None],
     exit_item_options: Callable[[], None],
+    enter_section_options: Callable[[str, screens.ScreenKind], None],
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el estado actual.
 
@@ -294,6 +297,13 @@ def make_key_callback(
             cronometro pare. Solo lo usa ``core.screens.resolve_page`` para
             la tecla 7 del menu (``KEY_TIMER_SHORTCUT``) -- ver su docstring
             y el de ``_prune_stale_last_timer``.
+        pinned_sections: Nombres de seccion (normalizados) fijados como boton
+            del menu principal (``core.pinned_sections``), vigentes para este
+            repintado. Se le pasa tal cual a ``core.screens.resolve_page`` en
+            ``on_key_change``, igual que ``mapping``: no es un wrapper
+            ``*_ref``, se recibe por valor y ya sale actualizado porque
+            ``_toggle_section_pin`` siempre repinta (recreando este closure)
+            justo despues de mutarlo.
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
@@ -322,6 +332,15 @@ def make_key_callback(
             repinta. La usan tanto "Volver" (via ``dispatch_navigation``) como
             un cambio de prioridad o un skip de tarea con exito (ver
             "task_set_priority"/"task_skip" mas abajo).
+        enter_section_options: Abre la pantalla de opciones de una seccion
+            (``ScreenKind.SECTION_OPTIONS``, ``section_name``, ``origin``)
+            sin tocar ``screen.page`` y repinta. ``origin`` es la pantalla
+            desde la que se mantuvo pulsado (``ScreenKind.SECTIONS_MENU`` o
+            ``ScreenKind.MENU``, ver ``core.pinned_sections``): se guarda en
+            ``ScreenState.entry_section_origin`` para que "Volver" regrese
+            ahi mismo (ver mas abajo, "Mantener pulsada una seccion"). La
+            dispara solo el temporizador de mantener pulsado, nunca una
+            pulsacion normal.
 
     Se suma un cuarto tipo de tecla, aparte de habito/tarea/plantilla:
 
@@ -390,6 +409,37 @@ def make_key_callback(
       lee de ``screen.entry_item_id``), reservadas con ``_claim``/``_release``
       por ese id, y en caso de fallo la tecla queda en rojo con el codigo sin
       salir del menu, para poder reintentar.
+    - **Mantener pulsada una seccion**, en las dos pantallas donde puede
+      aparecer un boton de seccion -- ``ScreenKind.SECTIONS_MENU`` (ver
+      ``core.screens.KEY_HABITS_SECTIONS_SHORTCUT``) y ``ScreenKind.MENU``
+      (un boton ya fijado, ver ``core.pinned_sections``): al igual que un
+      habito/tarea, la pulsacion tampoco se ejecuta al presionar -- se arma
+      el mismo temporizador de ``LONG_PRESS_SECONDS``. Soltar antes entra en
+      la seccion como de costumbre (``"enter_section"``, via
+      ``dispatch_navigation`` -> ``_enter_section``) en las dos pantallas por
+      igual; si dispara con la tecla aun pulsada, las dos abren
+      ``ScreenKind.SECTION_OPTIONS`` para esa seccion en concreto
+      (``enter_section_options``) -- **el mismo destino desde cualquiera de
+      las dos pantallas**, pero cada una recuerda de donde vino
+      (``on_key_change`` captura ``screen_kind`` al presionar, se guarda en
+      ``ScreenState.entry_section_origin``) para que "Volver" regrese
+      exactamente ahi, no siempre a "Secciones".
+
+      La pantalla de opciones de una seccion tiene una sola opcion real:
+      - **Fijar/quitar del menu principal** (tecla 14, verde/ambar segun el
+        estado -- ``OptionEntry.kind == "toggle_pin"``) -> alterna
+        ``core.pinned_sections`` (``_toggle_section_pin``). Es la UNICA
+        escritura del deck que no llama a ningun proveedor: es un fichero
+        local (``pinned_sections.json``), no puede fallar con un
+        ``ProviderError``, asi que no hay tecla en rojo que contemplar aqui.
+        No sale de ``SECTION_OPTIONS`` (a diferencia de "Skip"/"cambiar
+        prioridad"): se queda para que la etiqueta cambie delante del usuario
+        y se pueda alternar varias veces sin reabrir el menu, mismo criterio
+        que "Ajustar el progreso" de un habito real. Solo "Volver" (tecla 0,
+        ``"section_options_exit"``) saca de aqui, y vuelve a
+        ``screen.entry_section_origin`` -- "Secciones" o el menu principal,
+        segun por cual se llego (nunca a ``ScreenKind.VIEW``, a diferencia de
+        "Volver" en el menu de opciones de un habito/tarea).
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
@@ -722,7 +772,12 @@ def make_key_callback(
             refresh()
             print(f"Cronometro alternado: {what}", flush=True)
 
-    _HOLD_KINDS = ("habit", "habit_undo", "task")  # las unicas que distinguen corta de mantenida
+    _HOLD_KINDS = ("habit", "habit_undo", "task")  # las unicas que SIEMPRE distinguen corta de mantenida
+    # "enter_section" se arma aparte (ver on_key_change/_arm_hold): tambien
+    # distingue corta de mantenida, pero solo cuando se pulsa desde
+    # ScreenKind.SECTIONS_MENU o desde un boton ya fijado en ScreenKind.MENU --
+    # las dos abren ScreenKind.SECTION_OPTIONS al mantener pulsado, solo
+    # cambia a donde regresa despues "Volver" (ver ScreenState.entry_section_origin).
     _pending_hold: dict[int, tuple[screens.PressAction, threading.Timer]] = {}  # tecla -> (accion, temporizador)
     _hold_lock = threading.Lock()  # protege _pending_hold frente al hilo del temporizador
 
@@ -782,19 +837,31 @@ def make_key_callback(
         elif action.kind != "noop":
             dispatch_navigation(action)
 
-    def _arm_hold(deck: Any, key: int, action: screens.PressAction) -> None:
+    def _arm_hold(deck: Any, key: int, action: screens.PressAction, screen_kind: screens.ScreenKind) -> None:
         """Arma el temporizador de mantener pulsado para ``key``. Si dispara
         con la tecla todavia presionada, abre el menu de opciones en vez de
         ejecutar ``action``; si se suelta antes, ``on_key_change`` lo cancela
-        y ejecuta ``action`` como una pulsacion corta normal."""
+        y ejecuta ``action`` como una pulsacion corta normal.
+
+        ``screen_kind`` (la pantalla en la que se pulso, capturada por
+        ``on_key_change``) solo lo necesita ``"enter_section"``: la misma
+        accion sale tanto de una entrada de ``ScreenKind.SECTIONS_MENU`` como
+        de un boton ya fijado en ``ScreenKind.MENU``, y en los dos casos
+        mantener pulsado abre las opciones de ESA seccion en concreto -- pero
+        "Volver" debe regresar a la pantalla de origen, distinta segun cual
+        fuera (ver ``enter_section_options``/``ScreenState.
+        entry_section_origin``)."""
 
         def _on_hold_timeout() -> None:
             with _hold_lock:
                 entry = _pending_hold.pop(key, None)
             if entry is None:
                 return  # ya se solto antes de que disparara (pulsacion corta): nada que hacer
-            item_kind = "habit" if action.kind in ("habit", "habit_undo") else "task"
-            enter_item_options(item_kind, action.payload)
+            if action.kind == "enter_section":
+                enter_section_options(action.payload, screen_kind)
+            else:
+                item_kind = "habit" if action.kind in ("habit", "habit_undo") else "task"
+                enter_item_options(item_kind, action.payload)
 
         timer = threading.Timer(LONG_PRESS_SECONDS, _on_hold_timeout)
         timer.daemon = True
@@ -828,6 +895,7 @@ def make_key_callback(
             log_habits_list = list(log_habits_ref["value"].values())
             timer_labels_list = list(timer_labels_ref["value"].values())
             running_timer = running_timer_ref["value"]
+            screen_kind = screen.kind  # capturado aqui: decide si "enter_section" arma hold, ver mas abajo
             resolved = screens.resolve_page(
                 screen,
                 habits_list,
@@ -840,11 +908,20 @@ def make_key_callback(
                 task_totals_ref["value"],
                 last_timer_ref["value"],
                 mapping,
+                pinned_sections,
             )
             action = screens.resolve_press(screen, key, resolved)
 
-        if action.kind in _HOLD_KINDS:
-            _arm_hold(deck, key, action)
+        # "enter_section" arma hold tanto desde ScreenKind.SECTIONS_MENU como
+        # desde un boton ya fijado en ScreenKind.MENU: las dos abren las
+        # opciones de esa seccion (ver _arm_hold/enter_section_options) -- en
+        # cualquier otra pantalla no deberia poder producirse esta accion.
+        is_section_hold = action.kind == "enter_section" and screen_kind in (
+            screens.ScreenKind.SECTIONS_MENU,
+            screens.ScreenKind.MENU,
+        )
+        if action.kind in _HOLD_KINDS or is_section_hold:
+            _arm_hold(deck, key, action, screen_kind)
         else:
             _run_action(deck, key, action)
 
@@ -873,6 +950,10 @@ def main() -> None:
     session.open()
 
     mapping = key_map.load_map()
+    # Nombres de seccion (normalizados) fijados como boton del menu principal
+    # (ver core.pinned_sections/ScreenKind.SECTION_OPTIONS). Igual que mapping:
+    # variable simple, no un wrapper *_ref, mutada por nonlocal en _toggle_section_pin.
+    pinned_sections: frozenset[str] = pinned_sections_store.load()
     habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
     log_habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # idem para los LogHabit de get_log_habits()
     tasks_ref: dict[str, dict[str, Task]] = {"value": {}}  # task_id -> objeto Task, actualizado cada ciclo
@@ -952,6 +1033,7 @@ def main() -> None:
             task_totals_ref["value"],
             last_timer_ref["value"],
             mapping,
+            pinned_sections,
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
 
@@ -1006,6 +1088,7 @@ def main() -> None:
                 daily_totals_ref,
                 task_totals_ref,
                 last_timer_ref,
+                pinned_sections,
                 screen,
                 screen_lock,
                 _reset_idle_timers,
@@ -1015,6 +1098,7 @@ def main() -> None:
                 _exit_numeric_entry,
                 _enter_item_options,
                 _exit_item_options,
+                _enter_section_options,
             )
         )
 
@@ -1343,6 +1427,61 @@ def main() -> None:
             screen.kind = screens.ScreenKind.VIEW
             _paint_current_screen()
 
+    def _enter_section_options(section_name: str, origin: screens.ScreenKind) -> None:
+        """Abre la pantalla de opciones de ``section_name``
+        (``ScreenKind.SECTION_OPTIONS``), sin tocar ``screen.page``: es lo que
+        permite que "Volver" regrese exactamente a la misma pagina de la
+        pantalla de origen en la que estabas.
+
+        ``origin`` (``ScreenKind.SECTIONS_MENU`` o ``ScreenKind.MENU``, segun
+        desde cual de las dos se mantuvo pulsado un boton de seccion, ver
+        ``on_key_change``) se guarda en ``ScreenState.entry_section_origin``:
+        es lo que permite que "Volver" (``_exit_section_options``) regrese a
+        la pantalla correcta en vez de asumir siempre "Secciones" -- un boton
+        de seccion ya fijado en el menu principal tambien abre esta pantalla
+        al mantenerlo pulsado (no solo una entrada de "Secciones"). La
+        dispara solo el temporizador de mantener pulsado, nunca una pulsacion
+        normal."""
+        with screen_lock:
+            screen.kind = screens.ScreenKind.SECTION_OPTIONS
+            screen.entry_section_name = section_name
+            screen.entry_section_origin = origin
+            _paint_current_screen()
+
+    def _exit_section_options() -> None:
+        """Vuelve de la pantalla de opciones de una seccion a la pantalla
+        desde la que se abrio (``ScreenState.entry_section_origin``:
+        "Secciones" o el menu principal, nunca ``ScreenKind.VIEW`` -- a
+        diferencia de ``_exit_item_options``, aqui no hay ninguna vista de
+        origen a la que volver)."""
+        with screen_lock:
+            screen.kind = screen.entry_section_origin
+            _paint_current_screen()
+
+    def _toggle_section_pin() -> None:
+        """Alterna si la seccion abierta en ``ScreenKind.SECTION_OPTIONS``
+        aparece como boton fijo en el menu principal (``core.pinned_sections``).
+
+        A diferencia del resto de acciones que escriben algo (paso de habito,
+        cierre de tarea, cambio de prioridad...), esto NO llama a ningun
+        proveedor: es una escritura local a ``pinned_sections.json``, sin red,
+        que no puede fallar con un ``ProviderError`` -- por eso no pasa por
+        ``_claim``/``_release`` ni por el manejo de fallos de ``_run_action``,
+        y por eso ``_dispatch_navigation`` (no ``_run_action``) es quien la
+        ejecuta, junto al resto de navegacion pura.
+
+        Se queda en ``SECTION_OPTIONS`` tras el toggle (no vuelve a
+        "Secciones"): asi la etiqueta del boton cambia delante del usuario y
+        se puede alternar varias veces sin tener que reabrir el menu, mismo
+        criterio que "Ajustar el progreso" de un habito real
+        (``_press_habit_options_delta``)."""
+        nonlocal pinned_sections
+        with screen_lock:
+            section_name = screen.entry_section_name
+        pinned_sections = pinned_sections_store.toggle(section_name, pinned_sections)
+        with screen_lock:
+            _paint_current_screen()
+
     def _numeric_edit(kind: str, digit: str) -> None:
         """Muta ``ScreenState.entry_value`` (teclear un digito, el punto
         decimal o borrar) y repinta. Sin llamada de red, asi que no pasa por
@@ -1456,6 +1595,10 @@ def main() -> None:
             _numeric_edit("backspace", "")
         elif action.kind == "item_options_exit":
             _exit_item_options()
+        elif action.kind == "section_options_exit":
+            _exit_section_options()
+        elif action.kind == "toggle_section_pin":
+            _toggle_section_pin()
 
     # Dos plazos, el mismo disparador: cualquier pulsacion reprograma ambos.
     auto_return_timer = _IdleTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)

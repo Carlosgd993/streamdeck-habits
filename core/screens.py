@@ -30,8 +30,12 @@ seccion y "Volver" sigan funcionando sin cambios), resuelto por
 ``KEY_HABITS_SECTIONS_SHORTCUT`` (tecla 1 de "Habitos"), que abre el submenu
 "Secciones" (``ScreenKind.SECTIONS_MENU``, ``_section_menu_entries``) --
 cualquier seccion aparece ahi sola en cuanto algun habito la tenga asignada,
-sin tocar nada de este modulo. No hay entrada en el menu principal: es
-deliberado, para no duplicar el acceso.
+sin tocar nada de este modulo. Mantener pulsada una entrada de "Secciones"
+abre ``ScreenKind.SECTION_OPTIONS``, con un boton para fijarla/quitarla del
+menu principal (``_pinned_section_menu_entries``, ``core.pinned_sections`` --
+una preferencia local del deck, no un dato de ``../habits-core``): es la
+UNICA forma de que una seccion tenga entrada en el menu principal, deliberado
+para no duplicar el acceso por defecto.
 
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
@@ -60,6 +64,7 @@ class ScreenKind(Enum):
     STANDBY = auto()
     ITEM_OPTIONS = auto()
     SECTIONS_MENU = auto()
+    SECTION_OPTIONS = auto()
 
 
 @dataclass
@@ -102,6 +107,25 @@ class ScreenState:
             restaura la seccion solo, con el mismo mecanismo que ya usa
             cualquier otra vista (``_exit_item_options``/``_exit_numeric_entry``
             hacen ``screen.kind = ScreenKind.VIEW`` sin tocar nada mas).
+        entry_section_name: Nombre de la seccion sobre la que se abrio su
+            pantalla de opciones, solo si ``kind`` es
+            ``ScreenKind.SECTION_OPTIONS``. Campo propio, no compartido con
+            ``entry_item_id``: a diferencia de ``ITEM_OPTIONS`` (que siempre
+            vuelve a ``ScreenKind.VIEW``, ver ``_exit_item_options``), "Volver"
+            aqui tiene que volver a la pantalla de origen -- mezclar el campo
+            arriesgaria mezclar tambien el destino. Entrar aqui no toca
+            ``screen.page``: la pagina de la pantalla de origen (la lista
+            "Secciones" o el menu principal) queda intacta de propina.
+        entry_section_origin: Desde que pantalla se abrio
+            ``ScreenKind.SECTION_OPTIONS`` -- ``ScreenKind.SECTIONS_MENU``
+            (mantener pulsada una entrada de "Secciones") o
+            ``ScreenKind.MENU`` (mantener pulsado un boton de seccion ya
+            fijado en el menu principal, ver ``core.pinned_sections``). Solo
+            tiene sentido si ``kind`` es ``ScreenKind.SECTION_OPTIONS``:
+            ``orchestrator._exit_section_options`` vuelve exactamente aqui al
+            pulsar "Volver", en vez de asumir siempre "Secciones" -- las dos
+            pantallas pueden llevar a la misma sección, y cada una espera
+            volver a si misma.
     """
 
     kind: ScreenKind = ScreenKind.VIEW
@@ -112,6 +136,8 @@ class ScreenState:
     entry_item_kind: str = ""
     entry_item_id: str = ""
     section_name: str = ""
+    entry_section_name: str = ""
+    entry_section_origin: ScreenKind = ScreenKind.SECTIONS_MENU
 
 
 @dataclass(frozen=True)
@@ -279,7 +305,12 @@ class OptionEntry:
             ``"titulo\n[tiempo]"`` para no tener que recordar cual esta
             activo; si no, se pinta ``label`` ("Iniciar cronometro"). Lo
             decide ``resolve_page`` sobre una copia del layout, segun si esa
-            tarea es la que esta corriendo ahora mismo, ver ahi mismo) o
+            tarea es la que esta corriendo ahora mismo, ver ahi mismo),
+            "toggle_pin" (solo en la pantalla de opciones de una seccion, ver
+            ``ScreenKind.SECTION_OPTIONS``: alterna si esa seccion aparece
+            como boton fijo en el menu principal -- ``label`` ya trae "Fijar
+            en menu"/"Quitar del menu" segun el estado actual, decidido por
+            ``resolve_page`` contra ``pinned_sections``, ver ahi mismo) o
             "blank" (tecla vacia).
         label: Texto de la tecla.
         emoji: Icono a color, o cadena vacia.
@@ -300,6 +331,13 @@ class OptionEntry:
             tiempo transcurrido a partir de aqui en cada repintado -- nunca
             un contador que incrementa en el cliente, mismo criterio que
             ``provider.base.TimerLabel.started_at``.
+        active: Solo tiene sentido si ``kind`` es "toggle_pin": si ``True``,
+            la seccion ya esta fijada en el menu principal ahora mismo (la
+            tecla dice "Quitar del menu" y se pinta en ambar); si ``False``,
+            no lo esta ("Fijar en menu", verde) -- ver
+            ``deck.renderer.render_option_entry``. Campo generico (no
+            "running", que es especifico de "timer") por si una opcion
+            futura de tipo interruptor lo necesita.
     """
 
     kind: str
@@ -309,6 +347,7 @@ class OptionEntry:
     amount: float = 0.0
     running: bool = False
     started_at: str = ""
+    active: bool = False
 
 
 _ITEM_OPTIONS_BACK = OptionEntry("back", "Volver", "↩️")
@@ -708,10 +747,52 @@ def _section_menu_entries(habits: list[Habit]) -> list[MenuEntry]:
     (``v_today_habits`` ya filtra por ``is_due``). Ordenadas alfabeticamente
     (no hay ``sort_order`` de seccion expuesto al cliente).
 
-    Unico camino a una seccion, junto con el atajo fijo de la tecla 1 de
-    "Habitos" que abre este mismo submenu (ver ``KEY_HABITS_SECTIONS_SHORTCUT``):
-    no hay entrada de seccion en el menu principal."""
+    Sin emoji propio a proposito: una seccion no tiene icono en ``../habits-core``
+    (a diferencia de un habito), y marcar aqui las ya fijadas con un icono
+    generico (p.ej. "📌") se descarto -- con varias fijadas todas llevarian el
+    mismo icono, sin distinguirlas entre si ni aportar nada que el propio
+    menu principal (donde SI aparecen, ver ``_pinned_section_menu_entries``)
+    no diga ya.
+
+    Unico camino a una seccion (mantener pulsada una entrada aqui abre su
+    pantalla de opciones, ver ``ScreenKind.SECTION_OPTIONS``), junto con el
+    atajo fijo de la tecla 1 de "Habitos" que abre este mismo submenu (ver
+    ``KEY_HABITS_SECTIONS_SHORTCUT``): no hay entrada de seccion en el menu
+    principal salvo la que el propio usuario fije (ver
+    ``_pinned_section_menu_entries``)."""
     names = sorted({h.section_name.strip() for h in habits if h.section_name.strip()})
+    return [MenuEntry(name, "", "enter_section", section_name=name) for name in names]
+
+
+def _pinned_section_menu_entries(habits: list[Habit], pinned_sections: frozenset[str]) -> list[MenuEntry]:
+    """Botones fijos en el menu principal para las secciones marcadas como
+    favoritas desde su pantalla de opciones (``ScreenKind.SECTION_OPTIONS``,
+    tecla "Fijar en menu"/"Quitar del menu") -- alternativa dinamica y local
+    al deck a lo que antes era ``PINNED_SECTIONS`` (una constante en codigo
+    que exigia desplegar para cambiar).
+
+    Sin emoji a proposito (mismo motivo que ``_section_menu_entries``): una
+    seccion no tiene icono propio en ``../habits-core``, y forzar uno
+    generico (p.ej. "📌") en todas las fijadas las volveria indistinguibles
+    entre si con varias a la vez -- se mantiene el texto solo, como el resto
+    de entradas de "Secciones".
+
+    Solo se devuelve un boton por cada nombre de ``pinned_sections`` que siga
+    teniendo algun habito hoy (mismo criterio que ``_section_menu_entries``):
+    una seccion despinneada sola porque ya no tiene habitos no deja un boton
+    muerto en el menu. El nombre mostrado sale de ``habits`` (el mas fresco),
+    no del guardado en ``pinned_sections`` (normalizado, solo para comparar).
+
+    Se usa en la rama ``ScreenKind.MENU`` de ``resolve_page``, concatenada a
+    ``MENU_ENTRIES`` antes de repartir teclas con ``_nav_page`` -- que ya
+    pagina sola si no caben todas en la pagina 0, sin necesitar ningun cambio
+    ahi."""
+    by_key: dict[str, str] = {}
+    for h in habits:
+        name = h.section_name.strip()
+        if name:
+            by_key.setdefault(name.lower(), name)
+    names = sorted(by_key[key] for key in pinned_sections if key in by_key)
     return [MenuEntry(name, "", "enter_section", section_name=name) for name in names]
 
 
@@ -946,6 +1027,7 @@ def resolve_page(
     task_totals: dict[str, int],
     last_timer: RunningTimer | None,
     habit_mapping: dict[str, int],
+    pinned_sections: frozenset[str],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
 
@@ -984,6 +1066,14 @@ def resolve_page(
             Solo lo usa ``ScreenKind.MENU`` para la tecla 7
             (``KEY_TIMER_SHORTCUT``).
         habit_mapping: Mapeo persistido habito -> tecla vigente.
+        pinned_sections: Nombres de seccion (normalizados, ``strip().lower()``)
+            marcados como favoritos desde ``ScreenKind.SECTION_OPTIONS`` (ver
+            ``core.pinned_sections``). Los usa ``ScreenKind.MENU``
+            (``_pinned_section_menu_entries``, para anadir sus botones fijos)
+            y ``ScreenKind.SECTION_OPTIONS`` (para decidir la etiqueta "Fijar
+            en menu"/"Quitar del menu"). ``ScreenKind.SECTIONS_MENU`` no lo
+            necesita: esa lista no marca de ningun modo las ya fijadas (ver
+            ``_section_menu_entries``).
 
     Returns:
         La pagina resuelta, lista para pintar con ``deck.renderer.render_page``.
@@ -997,7 +1087,8 @@ def resolve_page(
         key_standby = {key: STANDBY_LAYOUT.get(key, _STANDBY_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_standby=key_standby, page=0, total_pages=1)
     if screen.kind is ScreenKind.MENU:
-        key_nav, total_pages = _nav_page(MENU_ENTRIES, screen.page, reserved_keys=frozenset({KEY_TIMER_SHORTCUT}))
+        entries = MENU_ENTRIES + _pinned_section_menu_entries(habits, pinned_sections)
+        key_nav, total_pages = _nav_page(entries, screen.page, reserved_keys=frozenset({KEY_TIMER_SHORTCUT}))
         clamped_page = _clamp_page(screen.page, total_pages)
         # KEY_TIMER_SHORTCUT, como las teclas fijas de MENU_ENTRIES, solo en
         # la pagina 0 -- reservarla en _nav_page ya la deja fuera de key_nav
@@ -1068,6 +1159,23 @@ def resolve_page(
         key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
+    if screen.kind is ScreenKind.SECTION_OPTIONS:
+        # Mismo patron que ITEM_OPTIONS (resuelve a las 15 teclas via
+        # key_options, reutilizando deck.renderer.render_option_entry sin
+        # tocar el renderer), pero pantalla propia: aqui "Volver" tiene que
+        # regresar a ScreenKind.SECTIONS_MENU, no a ScreenKind.VIEW, asi que
+        # no puede compartir el mecanismo generico de ITEM_OPTIONS (ver
+        # ScreenState.entry_section_name).
+        is_pinned = screen.entry_section_name.strip().lower() in pinned_sections
+        layout = {
+            KEY_MENU: _ITEM_OPTIONS_BACK,
+            14: OptionEntry(
+                "toggle_pin", "Quitar del menu" if is_pinned else "Fijar en menu", "📌", active=is_pinned
+            ),
+        }
+        key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
+        return ResolvedPage(key_options=key_options, page=0, total_pages=1)
+
     if screen.section_name:
         # screen.kind sigue siendo ScreenKind.VIEW: la seccion es un campo
         # mas de esa pantalla, no un ScreenKind propio (ver ScreenState.
@@ -1120,7 +1228,8 @@ class PressAction:
             "numeric_backspace" | "numeric_confirm" | "numeric_cancel" |
             "item_options_exit" | "task_set_priority" | "task_skip" |
             "habit_options_undo" | "habit_options_add_value" |
-            "habit_options_add_step" | "noop".
+            "habit_options_add_step" | "section_options_exit" |
+            "toggle_section_pin" | "noop".
         payload: Id del habito/tarea/plantilla/etiqueta-de-cronometro si
             ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
@@ -1143,8 +1252,10 @@ class PressAction:
             en el payload (leido de ``entry_item_id`` en ese momento, no
             despues), para compartir el mismo camino de ejecucion que cuando
             se pulsa directamente una tecla de "Cronometros" (que tambien
-            lleva id en el payload, como "task"/"template"). Vacio en el
-            resto.
+            lleva id en el payload, como "task"/"template"). "toggle_section_pin"
+            tampoco lleva payload: el nombre de la seccion se lee de
+            ``ScreenState.entry_section_name``, mismo patron que
+            "habit_options_undo"/"task_skip". Vacio en el resto.
     """
 
     kind: str
@@ -1259,6 +1370,20 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             # entry_item_id AQUI, no se deja para mas tarde.
             return PressAction("timer_toggle", screen.entry_item_id)
         return PressAction("item_options_exit")
+
+    if screen.kind is ScreenKind.SECTION_OPTIONS:
+        # Mismo patron que ITEM_OPTIONS justo arriba, pero con su propia
+        # salida: "Volver" aqui es "section_options_exit" (regresa a
+        # SECTIONS_MENU), no "item_options_exit" (regresa a VIEW).
+        entry = page.key_options.get(key)
+        if entry is None or entry.kind == "blank":
+            return PressAction("noop")
+        if entry.kind == "toggle_pin":
+            # Sin payload: el nombre de la seccion se lee de
+            # screen.entry_section_name en el momento de ejecutar, igual que
+            # "habit_options_undo"/"task_skip" leen entry_item_id.
+            return PressAction("toggle_section_pin")
+        return PressAction("section_options_exit")
 
     if key == KEY_MENU:
         if screen.kind is ScreenKind.MENU:

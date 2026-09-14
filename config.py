@@ -10,6 +10,7 @@ import os
 BASE_DIR = "/opt/streamdeck-habits"
 ENV_FILE = os.path.join(BASE_DIR, ".env")
 MAP_FILE = os.path.join(BASE_DIR, "habit_key_map.json")
+PINNED_SECTIONS_FILE = os.path.join(BASE_DIR, "pinned_sections.json")
 FAIL_LOG = os.path.join(BASE_DIR, "checkin_failures.log")
 DEVICE_LOG = os.path.join(BASE_DIR, "device_errors.log")
 
