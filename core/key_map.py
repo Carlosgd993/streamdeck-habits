@@ -34,7 +34,9 @@ def save_map(mapping: dict[str, int]) -> None:
         json.dump(mapping, f, indent=2)
 
 
-def update_mapping(habits: list[Habit], mapping: dict[str, int]) -> dict[str, int]:
+def update_mapping(
+    habits: list[Habit], mapping: dict[str, int], reserved_keys: frozenset[int] = frozenset()
+) -> dict[str, int]:
     """Reconcilia el mapeo habito -> tecla con la lista actual de habitos.
 
     Asigna la primera tecla libre a cada habito nuevo (nunca la reasigna) y
@@ -49,6 +51,11 @@ def update_mapping(habits: list[Habit], mapping: dict[str, int]) -> dict[str, in
     Args:
         habits: Habitos actuales devueltos por el proveedor.
         mapping: Mapeo actual habito -> tecla, modificado in situ.
+        reserved_keys: Teclas que nunca deben llevar un habito (p.ej.
+            ``core.screens.KEY_HABITS_SECTIONS_SHORTCUT``, el atajo fijo a
+            "Secciones" dentro de "Habitos"). Un habito que ya estuviera en
+            una de estas teclas (p.ej. porque la reserva es nueva) se libera
+            y se reparte de cero mas abajo, como si fuera un habito nuevo.
 
     Returns:
         El mismo ``mapping`` ya reconciliado.
@@ -62,8 +69,14 @@ def update_mapping(habits: list[Habit], mapping: dict[str, int]) -> dict[str, in
         changed = True
         print(f"Habito {hid} ya no existe, se libera la tecla {key}", flush=True)
 
+    evicted_ids = [hid for hid, key in mapping.items() if key in reserved_keys]
+    for hid in evicted_ids:
+        key = mapping.pop(hid)
+        changed = True
+        print(f"Habito {hid} liberaba la tecla reservada {key}, se reasigna", flush=True)
+
     used_keys = set(mapping.values())
-    free_keys = [k for k in AVAILABLE_KEYS if k not in used_keys]
+    free_keys = [k for k in AVAILABLE_KEYS if k not in used_keys and k not in reserved_keys]
 
     known_ids = set(mapping.keys())
     new_habits = [h for h in habits if h.id not in known_ids]

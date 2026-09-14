@@ -962,19 +962,27 @@ def main() -> None:
         # core/screens.py que los conoce, y una vista nueva tiene que decidir
         # explicitamente que codigos le afectan.
         is_view = screen.kind is screens.ScreenKind.VIEW
-        if last_habits_code is not None and is_view and screen.view_id in ("today", "habits", "mornings"):
+        # Una seccion (screen.section_name) tambien depende de get_habits(),
+        # igual que "Hoy"/"Habitos" -- ver core.screens.ScreenState.section_name.
+        # Mientras hay seccion activa, view_id queda con lo que hubiera antes
+        # de entrar (no se toca, ver orchestrator._enter_section) y NO debe
+        # consultarse para las otras cuatro comprobaciones: is_plain_view lo
+        # deja fuera, para no pintar por error un codigo de tareas/logs/
+        # plantillas/cronometros sobre una pantalla que no tiene nada de eso.
+        is_plain_view = is_view and not screen.section_name
+        if last_habits_code is not None and is_view and (screen.section_name or screen.view_id in ("today", "habits")):
             code = last_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
-        if last_log_habits_code is not None and is_view and screen.view_id == "logs":
+        if last_log_habits_code is not None and is_plain_view and screen.view_id == "logs":
             code = last_log_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
-        if last_tasks_code is not None and is_view and screen.view_id in ("today", "tasks"):
+        if last_tasks_code is not None and is_plain_view and screen.view_id in ("today", "tasks"):
             code = last_tasks_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_task.keys(), code))
-        if last_templates_code is not None and is_view and screen.view_id == "create":
+        if last_templates_code is not None and is_plain_view and screen.view_id == "create":
             code = last_templates_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_template.keys(), code))
-        if last_timer_labels_code is not None and is_view and screen.view_id == "timers":
+        if last_timer_labels_code is not None and is_plain_view and screen.view_id == "timers":
             # Solo el catalogo de etiquetas pinta rojo: sin el no hay nada que
             # ofrecer. Un fallo de get_running_timer() (last_running_timer_code)
             # NO se pinta aqui a proposito -- ver el comentario en refresh_cycle.
@@ -1178,7 +1186,9 @@ def main() -> None:
         with screen_lock:
             last_habits_code = habits_code
             if habits_code is None:
-                mapping = key_map.update_mapping(habits, mapping)
+                mapping = key_map.update_mapping(
+                    habits, mapping, reserved_keys=frozenset({screens.KEY_HABITS_SECTIONS_SHORTCUT})
+                )
                 habits_ref["value"] = {h.id: h for h in habits}
 
             last_log_habits_code = log_habits_code
@@ -1282,6 +1292,17 @@ def main() -> None:
             screen.kind, screen.page = screens.ScreenKind.SYSTEM, 0
             _paint_current_screen()
 
+    def _enter_sections_menu() -> None:
+        """Abre el submenu "Secciones" (``core.screens.ScreenKind.SECTIONS_MENU``).
+
+        Mismo patron que ``_enter_system``: pura navegacion, sin ``_claim`` ni
+        refetch -- la lista sale de los habitos ya cacheados
+        (``core.screens._section_menu_entries``), no hace falta pedir datos
+        frescos solo para abrir la lista."""
+        with screen_lock:
+            screen.kind, screen.page = screens.ScreenKind.SECTIONS_MENU, 0
+            _paint_current_screen()
+
     def _change_page(delta: int) -> None:
         with screen_lock:
             screen.page += delta
@@ -1340,12 +1361,36 @@ def main() -> None:
     def _enter_view(view_id: str) -> None:
         """Cambia a ``view_id`` en pagina 0 y fuerza un refresco completo
         (refetch + repintado): entrar en una vista desde el menu siempre
-        pide datos frescos antes de pintarla."""
+        pide datos frescos antes de pintarla.
+
+        Limpia ``section_name``: sin esto, entrar en "Hoy"/"Hábitos" desde el
+        menu tras haber visitado una seccion dejaria ese filtro puesto por
+        error (ver ``core.screens.ScreenState.section_name``)."""
         if not _claim(_NAV_SENTINEL):
             return  # ya hay una entrada a vista en vuelo (doble toque en el menu)
         try:
             with screen_lock:
                 screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, view_id, 0
+                screen.section_name = ""
+            refresh_cycle()
+        finally:
+            _release(_NAV_SENTINEL)
+
+    def _enter_section(section_name: str) -> None:
+        """Entra en la seccion ``section_name`` en pagina 0 y fuerza un
+        refresco completo, mismo patron que ``_enter_view``: pulsar una
+        entrada del submenu "Secciones" (tecla 1 de "Habitos") pide datos
+        frescos antes de pintar, igual que entrar en cualquier vista desde
+        el menu.
+
+        ``screen.view_id`` no se toca (queda con lo que hubiera antes): no se
+        consulta mientras ``section_name`` no este vacio (ver
+        ``core.screens.resolve_page``)."""
+        if not _claim(_NAV_SENTINEL):
+            return  # ya hay una entrada a vista/seccion en vuelo (doble toque)
+        try:
+            with screen_lock:
+                screen.kind, screen.section_name, screen.page = screens.ScreenKind.VIEW, section_name, 0
             refresh_cycle()
         finally:
             _release(_NAV_SENTINEL)
@@ -1369,10 +1414,12 @@ def main() -> None:
                 screen.kind is screens.ScreenKind.VIEW
                 and screen.view_id == screens.DEFAULT_VIEW_ID
                 and screen.page == 0
+                and not screen.section_name
             )
             if at_home:
                 return
             screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, screens.DEFAULT_VIEW_ID, 0
+            screen.section_name = ""
             _paint_current_screen()
 
     def _dispatch_navigation(action: screens.PressAction) -> None:
@@ -1381,8 +1428,12 @@ def main() -> None:
             _enter_menu()
         elif action.kind == "open_system":
             _enter_system()
+        elif action.kind == "open_sections":
+            _enter_sections_menu()
         elif action.kind == "select_view":
             _enter_view(action.payload)
+        elif action.kind == "enter_section":
+            _enter_section(action.payload)
         elif action.kind == "page_prev":
             _change_page(-1)
         elif action.kind == "page_next":

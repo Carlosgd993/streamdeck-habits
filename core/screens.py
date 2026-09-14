@@ -21,6 +21,18 @@ tarea (la duracion la mide ``orchestrator.make_key_callback``, este modulo
 solo describe la pantalla); y el stand by (``ScreenKind.STANDBY``), en el que
 el deck esta apagado y **cualquier** tecla se limita a despertarlo.
 
+Las secciones de habitos (``habit_sections``/``habits.section_id`` en
+``../habits-core``) son un caso aparte, ni vista registrada ni pantalla
+nueva: ``ScreenState.section_name`` es un campo mas de ``ScreenKind.VIEW``
+(no un ``ScreenKind`` propio, para que mantener pulsado un habito de una
+seccion y "Volver" sigan funcionando sin cambios), resuelto por
+``_section_page`` en vez de por ``VIEWS``. Se llega a traves de
+``KEY_HABITS_SECTIONS_SHORTCUT`` (tecla 1 de "Habitos"), que abre el submenu
+"Secciones" (``ScreenKind.SECTIONS_MENU``, ``_section_menu_entries``) --
+cualquier seccion aparece ahi sola en cuanto algun habito la tenga asignada,
+sin tocar nada de este modulo. No hay entrada en el menu principal: es
+deliberado, para no duplicar el acceso.
+
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
 (``paginate``) y ``provider.base`` (``Habit``/``RealHabit``/``Task``/
@@ -47,6 +59,7 @@ class ScreenKind(Enum):
     NUMERIC_ENTRY = auto()
     STANDBY = auto()
     ITEM_OPTIONS = auto()
+    SECTIONS_MENU = auto()
 
 
 @dataclass
@@ -79,6 +92,16 @@ class ScreenState:
             opciones. Igual que ``entry_habit_id``, entrar aqui no toca
             ``view_id``/``page``: "Volver" regresa exactamente a la vista de
             origen sin un campo aparte.
+        section_name: Nombre de la seccion activa, solo si ``kind`` es
+            ``ScreenKind.VIEW`` y no esta vacio -- en ese caso ``resolve_page``/
+            ``_undoes`` resuelven contra la seccion (``_section_page``) en vez
+            de contra ``VIEWS[view_id]``, y ``view_id`` queda sin consultar
+            mientras tanto. Vive como un campo mas de ``ScreenKind.VIEW`` (no
+            como un ``ScreenKind`` propio) a proposito: asi mantener pulsado un
+            habito de una seccion y pulsar "Volver" en su menu de opciones
+            restaura la seccion solo, con el mismo mecanismo que ya usa
+            cualquier otra vista (``_exit_item_options``/``_exit_numeric_entry``
+            hacen ``screen.kind = ScreenKind.VIEW`` sin tocar nada mas).
     """
 
     kind: ScreenKind = ScreenKind.VIEW
@@ -88,6 +111,7 @@ class ScreenState:
     entry_value: str = ""
     entry_item_kind: str = ""
     entry_item_id: str = ""
+    section_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -109,16 +133,23 @@ class MenuEntry:
         label: Texto del boton.
         emoji: Icono a color, o cadena vacia.
         action: Que hace al pulsarlo -- "select_view" (entra en ``view_id``),
-            "open_system" (abre el submenu Sistema), "standby" (apaga la
-            pantalla del deck) o "shutdown" (apaga la Raspberry Pi). No hay
-            boton de "volver": la tecla de menu ya vuelve al menu principal
-            desde cualquier pantalla, incluida Sistema, asi que un boton
-            "Atras" seria redundante.
+            "open_system" (abre el submenu Sistema), "open_sections" (abre el
+            submenu "Secciones", ver ``ScreenKind.SECTIONS_MENU``),
+            "enter_section" (entra en la seccion ``section_name``), "standby"
+            (apaga la pantalla del deck) o "shutdown" (apaga la Raspberry Pi).
+            No hay boton de "volver": la tecla de menu ya vuelve al menu
+            principal desde cualquier pantalla, incluida Sistema, asi que un
+            boton "Atras" seria redundante.
         view_id: Id de la vista a la que lleva, solo si ``action`` es
             "select_view".
         key: Tecla fija dentro de la pagina 0 (p.ej. "Sistema" siempre en la
             14), o ``None`` para repartirse automaticamente entre las que
             sobren, en el orden en que aparece en la lista.
+        section_name: Nombre de la seccion a la que lleva, solo si ``action``
+            es "enter_section" -- usado tanto por el atajo fijo de la tecla 1
+            de "Habitos" (ver ``KEY_HABITS_SECTIONS_SHORTCUT``/``resolve_page``)
+            como por las entradas que genera ``_section_menu_entries`` para el
+            submenu "Secciones".
     """
 
     label: str
@@ -126,6 +157,7 @@ class MenuEntry:
     action: str
     view_id: str = ""
     key: int | None = None
+    section_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -448,15 +480,18 @@ class ViewSpec:
 
 
 def _place_items(
-    items: list[ViewItem],
+    items: list[ViewItem], reserved_keys: frozenset[int] = frozenset()
 ) -> tuple[dict[int, Habit], dict[int, Task], dict[int, Template], dict[int, TimerLabel]]:
     """Reparte ``items`` (ya recortados a una pagina) entre las teclas
-    disponibles, en el orden en que llegan."""
+    disponibles, en el orden en que llegan. ``reserved_keys`` se excluye del
+    reparto (usado por el sobrante de "Habitos", para no invadir la tecla del
+    atajo fijo a "Secciones" -- ver ``KEY_HABITS_SECTIONS_SHORTCUT``)."""
     key_habit: dict[int, Habit] = {}
     key_task: dict[int, Task] = {}
     key_template: dict[int, Template] = {}
     key_timer: dict[int, TimerLabel] = {}
-    for key, item in zip(AVAILABLE_KEYS, items, strict=False):
+    available_keys = [key for key in AVAILABLE_KEYS if key not in reserved_keys]
+    for key, item in zip(available_keys, items, strict=False):
         if isinstance(item.obj, Habit):
             key_habit[key] = item.obj
         elif isinstance(item.obj, Template):
@@ -476,14 +511,19 @@ def _overflow_items(habits: list[Habit], habit_mapping: dict[str, int]) -> list[
     return [ViewItem("habit", h) for h in overflow_habits]
 
 
-def _tiered_page_builder() -> PageBuilder:
+def _tiered_page_builder(reserved_keys: frozenset[int] = frozenset()) -> PageBuilder:
     """Constructor de pagina para "Habitos", la unica vista que reutiliza el
     mapeo estable de habitos: la pagina 0 es literalmente el mapeo
     persistido ya calculado por ``core.key_map`` -- por eso un habito
     conserva su tecla exactamente igual entre ciclos, hecho o no. Las paginas
     siguientes son el sobrante (``_overflow_items``), sin garantia de
     estabilidad entre ciclos: es la red de seguridad, no el camino principal.
-    """
+
+    ``reserved_keys`` (ver ``KEY_HABITS_SECTIONS_SHORTCUT``) nunca recibe un
+    habito, ni en la pagina 0 (el mapeo persistido ya las excluye, ver
+    ``core.key_map.update_mapping``) ni en el sobrante (se excluyen tambien
+    aqui de ``_place_items``, para que el atajo no se vea invadido por un
+    habito en una pagina 1+)."""
 
     def build(
         habits: list[Habit],
@@ -508,7 +548,7 @@ def _tiered_page_builder() -> PageBuilder:
             return key_habit, {}, {}, {}, total_pages
 
         page_items, _ = paginate(overflow, page - 1, PAGE_SIZE)
-        key_habit, key_task, key_template, key_timer = _place_items(page_items)
+        key_habit, key_task, key_template, key_timer = _place_items(page_items, reserved_keys)
         return key_habit, key_task, key_template, key_timer, total_pages
 
     return build
@@ -659,40 +699,52 @@ def _log_items(
     return [ViewItem("habit", h) for h in sorted(log_habits, key=lambda h: (h.order, h.id))]
 
 
-_MORNINGS_SECTION_NAME = "Mornings"
-"""Nombre de la seccion (``habit_sections.name`` en la base) que filtra la
-vista "Mornings" (ver ``_mornings_items``). Vive aqui, no en ``config.py``:
-es un literal propio de esta vista, mismo criterio que ``NUMERIC_KEYPAD``/
-``STANDBY_LAYOUT``. La seccion la crea y asigna el usuario a mano por SQL en
-``../habits-core`` (igual que ``task_templates.show_in_deck``); aqui no hay
-nada que migrar si cambia de nombre, solo tocar esta constante."""
+def _section_menu_entries(habits: list[Habit]) -> list[MenuEntry]:
+    """Items del submenu "Secciones" (``ScreenKind.SECTIONS_MENU``): un boton
+    por cada nombre de seccion presente en ``habits`` hoy, sacado directamente
+    de ``Habit.section_name`` -- **nada de codigo, nada de configuracion**: una
+    seccion aparece aqui en cuanto algun habito la tenga asignada
+    (``habits.section_id`` en ``../habits-core``) y tenga algo que tocar hoy
+    (``v_today_habits`` ya filtra por ``is_due``). Ordenadas alfabeticamente
+    (no hay ``sort_order`` de seccion expuesto al cliente).
+
+    Unico camino a una seccion, junto con el atajo fijo de la tecla 1 de
+    "Habitos" que abre este mismo submenu (ver ``KEY_HABITS_SECTIONS_SHORTCUT``):
+    no hay entrada de seccion en el menu principal."""
+    names = sorted({h.section_name.strip() for h in habits if h.section_name.strip()})
+    return [MenuEntry(name, "", "enter_section", section_name=name) for name in names]
 
 
-def _mornings_items(
-    habits: list[Habit],
-    tasks: list[Task],
-    templates: list[Template],
-    log_habits: list[Habit],
-    timer_labels: list[TimerLabel],
-    running_timer: RunningTimer | None,
-    daily_totals: dict[str, int],
-    task_totals: dict[str, int],
-) -> list[ViewItem]:
-    """Items de la vista "Mornings": los habitos con objetivo (``BooleanHabit``/
-    ``RealHabit``, los mismos que "Habitos") cuya ``section_name`` coincide con
-    ``_MORNINGS_SECTION_NAME``, todos -- sin filtrar por ``is_done``, al reves
-    que "Hoy" -- ordenados por ``(order, id)``.
+def _section_page(section_name: str, habits: list[Habit], page: int) -> ResolvedPage:
+    """Resuelve una seccion filtrada (``ScreenState.section_name``): mismo
+    comportamiento que "Habitos" (se ven todos, hechos hoy en gris, y
+    ``_undoes`` siempre deja deshacer un booleano ya hecho aqui), pero
+    restringido a los habitos cuya ``section_name`` coincide (comparacion
+    insensible a mayusculas/minusculas y a espacios sueltos, para no depender
+    de que la entrada pulsada en "Secciones" (``_section_menu_entries``)
+    escribiera el nombre exactamente igual).
 
-    Comparacion insensible a mayusculas/minusculas: no depende de que la
-    seccion se escriba exactamente igual en cada proyecto Supabase (produccion
-    y test pueden diferir en el capitalizado sin que esta vista se rompa).
-
-    Mismo criterio que "Logs"/"Cronometros": ningun habito desaparece de aqui
-    solo por completarse hoy (queda en gris), asi que paginar de cero cada
-    ciclo con ``_flat_page_builder`` ya da tecla estable sin necesitar el
-    mapeo persistido de ``core.key_map`` que usa "Habitos"."""
-    mornings = [h for h in habits if h.section_name.strip().lower() == _MORNINGS_SECTION_NAME.lower()]
-    return [ViewItem("habit", h) for h in sorted(mornings, key=lambda h: (h.order, h.id))]
+    A diferencia de una vista de ``VIEWS``, esto **no** pasa por
+    ``ViewSpec``/``PageBuilder``: el filtro es un parametro en tiempo de
+    ejecucion (el nombre pulsado), no un id fijo registrado de antemano. Mismo
+    truco interno que ``_flat_page_builder`` (``paginate`` + ``_place_items``),
+    sin necesitar el mapeo persistido de ``core.key_map`` -- ningun habito
+    desaparece de aqui solo por completarse hoy, asi que la tecla de cada uno
+    ya sale estable entre ciclos sin esa persistencia, igual que "Logs"."""
+    target = section_name.strip().lower()
+    matching = [h for h in habits if h.section_name.strip().lower() == target]
+    page_items, total_pages = paginate(
+        [ViewItem("habit", h) for h in sorted(matching, key=lambda h: (h.order, h.id))], page, PAGE_SIZE
+    )
+    key_habit, key_task, key_template, key_timer = _place_items(page_items)
+    return ResolvedPage(
+        key_habit=key_habit,
+        key_task=key_task,
+        key_template=key_template,
+        key_timer=key_timer,
+        page=_clamp_page(page, total_pages),
+        total_pages=total_pages,
+    )
 
 
 def _timer_items(
@@ -731,15 +783,23 @@ def _timer_items(
     return [ViewItem("timer_label", tl) for tl in sorted(timer_labels, key=lambda t: (t.order, t.id))]
 
 
+KEY_HABITS_SECTIONS_SHORTCUT = 1
+"""Tecla fija de la vista "Habitos" para el atajo directo a "Secciones"
+(``ScreenKind.SECTIONS_MENU``) -- unico punto de entrada a una seccion, no
+hay nada equivalente en el menu principal. Reservada de forma permanente,
+como ``KEY_TIMER_SHORTCUT`` en el menu: ningun habito la ocupa nunca, ni en
+la pagina 0 (``core.key_map.update_mapping`` la excluye) ni en
+el sobrante (``_place_items`` tambien). El contenido en si (el boton) solo se
+pinta en la pagina 0, igual que ``KEY_TIMER_SHORTCUT`` -- ver ``resolve_page``."""
+
 VIEWS: dict[str, ViewSpec] = {
     "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
-    "habits": ViewSpec("habits", "Habitos", "✅", _tiered_page_builder(), allows_undo=True),
+    "habits": ViewSpec(
+        "habits", "Habitos", "✅", _tiered_page_builder(frozenset({KEY_HABITS_SECTIONS_SHORTCUT})), allows_undo=True
+    ),
     "tasks": ViewSpec("tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items)),
     "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
     "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items)),
-    # allows_undo=True replica el mismo comportamiento que "Habitos" (pulsar un
-    # booleano ya hecho lo deshace) para el subconjunto de la seccion Mornings.
-    "mornings": ViewSpec("mornings", "Mornings", "🌅", _flat_page_builder(_mornings_items), allows_undo=True),
     "timers": ViewSpec("timers", "Cronometros", "⏱️", _flat_page_builder(_timer_items)),
 }
 DEFAULT_VIEW_ID = "today"
@@ -750,7 +810,6 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry(VIEWS["tasks"].menu_label, VIEWS["tasks"].menu_emoji, "select_view", view_id="tasks"),
     MenuEntry(VIEWS["create"].menu_label, VIEWS["create"].menu_emoji, "select_view", view_id="create"),
     MenuEntry(VIEWS["logs"].menu_label, VIEWS["logs"].menu_emoji, "select_view", view_id="logs"),
-    MenuEntry(VIEWS["mornings"].menu_label, VIEWS["mornings"].menu_emoji, "select_view", view_id="mornings"),
     # Tecla fija 8, junto al atajo de cronometro fijo en la 7 (ver
     # KEY_TIMER_SHORTCUT/_timer_shortcut_item): las dos van pegadas a
     # proposito, la vista completa al lado de su acceso directo.
@@ -954,6 +1013,12 @@ def resolve_page(
     if screen.kind is ScreenKind.SYSTEM:
         key_nav, total_pages = _nav_page(SYSTEM_ENTRIES, screen.page)
         return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
+    if screen.kind is ScreenKind.SECTIONS_MENU:
+        # Misma mecanica que ScreenKind.SYSTEM, salvo que la lista no es un
+        # literal estatico: sale de _section_menu_entries(habits), recalculada
+        # en cada resolucion contra los habitos vigentes.
+        key_nav, total_pages = _nav_page(_section_menu_entries(habits), screen.page)
+        return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
     if screen.kind is ScreenKind.NUMERIC_ENTRY:
         key_numeric = dict(NUMERIC_KEYPAD)
         key_numeric[1] = NumericKey("display", screen.entry_value)
@@ -1003,6 +1068,12 @@ def resolve_page(
         key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
+    if screen.section_name:
+        # screen.kind sigue siendo ScreenKind.VIEW: la seccion es un campo
+        # mas de esa pantalla, no un ScreenKind propio (ver ScreenState.
+        # section_name) -- view_id queda sin consultar mientras tanto.
+        return _section_page(screen.section_name, habits, screen.page)
+
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
     key_habit, key_task, key_template, key_timer, total_pages = spec.build_page(
         habits,
@@ -1016,12 +1087,23 @@ def resolve_page(
         habit_mapping,
         screen.page,
     )
+    clamped_page = _clamp_page(screen.page, total_pages)
+    # Atajo fijo a "Secciones" en la tecla 1 de "Habitos", solo en la pagina 0
+    # -- mismo criterio que KEY_TIMER_SHORTCUT en el menu (la tecla ya esta
+    # reservada en cualquier pagina via _tiered_page_builder, esto es solo lo
+    # que la rellena en la primera).
+    key_nav = (
+        {KEY_HABITS_SECTIONS_SHORTCUT: MenuEntry("Secciones", "🗂️", "open_sections")}
+        if spec.id == "habits" and clamped_page == 0
+        else {}
+    )
     return ResolvedPage(
         key_habit=key_habit,
         key_task=key_task,
         key_template=key_template,
         key_timer=key_timer,
-        page=_clamp_page(screen.page, total_pages),
+        key_nav=key_nav,
+        page=clamped_page,
         total_pages=total_pages,
     )
 
@@ -1073,12 +1155,31 @@ def _undoes(screen: ScreenState, habit: Habit) -> bool:
     """Decide si pulsar ``habit`` en ``screen`` deshace en vez de avanzar.
 
     Solo deshace un habito **booleano** ya hecho hoy, y solo en una vista que
-    lo declare (``ViewSpec.allows_undo``). Un habito cuantificable nunca
-    deshace al pulsarlo: sigue sumando ``step`` aunque ya haya pasado su
-    objetivo (10/8 -> 11/8), que es justo lo que su tecla en gris significa.
+    lo declare (``ViewSpec.allows_undo``) o en una seccion (``screen.
+    section_name``, ver ``ScreenState``) -- una seccion siempre deshace,
+    mismo comportamiento que "Habitos", sin necesitar una entrada en
+    ``VIEWS``. Un habito cuantificable nunca deshace al pulsarlo: sigue
+    sumando ``step`` aunque ya haya pasado su objetivo (10/8 -> 11/8), que es
+    justo lo que su tecla en gris significa.
     """
-    spec = VIEWS.get(screen.view_id)
-    return bool(spec and spec.allows_undo) and isinstance(habit, BooleanHabit) and habit.is_done
+    if screen.section_name:
+        allows_undo = True
+    else:
+        spec = VIEWS.get(screen.view_id)
+        allows_undo = bool(spec and spec.allows_undo)
+    return allows_undo and isinstance(habit, BooleanHabit) and habit.is_done
+
+
+def _nav_press(entry: MenuEntry) -> PressAction:
+    """Traduce un ``MenuEntry`` pulsado a su ``PressAction``. Compartido por
+    el bloque MENU/SYSTEM/SECTIONS_MENU y por el atajo fijo dentro de una
+    vista de ``VIEWS`` (hoy solo ``KEY_HABITS_SECTIONS_SHORTCUT``), para no
+    repetir el mismo `if action == ...` dos veces."""
+    if entry.action == "select_view":
+        return PressAction("select_view", entry.view_id)
+    if entry.action == "enter_section":
+        return PressAction("enter_section", entry.section_name)
+    return PressAction(entry.action)
 
 
 def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAction:
@@ -1169,20 +1270,17 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             return PressAction("noop")  # sin flecha activa, la tecla no hace nada
         return PressAction("page_prev" if key == KEY_PAGE_PREV else "page_next")
 
-    if screen.kind in (ScreenKind.MENU, ScreenKind.SYSTEM):
-        # Comprobado antes que key_nav (que en SYSTEM siempre esta vacio, asi
-        # que aqui no cambia nada): KEY_TIMER_SHORTCUT no es un MenuEntry, y
-        # el atajo generico de key_timer al final de esta funcion nunca se
-        # alcanza para MENU/SYSTEM porque este bloque ya devuelve antes.
+    if screen.kind in (ScreenKind.MENU, ScreenKind.SYSTEM, ScreenKind.SECTIONS_MENU):
+        # Comprobado antes que key_nav (que en SYSTEM/SECTIONS_MENU siempre
+        # esta vacio, asi que aqui no cambia nada): KEY_TIMER_SHORTCUT no es
+        # un MenuEntry, y el atajo generico de key_nav al final de esta
+        # funcion nunca se alcanza para estos tres kinds porque este bloque
+        # ya devuelve antes.
         shortcut = page.key_timer_shortcut.get(key)
         if shortcut is not None:
             return PressAction("timer_toggle", shortcut.id)
         entry = page.key_nav.get(key)
-        if entry is None:
-            return PressAction("noop")
-        if entry.action == "select_view":
-            return PressAction("select_view", entry.view_id)
-        return PressAction(entry.action)
+        return _nav_press(entry) if entry is not None else PressAction("noop")
 
     habit = page.key_habit.get(key)
     if habit is not None:
@@ -1206,4 +1304,11 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     timer_label = page.key_timer.get(key)
     if timer_label is not None:
         return PressAction("timer_toggle", timer_label.id)
+    # Atajo fijo dentro de una vista de VIEWS (hoy solo KEY_HABITS_SECTIONS_
+    # SHORTCUT en "Habitos", ver resolve_page): screen.kind aqui es
+    # ScreenKind.VIEW, no pasa por el bloque MENU/SYSTEM/SECTIONS_MENU de
+    # arriba, asi que necesita su propio fallback a key_nav.
+    nav_entry = page.key_nav.get(key)
+    if nav_entry is not None:
+        return _nav_press(nav_entry)
     return PressAction("noop")
