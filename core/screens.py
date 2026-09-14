@@ -37,6 +37,18 @@ una preferencia local del deck, no un dato de ``../habits-core``): es la
 UNICA forma de que una seccion tenga entrada en el menu principal, deliberado
 para no duplicar el acceso por defecto.
 
+Los proyectos de tarea (``projects``/``tasks.project_id`` en
+``../habits-core``) siguen exactamente el mismo patron que las secciones,
+pero sobre ``Task``/"Tareas" en vez de ``Habit``/"Habitos":
+``ScreenState.project_name``, ``_project_page``,
+``KEY_TASKS_PROJECTS_SHORTCUT`` (tecla 1 de "Tareas"),
+``ScreenKind.PROJECTS_MENU``/``_project_menu_entries``,
+``ScreenKind.PROJECT_OPTIONS``/``_pinned_project_menu_entries``/
+``core.pinned_projects``. A diferencia de las secciones, ``project_name`` no
+estaba resuelto en ``v_today_tasks`` de fabrica: hizo falta una migration en
+``../habits-core`` que anadiera el ``left join`` a ``projects``, mismo patron
+que ``section_name`` en ``v_today_habits``.
+
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
 (``paginate``) y ``provider.base`` (``Habit``/``RealHabit``/``Task``/
@@ -65,6 +77,8 @@ class ScreenKind(Enum):
     ITEM_OPTIONS = auto()
     SECTIONS_MENU = auto()
     SECTION_OPTIONS = auto()
+    PROJECTS_MENU = auto()
+    PROJECT_OPTIONS = auto()
 
 
 @dataclass
@@ -126,6 +140,23 @@ class ScreenState:
             pulsar "Volver", en vez de asumir siempre "Secciones" -- las dos
             pantallas pueden llevar a la misma sección, y cada una espera
             volver a si misma.
+        project_name: Nombre del proyecto activo, solo si ``kind`` es
+            ``ScreenKind.VIEW`` y no esta vacio -- mismo mecanismo que
+            ``section_name`` (campo mas de ``ScreenKind.VIEW``, no un
+            ``ScreenKind`` propio) pero para tareas: ``resolve_page`` resuelve
+            contra ``_project_page`` en vez de ``VIEWS[view_id]`` mientras
+            este relleno, y ``view_id`` queda sin consultar. ``section_name``
+            y ``project_name`` nunca estan rellenos los dos a la vez.
+        entry_project_name: Nombre del proyecto sobre el que se abrio su
+            pantalla de opciones, solo si ``kind`` es
+            ``ScreenKind.PROJECT_OPTIONS``. Mismo papel que
+            ``entry_section_name`` para secciones -- campo propio, no
+            compartido con ``entry_item_id``/``entry_section_name``.
+        entry_project_origin: Desde que pantalla se abrio
+            ``ScreenKind.PROJECT_OPTIONS`` -- ``ScreenKind.PROJECTS_MENU`` o
+            ``ScreenKind.MENU`` (boton de proyecto ya fijado). Mismo papel
+            que ``entry_section_origin``: ``orchestrator._exit_project_options``
+            vuelve exactamente aqui al pulsar "Volver".
     """
 
     kind: ScreenKind = ScreenKind.VIEW
@@ -138,6 +169,9 @@ class ScreenState:
     section_name: str = ""
     entry_section_name: str = ""
     entry_section_origin: ScreenKind = ScreenKind.SECTIONS_MENU
+    project_name: str = ""
+    entry_project_name: str = ""
+    entry_project_origin: ScreenKind = ScreenKind.PROJECTS_MENU
 
 
 @dataclass(frozen=True)
@@ -161,11 +195,14 @@ class MenuEntry:
         action: Que hace al pulsarlo -- "select_view" (entra en ``view_id``),
             "open_system" (abre el submenu Sistema), "open_sections" (abre el
             submenu "Secciones", ver ``ScreenKind.SECTIONS_MENU``),
-            "enter_section" (entra en la seccion ``section_name``), "standby"
-            (apaga la pantalla del deck) o "shutdown" (apaga la Raspberry Pi).
-            No hay boton de "volver": la tecla de menu ya vuelve al menu
-            principal desde cualquier pantalla, incluida Sistema, asi que un
-            boton "Atras" seria redundante.
+            "enter_section" (entra en la seccion ``section_name``),
+            "open_projects" (abre el submenu "Proyectos", ver
+            ``ScreenKind.PROJECTS_MENU``), "enter_project" (entra en el
+            proyecto ``project_name``), "standby" (apaga la pantalla del
+            deck) o "shutdown" (apaga la Raspberry Pi). No hay boton de
+            "volver": la tecla de menu ya vuelve al menu principal desde
+            cualquier pantalla, incluida Sistema, asi que un boton "Atras"
+            seria redundante.
         view_id: Id de la vista a la que lleva, solo si ``action`` es
             "select_view".
         key: Tecla fija dentro de la pagina 0 (p.ej. "Sistema" siempre en la
@@ -176,6 +213,10 @@ class MenuEntry:
             de "Habitos" (ver ``KEY_HABITS_SECTIONS_SHORTCUT``/``resolve_page``)
             como por las entradas que genera ``_section_menu_entries`` para el
             submenu "Secciones".
+        project_name: Nombre del proyecto al que lleva, solo si ``action`` es
+            "enter_project" -- mismo papel que ``section_name`` pero para
+            proyectos (tecla 1 de "Tareas"/``KEY_TASKS_PROJECTS_SHORTCUT`` y
+            ``_project_menu_entries`` para el submenu "Proyectos").
     """
 
     label: str
@@ -184,6 +225,7 @@ class MenuEntry:
     view_id: str = ""
     key: int | None = None
     section_name: str = ""
+    project_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -306,12 +348,13 @@ class OptionEntry:
             activo; si no, se pinta ``label`` ("Iniciar cronometro"). Lo
             decide ``resolve_page`` sobre una copia del layout, segun si esa
             tarea es la que esta corriendo ahora mismo, ver ahi mismo),
-            "toggle_pin" (solo en la pantalla de opciones de una seccion, ver
-            ``ScreenKind.SECTION_OPTIONS``: alterna si esa seccion aparece
-            como boton fijo en el menu principal -- ``label`` ya trae "Fijar
-            en menu"/"Quitar del menu" segun el estado actual, decidido por
-            ``resolve_page`` contra ``pinned_sections``, ver ahi mismo) o
-            "blank" (tecla vacia).
+            "toggle_pin" (en la pantalla de opciones de una seccion o de un
+            proyecto, ver ``ScreenKind.SECTION_OPTIONS``/
+            ``ScreenKind.PROJECT_OPTIONS``: alterna si esa seccion/proyecto
+            aparece como boton fijo en el menu principal -- ``label`` ya trae
+            "Fijar en menu"/"Quitar del menu" segun el estado actual,
+            decidido por ``resolve_page`` contra ``pinned_sections``/
+            ``pinned_projects``, ver ahi mismo) o "blank" (tecla vacia).
         label: Texto de la tecla.
         emoji: Icono a color, o cadena vacia.
         priority: Prioridad (``0``/``1``/``3``/``5``) que fija esta tecla.
@@ -332,9 +375,9 @@ class OptionEntry:
             un contador que incrementa en el cliente, mismo criterio que
             ``provider.base.TimerLabel.started_at``.
         active: Solo tiene sentido si ``kind`` es "toggle_pin": si ``True``,
-            la seccion ya esta fijada en el menu principal ahora mismo (la
-            tecla dice "Quitar del menu" y se pinta en ambar); si ``False``,
-            no lo esta ("Fijar en menu", verde) -- ver
+            la seccion/proyecto ya esta fijada en el menu principal ahora
+            mismo (la tecla dice "Quitar del menu" y se pinta en ambar); si
+            ``False``, no lo esta ("Fijar en menu", verde) -- ver
             ``deck.renderer.render_option_entry``. Campo generico (no
             "running", que es especifico de "timer") por si una opcion
             futura de tipo interruptor lo necesita.
@@ -593,11 +636,15 @@ def _tiered_page_builder(reserved_keys: frozenset[int] = frozenset()) -> PageBui
     return build
 
 
-def _flat_page_builder(items_fn: ItemsFn) -> PageBuilder:
+def _flat_page_builder(items_fn: ItemsFn, reserved_keys: frozenset[int] = frozenset()) -> PageBuilder:
     """Constructor de pagina generico para una vista sin reparto especial:
-    pagina la lista completa que devuelva ``items_fn`` sin reservar nada para
-    habitos. Es el que usa una vista nueva por defecto (p.ej. "por proyecto")
-    salvo que necesite reutilizar el mapeo estable de habitos."""
+    pagina la lista completa que devuelva ``items_fn`` sin reutilizar el
+    mapeo estable de habitos. Es el que usa una vista nueva por defecto salvo
+    que necesite ese mapeo (ver ``_tiered_page_builder``).
+
+    ``reserved_keys`` (usado por "Tareas", ver ``KEY_TASKS_PROJECTS_SHORTCUT``)
+    se excluye del reparto en ``_place_items``, mismo papel que en
+    ``_tiered_page_builder`` -- ninguna tarea ocupa nunca esa tecla."""
 
     def build(
         habits: list[Habit],
@@ -616,7 +663,7 @@ def _flat_page_builder(items_fn: ItemsFn) -> PageBuilder:
             page,
             PAGE_SIZE,
         )
-        key_habit, key_task, key_template, key_timer = _place_items(page_items)
+        key_habit, key_task, key_template, key_timer = _place_items(page_items, reserved_keys)
         return key_habit, key_task, key_template, key_timer, total_pages
 
     return build
@@ -828,6 +875,85 @@ def _section_page(section_name: str, habits: list[Habit], page: int) -> Resolved
     )
 
 
+def _project_menu_entries(tasks: list[Task]) -> list[MenuEntry]:
+    """Items del submenu "Proyectos" (``ScreenKind.PROJECTS_MENU``): un boton
+    por cada nombre de proyecto presente en ``tasks`` hoy, sacado directamente
+    de ``Task.project_name`` -- **nada de codigo, nada de configuracion**: un
+    proyecto aparece aqui en cuanto alguna tarea lo tenga asignada
+    (``tasks.project_id`` en ``../habits-core``) y venza hoy o antes
+    (``v_today_tasks`` ya filtra). Ordenados alfabeticamente (no hay
+    ``sort_order`` de proyecto expuesto al cliente). Mirror exacto de
+    ``_section_menu_entries`` para tareas -- mismo razonamiento sobre no
+    llevar emoji propio (ver ahi mismo).
+
+    Unico camino a un proyecto (mantener pulsada una entrada aqui abre su
+    pantalla de opciones, ver ``ScreenKind.PROJECT_OPTIONS``), junto con el
+    atajo fijo de la tecla 1 de "Tareas" que abre este mismo submenu (ver
+    ``KEY_TASKS_PROJECTS_SHORTCUT``): no hay entrada de proyecto en el menu
+    principal salvo la que el propio usuario fije (ver
+    ``_pinned_project_menu_entries``)."""
+    names = sorted({t.project_name.strip() for t in tasks if t.project_name.strip()})
+    return [MenuEntry(name, "", "enter_project", project_name=name) for name in names]
+
+
+def _pinned_project_menu_entries(tasks: list[Task], pinned_projects: frozenset[str]) -> list[MenuEntry]:
+    """Botones fijos en el menu principal para los proyectos marcados como
+    favoritos desde su pantalla de opciones (``ScreenKind.PROJECT_OPTIONS``,
+    tecla "Fijar en menu"/"Quitar del menu"). Mirror exacto de
+    ``_pinned_section_menu_entries`` para tareas.
+
+    Solo se devuelve un boton por cada nombre de ``pinned_projects`` que siga
+    teniendo alguna tarea hoy (mismo criterio que ``_project_menu_entries``):
+    un proyecto despinneado solo porque ya no tiene tareas no deja un boton
+    muerto en el menu.
+
+    Se usa en la rama ``ScreenKind.MENU`` de ``resolve_page``, concatenada a
+    ``MENU_ENTRIES``/``_pinned_section_menu_entries`` antes de repartir
+    teclas con ``_nav_page``."""
+    by_key: dict[str, str] = {}
+    for t in tasks:
+        name = t.project_name.strip()
+        if name:
+            by_key.setdefault(name.lower(), name)
+    names = sorted(by_key[key] for key in pinned_projects if key in by_key)
+    return [MenuEntry(name, "", "enter_project", project_name=name) for name in names]
+
+
+def _project_page(
+    project_name: str,
+    tasks: list[Task],
+    running_timer: RunningTimer | None,
+    task_totals: dict[str, int],
+    page: int,
+) -> ResolvedPage:
+    """Resuelve un proyecto filtrado (``ScreenState.project_name``): mismo
+    comportamiento que "Tareas" (sin deshacer, una tarea nunca lo tiene),
+    pero restringido a las tareas cuyo ``project_name`` coincide (comparacion
+    insensible a mayusculas/minusculas y a espacios sueltos, igual que
+    ``_section_page``). Se conserva el orden que ya trae el proveedor
+    (prioridad descendente, fecha ascendente) en vez de reordenar, mismo
+    criterio que ``_tasks_items``.
+
+    A diferencia de ``_section_page``, tambien marca ``timer_running``/
+    ``total_seconds`` (``_mark_running_task``) antes de repartir: una tarea
+    filtrada por proyecto pinta el mismo borde/prefijo de cronometro que en
+    "Tareas", que ``_tasks_items`` ya hace por su cuenta pero que aqui, al no
+    pasar por ningun ``PageBuilder``, hay que llamar explicitamente."""
+    target = project_name.strip().lower()
+    matching = [t for t in tasks if t.project_name.strip().lower() == target]
+    _mark_running_task(matching, running_timer, task_totals)
+    page_items, total_pages = paginate([ViewItem("task", t) for t in matching], page, PAGE_SIZE)
+    key_habit, key_task, key_template, key_timer = _place_items(page_items)
+    return ResolvedPage(
+        key_habit=key_habit,
+        key_task=key_task,
+        key_template=key_template,
+        key_timer=key_timer,
+        page=_clamp_page(page, total_pages),
+        total_pages=total_pages,
+    )
+
+
 def _timer_items(
     habits: list[Habit],
     tasks: list[Task],
@@ -873,12 +999,22 @@ la pagina 0 (``core.key_map.update_mapping`` la excluye) ni en
 el sobrante (``_place_items`` tambien). El contenido en si (el boton) solo se
 pinta en la pagina 0, igual que ``KEY_TIMER_SHORTCUT`` -- ver ``resolve_page``."""
 
+KEY_TASKS_PROJECTS_SHORTCUT = 1
+"""Tecla fija de la vista "Tareas" para el atajo directo a "Proyectos"
+(``ScreenKind.PROJECTS_MENU``) -- mismo papel que
+``KEY_HABITS_SECTIONS_SHORTCUT`` en "Habitos", pero "Tareas" usa
+``_flat_page_builder`` (no reutiliza ningun mapeo persistido, ver
+``core.key_map``), asi que la reserva se hace pasando ``reserved_keys`` a
+``_flat_page_builder`` en vez de a ``core.key_map.update_mapping``."""
+
 VIEWS: dict[str, ViewSpec] = {
     "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
     "habits": ViewSpec(
         "habits", "Habitos", "✅", _tiered_page_builder(frozenset({KEY_HABITS_SECTIONS_SHORTCUT})), allows_undo=True
     ),
-    "tasks": ViewSpec("tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items)),
+    "tasks": ViewSpec(
+        "tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items, frozenset({KEY_TASKS_PROJECTS_SHORTCUT}))
+    ),
     "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
     "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items)),
     "timers": ViewSpec("timers", "Cronometros", "⏱️", _flat_page_builder(_timer_items)),
@@ -1028,6 +1164,7 @@ def resolve_page(
     last_timer: RunningTimer | None,
     habit_mapping: dict[str, int],
     pinned_sections: frozenset[str],
+    pinned_projects: frozenset[str],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
 
@@ -1074,6 +1211,10 @@ def resolve_page(
             en menu"/"Quitar del menu"). ``ScreenKind.SECTIONS_MENU`` no lo
             necesita: esa lista no marca de ningun modo las ya fijadas (ver
             ``_section_menu_entries``).
+        pinned_projects: Nombres de proyecto (normalizados) marcados como
+            favoritos desde ``ScreenKind.PROJECT_OPTIONS`` (ver
+            ``core.pinned_projects``). Mismo papel que ``pinned_sections``,
+            para ``ScreenKind.MENU``/``ScreenKind.PROJECT_OPTIONS``.
 
     Returns:
         La pagina resuelta, lista para pintar con ``deck.renderer.render_page``.
@@ -1087,7 +1228,11 @@ def resolve_page(
         key_standby = {key: STANDBY_LAYOUT.get(key, _STANDBY_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_standby=key_standby, page=0, total_pages=1)
     if screen.kind is ScreenKind.MENU:
-        entries = MENU_ENTRIES + _pinned_section_menu_entries(habits, pinned_sections)
+        entries = (
+            MENU_ENTRIES
+            + _pinned_section_menu_entries(habits, pinned_sections)
+            + _pinned_project_menu_entries(tasks, pinned_projects)
+        )
         key_nav, total_pages = _nav_page(entries, screen.page, reserved_keys=frozenset({KEY_TIMER_SHORTCUT}))
         clamped_page = _clamp_page(screen.page, total_pages)
         # KEY_TIMER_SHORTCUT, como las teclas fijas de MENU_ENTRIES, solo en
@@ -1109,6 +1254,10 @@ def resolve_page(
         # literal estatico: sale de _section_menu_entries(habits), recalculada
         # en cada resolucion contra los habitos vigentes.
         key_nav, total_pages = _nav_page(_section_menu_entries(habits), screen.page)
+        return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
+    if screen.kind is ScreenKind.PROJECTS_MENU:
+        # Mismo mecanismo que ScreenKind.SECTIONS_MENU, para tareas.
+        key_nav, total_pages = _nav_page(_project_menu_entries(tasks), screen.page)
         return ResolvedPage(key_nav=key_nav, page=_clamp_page(screen.page, total_pages), total_pages=total_pages)
     if screen.kind is ScreenKind.NUMERIC_ENTRY:
         key_numeric = dict(NUMERIC_KEYPAD)
@@ -1176,11 +1325,30 @@ def resolve_page(
         key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
+    if screen.kind is ScreenKind.PROJECT_OPTIONS:
+        # Mismo patron que ScreenKind.SECTION_OPTIONS, para un proyecto: aqui
+        # "Volver" tiene que regresar a screen.entry_project_origin, no a
+        # ScreenKind.VIEW, mismo motivo que la seccion (ver
+        # ScreenState.entry_project_name).
+        is_pinned = screen.entry_project_name.strip().lower() in pinned_projects
+        layout = {
+            KEY_MENU: _ITEM_OPTIONS_BACK,
+            14: OptionEntry(
+                "toggle_pin", "Quitar del menu" if is_pinned else "Fijar en menu", "📌", active=is_pinned
+            ),
+        }
+        key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
+        return ResolvedPage(key_options=key_options, page=0, total_pages=1)
+
     if screen.section_name:
         # screen.kind sigue siendo ScreenKind.VIEW: la seccion es un campo
         # mas de esa pantalla, no un ScreenKind propio (ver ScreenState.
         # section_name) -- view_id queda sin consultar mientras tanto.
         return _section_page(screen.section_name, habits, screen.page)
+
+    if screen.project_name:
+        # Mismo mecanismo que screen.section_name, arriba, para tareas.
+        return _project_page(screen.project_name, tasks, running_timer, task_totals, screen.page)
 
     spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
     key_habit, key_task, key_template, key_timer, total_pages = spec.build_page(
@@ -1196,15 +1364,17 @@ def resolve_page(
         screen.page,
     )
     clamped_page = _clamp_page(screen.page, total_pages)
-    # Atajo fijo a "Secciones" en la tecla 1 de "Habitos", solo en la pagina 0
-    # -- mismo criterio que KEY_TIMER_SHORTCUT en el menu (la tecla ya esta
-    # reservada en cualquier pagina via _tiered_page_builder, esto es solo lo
-    # que la rellena en la primera).
-    key_nav = (
-        {KEY_HABITS_SECTIONS_SHORTCUT: MenuEntry("Secciones", "🗂️", "open_sections")}
-        if spec.id == "habits" and clamped_page == 0
-        else {}
-    )
+    # Atajo fijo a "Secciones"/"Proyectos" en la tecla 1 de "Habitos"/"Tareas",
+    # solo en la pagina 0 -- mismo criterio que KEY_TIMER_SHORTCUT en el menu
+    # (la tecla ya esta reservada en cualquier pagina via
+    # _tiered_page_builder/_flat_page_builder, esto es solo lo que la rellena
+    # en la primera).
+    key_nav: dict[int, MenuEntry] = {}
+    if clamped_page == 0:
+        if spec.id == "habits":
+            key_nav = {KEY_HABITS_SECTIONS_SHORTCUT: MenuEntry("Secciones", "🗂️", "open_sections")}
+        elif spec.id == "tasks":
+            key_nav = {KEY_TASKS_PROJECTS_SHORTCUT: MenuEntry("Proyectos", "📁", "open_projects")}
     return ResolvedPage(
         key_habit=key_habit,
         key_task=key_task,
@@ -1229,7 +1399,8 @@ class PressAction:
             "item_options_exit" | "task_set_priority" | "task_skip" |
             "habit_options_undo" | "habit_options_add_value" |
             "habit_options_add_step" | "section_options_exit" |
-            "toggle_section_pin" | "noop".
+            "toggle_section_pin" | "open_projects" | "enter_project" |
+            "project_options_exit" | "toggle_project_pin" | "noop".
         payload: Id del habito/tarea/plantilla/etiqueta-de-cronometro si
             ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
@@ -1255,7 +1426,11 @@ class PressAction:
             lleva id en el payload, como "task"/"template"). "toggle_section_pin"
             tampoco lleva payload: el nombre de la seccion se lee de
             ``ScreenState.entry_section_name``, mismo patron que
-            "habit_options_undo"/"task_skip". Vacio en el resto.
+            "habit_options_undo"/"task_skip". "enter_project" lleva el nombre
+            del proyecto (mismo patron que "enter_section" con
+            ``section_name``); "toggle_project_pin" no lleva payload (mismo
+            patron que "toggle_section_pin", lee ``ScreenState.
+            entry_project_name``). Vacio en el resto.
     """
 
     kind: str
@@ -1283,13 +1458,16 @@ def _undoes(screen: ScreenState, habit: Habit) -> bool:
 
 def _nav_press(entry: MenuEntry) -> PressAction:
     """Traduce un ``MenuEntry`` pulsado a su ``PressAction``. Compartido por
-    el bloque MENU/SYSTEM/SECTIONS_MENU y por el atajo fijo dentro de una
-    vista de ``VIEWS`` (hoy solo ``KEY_HABITS_SECTIONS_SHORTCUT``), para no
-    repetir el mismo `if action == ...` dos veces."""
+    el bloque MENU/SYSTEM/SECTIONS_MENU/PROJECTS_MENU y por el atajo fijo
+    dentro de una vista de ``VIEWS`` (``KEY_HABITS_SECTIONS_SHORTCUT``/
+    ``KEY_TASKS_PROJECTS_SHORTCUT``), para no repetir el mismo
+    `if action == ...` varias veces."""
     if entry.action == "select_view":
         return PressAction("select_view", entry.view_id)
     if entry.action == "enter_section":
         return PressAction("enter_section", entry.section_name)
+    if entry.action == "enter_project":
+        return PressAction("enter_project", entry.project_name)
     return PressAction(entry.action)
 
 
@@ -1385,6 +1563,17 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             return PressAction("toggle_section_pin")
         return PressAction("section_options_exit")
 
+    if screen.kind is ScreenKind.PROJECT_OPTIONS:
+        # Mismo patron que SECTION_OPTIONS justo arriba, para un proyecto:
+        # "Volver" aqui es "project_options_exit" (regresa a
+        # screen.entry_project_origin), no "section_options_exit".
+        entry = page.key_options.get(key)
+        if entry is None or entry.kind == "blank":
+            return PressAction("noop")
+        if entry.kind == "toggle_pin":
+            return PressAction("toggle_project_pin")
+        return PressAction("project_options_exit")
+
     if key == KEY_MENU:
         if screen.kind is ScreenKind.MENU:
             return PressAction("noop")  # ya esta en el menu, no hace falta nada
@@ -1395,12 +1584,12 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             return PressAction("noop")  # sin flecha activa, la tecla no hace nada
         return PressAction("page_prev" if key == KEY_PAGE_PREV else "page_next")
 
-    if screen.kind in (ScreenKind.MENU, ScreenKind.SYSTEM, ScreenKind.SECTIONS_MENU):
-        # Comprobado antes que key_nav (que en SYSTEM/SECTIONS_MENU siempre
-        # esta vacio, asi que aqui no cambia nada): KEY_TIMER_SHORTCUT no es
-        # un MenuEntry, y el atajo generico de key_nav al final de esta
-        # funcion nunca se alcanza para estos tres kinds porque este bloque
-        # ya devuelve antes.
+    if screen.kind in (ScreenKind.MENU, ScreenKind.SYSTEM, ScreenKind.SECTIONS_MENU, ScreenKind.PROJECTS_MENU):
+        # Comprobado antes que key_nav (que en SYSTEM/SECTIONS_MENU/
+        # PROJECTS_MENU siempre esta vacio, asi que aqui no cambia nada):
+        # KEY_TIMER_SHORTCUT no es un MenuEntry, y el atajo generico de
+        # key_nav al final de esta funcion nunca se alcanza para estos
+        # cuatro kinds porque este bloque ya devuelve antes.
         shortcut = page.key_timer_shortcut.get(key)
         if shortcut is not None:
             return PressAction("timer_toggle", shortcut.id)
@@ -1429,10 +1618,11 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     timer_label = page.key_timer.get(key)
     if timer_label is not None:
         return PressAction("timer_toggle", timer_label.id)
-    # Atajo fijo dentro de una vista de VIEWS (hoy solo KEY_HABITS_SECTIONS_
-    # SHORTCUT en "Habitos", ver resolve_page): screen.kind aqui es
-    # ScreenKind.VIEW, no pasa por el bloque MENU/SYSTEM/SECTIONS_MENU de
-    # arriba, asi que necesita su propio fallback a key_nav.
+    # Atajo fijo dentro de una vista de VIEWS (KEY_HABITS_SECTIONS_SHORTCUT en
+    # "Habitos", KEY_TASKS_PROJECTS_SHORTCUT en "Tareas", ver resolve_page):
+    # screen.kind aqui es ScreenKind.VIEW, no pasa por el bloque MENU/SYSTEM/
+    # SECTIONS_MENU/PROJECTS_MENU de arriba, asi que necesita su propio
+    # fallback a key_nav.
     nav_entry = page.key_nav.get(key)
     if nav_entry is not None:
         return _nav_press(nav_entry)

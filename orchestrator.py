@@ -25,6 +25,7 @@ from typing import Any
 
 import core.health as health
 import core.key_map as key_map
+import core.pinned_projects as pinned_projects_store
 import core.pinned_sections as pinned_sections_store
 import core.screens as screens
 import deck.keys as deck_keys
@@ -148,6 +149,7 @@ def make_key_callback(
     task_totals_ref: dict[str, dict[str, int]],
     last_timer_ref: dict[str, RunningTimer | None],
     pinned_sections: frozenset[str],
+    pinned_projects: frozenset[str],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     reset_idle_timers: Callable[[], None],
@@ -158,6 +160,7 @@ def make_key_callback(
     enter_item_options: Callable[[str, str], None],
     exit_item_options: Callable[[], None],
     enter_section_options: Callable[[str, screens.ScreenKind], None],
+    enter_project_options: Callable[[str, screens.ScreenKind], None],
 ) -> Callable[[Any, int, bool], None]:
     """Crea el callback de pulsacion de tecla para el estado actual.
 
@@ -304,6 +307,8 @@ def make_key_callback(
             ``*_ref``, se recibe por valor y ya sale actualizado porque
             ``_toggle_section_pin`` siempre repinta (recreando este closure)
             justo despues de mutarlo.
+        pinned_projects: Igual que ``pinned_sections``, pero para proyectos
+            (``core.pinned_projects``, ``_toggle_project_pin``).
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
@@ -341,6 +346,10 @@ def make_key_callback(
             ahi mismo (ver mas abajo, "Mantener pulsada una seccion"). La
             dispara solo el temporizador de mantener pulsado, nunca una
             pulsacion normal.
+        enter_project_options: Igual que ``enter_section_options``, pero para
+            un proyecto (``ScreenKind.PROJECT_OPTIONS``, ``project_name``,
+            ``ScreenState.entry_project_origin`` -- ver mas abajo, "Mantener
+            pulsado un proyecto").
 
     Se suma un cuarto tipo de tecla, aparte de habito/tarea/plantilla:
 
@@ -440,6 +449,19 @@ def make_key_callback(
         ``screen.entry_section_origin`` -- "Secciones" o el menu principal,
         segun por cual se llego (nunca a ``ScreenKind.VIEW``, a diferencia de
         "Volver" en el menu de opciones de un habito/tarea).
+    - **Mantener pulsado un proyecto**, mirror exacto de "Mantener pulsada una
+      seccion" para tareas: ``ScreenKind.PROJECTS_MENU`` (ver
+      ``core.screens.KEY_TASKS_PROJECTS_SHORTCUT``) y ``ScreenKind.MENU`` (un
+      boton ya fijado, ver ``core.pinned_projects``) arman el mismo
+      temporizador; soltar antes entra en el proyecto (``"enter_project"`` ->
+      ``_enter_project``); mantener pulsada abre ``ScreenKind.PROJECT_OPTIONS``
+      (``enter_project_options``), con ``screen.entry_project_origin``
+      guardando de donde vino, igual que ``entry_section_origin``.
+
+      Unica opcion real: **Fijar/quitar del menu principal** (tecla 14) ->
+      ``core.pinned_projects`` (``_toggle_project_pin``), mismo patron sin red
+      que ``_toggle_section_pin``. Solo "Volver" (``"project_options_exit"``)
+      saca de aqui, y vuelve a ``screen.entry_project_origin``.
 
     Returns:
         El callback ``on_key_change(deck, key, pressed)`` para el Stream Deck.
@@ -773,11 +795,12 @@ def make_key_callback(
             print(f"Cronometro alternado: {what}", flush=True)
 
     _HOLD_KINDS = ("habit", "habit_undo", "task")  # las unicas que SIEMPRE distinguen corta de mantenida
-    # "enter_section" se arma aparte (ver on_key_change/_arm_hold): tambien
-    # distingue corta de mantenida, pero solo cuando se pulsa desde
-    # ScreenKind.SECTIONS_MENU o desde un boton ya fijado en ScreenKind.MENU --
-    # las dos abren ScreenKind.SECTION_OPTIONS al mantener pulsado, solo
-    # cambia a donde regresa despues "Volver" (ver ScreenState.entry_section_origin).
+    # "enter_section"/"enter_project" se arman aparte (ver on_key_change/
+    # _arm_hold): tambien distinguen corta de mantenida, pero solo cuando se
+    # pulsan desde ScreenKind.SECTIONS_MENU/PROJECTS_MENU o desde un boton ya
+    # fijado en ScreenKind.MENU -- las dos abren ScreenKind.SECTION_OPTIONS/
+    # PROJECT_OPTIONS al mantener pulsado, solo cambia a donde regresa
+    # despues "Volver" (ver ScreenState.entry_section_origin/entry_project_origin).
     _pending_hold: dict[int, tuple[screens.PressAction, threading.Timer]] = {}  # tecla -> (accion, temporizador)
     _hold_lock = threading.Lock()  # protege _pending_hold frente al hilo del temporizador
 
@@ -844,13 +867,14 @@ def make_key_callback(
         y ejecuta ``action`` como una pulsacion corta normal.
 
         ``screen_kind`` (la pantalla en la que se pulso, capturada por
-        ``on_key_change``) solo lo necesita ``"enter_section"``: la misma
-        accion sale tanto de una entrada de ``ScreenKind.SECTIONS_MENU`` como
-        de un boton ya fijado en ``ScreenKind.MENU``, y en los dos casos
-        mantener pulsado abre las opciones de ESA seccion en concreto -- pero
+        ``on_key_change``) solo lo necesitan ``"enter_section"``/
+        ``"enter_project"``: la misma accion sale tanto de una entrada de
+        ``ScreenKind.SECTIONS_MENU``/``PROJECTS_MENU`` como de un boton ya
+        fijado en ``ScreenKind.MENU``, y en los dos casos mantener pulsado
+        abre las opciones de ESA seccion/proyecto en concreto -- pero
         "Volver" debe regresar a la pantalla de origen, distinta segun cual
-        fuera (ver ``enter_section_options``/``ScreenState.
-        entry_section_origin``)."""
+        fuera (ver ``enter_section_options``/``enter_project_options``,
+        ``ScreenState.entry_section_origin``/``entry_project_origin``)."""
 
         def _on_hold_timeout() -> None:
             with _hold_lock:
@@ -859,6 +883,8 @@ def make_key_callback(
                 return  # ya se solto antes de que disparara (pulsacion corta): nada que hacer
             if action.kind == "enter_section":
                 enter_section_options(action.payload, screen_kind)
+            elif action.kind == "enter_project":
+                enter_project_options(action.payload, screen_kind)
             else:
                 item_kind = "habit" if action.kind in ("habit", "habit_undo") else "task"
                 enter_item_options(item_kind, action.payload)
@@ -909,18 +935,22 @@ def make_key_callback(
                 last_timer_ref["value"],
                 mapping,
                 pinned_sections,
+                pinned_projects,
             )
             action = screens.resolve_press(screen, key, resolved)
 
-        # "enter_section" arma hold tanto desde ScreenKind.SECTIONS_MENU como
-        # desde un boton ya fijado en ScreenKind.MENU: las dos abren las
-        # opciones de esa seccion (ver _arm_hold/enter_section_options) -- en
-        # cualquier otra pantalla no deberia poder producirse esta accion.
-        is_section_hold = action.kind == "enter_section" and screen_kind in (
+        # "enter_section"/"enter_project" arman hold tanto desde
+        # ScreenKind.SECTIONS_MENU/PROJECTS_MENU como desde un boton ya
+        # fijado en ScreenKind.MENU: las dos abren las opciones de esa
+        # seccion/proyecto (ver _arm_hold/enter_section_options/
+        # enter_project_options) -- en cualquier otra pantalla no deberia
+        # poder producirse ninguna de las dos acciones.
+        is_pin_target_hold = action.kind in ("enter_section", "enter_project") and screen_kind in (
             screens.ScreenKind.SECTIONS_MENU,
+            screens.ScreenKind.PROJECTS_MENU,
             screens.ScreenKind.MENU,
         )
-        if action.kind in _HOLD_KINDS or is_section_hold:
+        if action.kind in _HOLD_KINDS or is_pin_target_hold:
             _arm_hold(deck, key, action, screen_kind)
         else:
             _run_action(deck, key, action)
@@ -954,6 +984,9 @@ def main() -> None:
     # (ver core.pinned_sections/ScreenKind.SECTION_OPTIONS). Igual que mapping:
     # variable simple, no un wrapper *_ref, mutada por nonlocal en _toggle_section_pin.
     pinned_sections: frozenset[str] = pinned_sections_store.load()
+    # Idem para proyectos (ver core.pinned_projects/ScreenKind.PROJECT_OPTIONS),
+    # mutada por nonlocal en _toggle_project_pin.
+    pinned_projects: frozenset[str] = pinned_projects_store.load()
     habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # habit_id -> objeto Habit, actualizado cada ciclo
     log_habits_ref: dict[str, dict[str, Habit]] = {"value": {}}  # idem para los LogHabit de get_log_habits()
     tasks_ref: dict[str, dict[str, Task]] = {"value": {}}  # task_id -> objeto Task, actualizado cada ciclo
@@ -1034,6 +1067,7 @@ def main() -> None:
             last_timer_ref["value"],
             mapping,
             pinned_sections,
+            pinned_projects,
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
 
@@ -1046,19 +1080,24 @@ def main() -> None:
         is_view = screen.kind is screens.ScreenKind.VIEW
         # Una seccion (screen.section_name) tambien depende de get_habits(),
         # igual que "Hoy"/"Habitos" -- ver core.screens.ScreenState.section_name.
-        # Mientras hay seccion activa, view_id queda con lo que hubiera antes
-        # de entrar (no se toca, ver orchestrator._enter_section) y NO debe
-        # consultarse para las otras cuatro comprobaciones: is_plain_view lo
-        # deja fuera, para no pintar por error un codigo de tareas/logs/
-        # plantillas/cronometros sobre una pantalla que no tiene nada de eso.
-        is_plain_view = is_view and not screen.section_name
+        # Un proyecto (screen.project_name) es el equivalente para get_tasks().
+        # Mientras hay seccion/proyecto activo, view_id queda con lo que
+        # hubiera antes de entrar (no se toca, ver orchestrator._enter_section/
+        # _enter_project) y NO debe consultarse para las comprobaciones que no
+        # le tocan: is_plain_view los deja fuera, para no pintar por error un
+        # codigo de logs/plantillas/cronometros (ni tareas sobre una seccion,
+        # ni habitos sobre un proyecto) sobre una pantalla que no tiene nada
+        # de eso.
+        is_plain_view = is_view and not screen.section_name and not screen.project_name
         if last_habits_code is not None and is_view and (screen.section_name or screen.view_id in ("today", "habits")):
             code = last_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
         if last_log_habits_code is not None and is_plain_view and screen.view_id == "logs":
             code = last_log_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
-        if last_tasks_code is not None and is_plain_view and screen.view_id in ("today", "tasks"):
+        if last_tasks_code is not None and is_view and (
+            screen.project_name or (is_plain_view and screen.view_id in ("today", "tasks"))
+        ):
             code = last_tasks_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_task.keys(), code))
         if last_templates_code is not None and is_plain_view and screen.view_id == "create":
@@ -1089,6 +1128,7 @@ def main() -> None:
                 task_totals_ref,
                 last_timer_ref,
                 pinned_sections,
+                pinned_projects,
                 screen,
                 screen_lock,
                 _reset_idle_timers,
@@ -1099,6 +1139,7 @@ def main() -> None:
                 _enter_item_options,
                 _exit_item_options,
                 _enter_section_options,
+                _enter_project_options,
             )
         )
 
@@ -1387,6 +1428,14 @@ def main() -> None:
             screen.kind, screen.page = screens.ScreenKind.SECTIONS_MENU, 0
             _paint_current_screen()
 
+    def _enter_projects_menu() -> None:
+        """Abre el submenu "Proyectos" (``core.screens.ScreenKind.PROJECTS_MENU``).
+
+        Mirror exacto de ``_enter_sections_menu``, para tareas."""
+        with screen_lock:
+            screen.kind, screen.page = screens.ScreenKind.PROJECTS_MENU, 0
+            _paint_current_screen()
+
     def _change_page(delta: int) -> None:
         with screen_lock:
             screen.page += delta
@@ -1482,6 +1531,38 @@ def main() -> None:
         with screen_lock:
             _paint_current_screen()
 
+    def _enter_project_options(project_name: str, origin: screens.ScreenKind) -> None:
+        """Abre la pantalla de opciones de ``project_name``
+        (``ScreenKind.PROJECT_OPTIONS``). Mirror exacto de
+        ``_enter_section_options``, para un proyecto -- ``origin`` es
+        ``ScreenKind.PROJECTS_MENU`` o ``ScreenKind.MENU``, guardado en
+        ``ScreenState.entry_project_origin``."""
+        with screen_lock:
+            screen.kind = screens.ScreenKind.PROJECT_OPTIONS
+            screen.entry_project_name = project_name
+            screen.entry_project_origin = origin
+            _paint_current_screen()
+
+    def _exit_project_options() -> None:
+        """Vuelve de la pantalla de opciones de un proyecto a la pantalla
+        desde la que se abrio (``ScreenState.entry_project_origin``). Mirror
+        exacto de ``_exit_section_options``."""
+        with screen_lock:
+            screen.kind = screen.entry_project_origin
+            _paint_current_screen()
+
+    def _toggle_project_pin() -> None:
+        """Alterna si el proyecto abierto en ``ScreenKind.PROJECT_OPTIONS``
+        aparece como boton fijo en el menu principal (``core.pinned_projects``).
+        Mirror exacto de ``_toggle_section_pin``: tampoco llama a ningun
+        proveedor ni pasa por ``_claim``/``_release``."""
+        nonlocal pinned_projects
+        with screen_lock:
+            project_name = screen.entry_project_name
+        pinned_projects = pinned_projects_store.toggle(project_name, pinned_projects)
+        with screen_lock:
+            _paint_current_screen()
+
     def _numeric_edit(kind: str, digit: str) -> None:
         """Muta ``ScreenState.entry_value`` (teclear un digito, el punto
         decimal o borrar) y repinta. Sin llamada de red, asi que no pasa por
@@ -1502,15 +1583,17 @@ def main() -> None:
         (refetch + repintado): entrar en una vista desde el menu siempre
         pide datos frescos antes de pintarla.
 
-        Limpia ``section_name``: sin esto, entrar en "Hoy"/"Hábitos" desde el
-        menu tras haber visitado una seccion dejaria ese filtro puesto por
-        error (ver ``core.screens.ScreenState.section_name``)."""
+        Limpia ``section_name``/``project_name``: sin esto, entrar en
+        "Hoy"/"Hábitos"/"Tareas" desde el menu tras haber visitado una
+        seccion/proyecto dejaria ese filtro puesto por error (ver
+        ``core.screens.ScreenState.section_name``/``project_name``)."""
         if not _claim(_NAV_SENTINEL):
             return  # ya hay una entrada a vista en vuelo (doble toque en el menu)
         try:
             with screen_lock:
                 screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, view_id, 0
                 screen.section_name = ""
+                screen.project_name = ""
             refresh_cycle()
         finally:
             _release(_NAV_SENTINEL)
@@ -1524,12 +1607,29 @@ def main() -> None:
 
         ``screen.view_id`` no se toca (queda con lo que hubiera antes): no se
         consulta mientras ``section_name`` no este vacio (ver
-        ``core.screens.resolve_page``)."""
+        ``core.screens.resolve_page``). Limpia ``project_name`` (nunca los
+        dos filtros a la vez)."""
         if not _claim(_NAV_SENTINEL):
             return  # ya hay una entrada a vista/seccion en vuelo (doble toque)
         try:
             with screen_lock:
                 screen.kind, screen.section_name, screen.page = screens.ScreenKind.VIEW, section_name, 0
+                screen.project_name = ""
+            refresh_cycle()
+        finally:
+            _release(_NAV_SENTINEL)
+
+    def _enter_project(project_name: str) -> None:
+        """Entra en el proyecto ``project_name`` en pagina 0 y fuerza un
+        refresco completo. Mirror exacto de ``_enter_section``, para tareas
+        (tecla 1 de "Tareas"/``KEY_TASKS_PROJECTS_SHORTCUT``). Limpia
+        ``section_name``."""
+        if not _claim(_NAV_SENTINEL):
+            return  # ya hay una entrada a vista/proyecto en vuelo (doble toque)
+        try:
+            with screen_lock:
+                screen.kind, screen.project_name, screen.page = screens.ScreenKind.VIEW, project_name, 0
+                screen.section_name = ""
             refresh_cycle()
         finally:
             _release(_NAV_SENTINEL)
@@ -1554,11 +1654,13 @@ def main() -> None:
                 and screen.view_id == screens.DEFAULT_VIEW_ID
                 and screen.page == 0
                 and not screen.section_name
+                and not screen.project_name
             )
             if at_home:
                 return
             screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, screens.DEFAULT_VIEW_ID, 0
             screen.section_name = ""
+            screen.project_name = ""
             _paint_current_screen()
 
     def _dispatch_navigation(action: screens.PressAction) -> None:
@@ -1573,6 +1675,10 @@ def main() -> None:
             _enter_view(action.payload)
         elif action.kind == "enter_section":
             _enter_section(action.payload)
+        elif action.kind == "open_projects":
+            _enter_projects_menu()
+        elif action.kind == "enter_project":
+            _enter_project(action.payload)
         elif action.kind == "page_prev":
             _change_page(-1)
         elif action.kind == "page_next":
@@ -1599,6 +1705,10 @@ def main() -> None:
             _exit_section_options()
         elif action.kind == "toggle_section_pin":
             _toggle_section_pin()
+        elif action.kind == "project_options_exit":
+            _exit_project_options()
+        elif action.kind == "toggle_project_pin":
+            _toggle_project_pin()
 
     # Dos plazos, el mismo disparador: cualquier pulsacion reprograma ambos.
     auto_return_timer = _IdleTimer(AUTO_RETURN_SECONDS, _on_auto_return_timeout)

@@ -322,6 +322,13 @@ class Task:
             ``deck.renderer.render_task`` para anteponer ``"[total] "`` al
             titulo si es mayor que 0 -- si es 0 (nunca se ha cronometrado
             esta tarea), la tecla se pinta igual que siempre.
+        project_name: Nombre del proyecto (``projects.name`` en
+            ``../habits-core``) resuelto por ``v_today_tasks`` -- mismo
+            criterio que ``Habit.section_name``: viene ya resuelto del
+            proveedor, nunca un UUID crudo, para que ``core.screens`` pueda
+            filtrar/agrupar por proyecto sin ``isinstance``. Vacio si la
+            tarea no tiene proyecto (no deberia pasar, ``project_id`` es
+            ``not null`` en ``../habits-core``).
     """
 
     def __init__(
@@ -333,6 +340,7 @@ class Task:
         overdue: bool = False,
         due_day: str = "",
         template_id: str = "",
+        project_name: str = "",
     ) -> None:
         self.id = id
         self.title = title
@@ -341,6 +349,7 @@ class Task:
         self.overdue = overdue
         self.due_day = due_day
         self.template_id = template_id
+        self.project_name = project_name
         self.timer_running = False
         self.total_seconds = 0
 

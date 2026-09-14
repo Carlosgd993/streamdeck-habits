@@ -186,6 +186,7 @@ def build_task(data: dict[str, Any]) -> Task:
         overdue=bool(data.get("overdue")),
         due_day=str(data.get("due_day") or ""),
         template_id=str(data.get("template_id") or ""),
+        project_name=str(data.get("project_name") or ""),
     )
 
 
@@ -441,7 +442,10 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
             resp = requests.get(
                 f"{self._base}/v_today_tasks",
                 headers=self._headers(Accept="application/json"),
-                params={"select": "id,title,priority,overdue,due_day,template_id", "order": _TASKS_ORDER},
+                params={
+                    "select": "id,title,priority,overdue,due_day,template_id,project_name",
+                    "order": _TASKS_ORDER,
+                },
                 timeout=10,
             )
         except requests.RequestException as exc:
