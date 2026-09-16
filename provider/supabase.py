@@ -6,7 +6,8 @@ Concentra TODO lo especifico de Supabase/PostgREST, aislado del resto del
 proyecto:
 
 - Carga de la URL y la clave publishable desde el ``.env``.
-- Las llamadas HTTP (``requests``) contra las vistas ``v_today_habits``,
+- Las llamadas HTTP (``requests``, sobre una ``Session`` reutilizada -- ver
+  ``_build_session``) contra las vistas ``v_today_habits``,
   ``v_log_habits``, ``v_today_tasks``, ``v_templates``, ``v_timer_labels`` y
   ``v_running_timer``, y las funciones ``rpc/habit_step``, ``rpc/habit_undo``,
   ``rpc/complete_task``, ``rpc/skip_task``, ``rpc/set_task_priority``,
@@ -33,6 +34,8 @@ from typing import Any
 
 import requests
 from dotenv import load_dotenv
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from config import ENV_FILE
 from core.emoji import extract_emoji
@@ -62,6 +65,30 @@ _ICON_TEXT_PREFIX = "txt_"  # prefijo de icon_res cuando el icono elegido es un 
 _TASKS_ORDER = "priority.desc,due_date.asc"  # v_today_tasks no ordena por si sola: lo mas urgente primero
 _TEMPLATES_ORDER = "title"  # v_templates si ordena por dentro, pero el orden va explicito como en el resto
 _TIMER_LABELS_ORDER = "sort_order"  # v_timer_labels si ordena por dentro, pero explicito como el resto
+
+
+def _build_session() -> requests.Session:
+    """Crea la sesion HTTP que reutilizan TODAS las peticiones del adaptador.
+
+    Una ``Session`` mantiene viva la conexion TCP/TLS entre peticiones
+    (keep-alive + pool de urllib3): sin ella, cada lectura o escritura pagaba
+    su propio handshake completo, que en la Raspberry Pi cuesta mas que los
+    datos en si -- y un ciclo de refresco encadena varias seguidas.
+
+    El unico reintento configurado es el de **conexion** (``connect=1``,
+    ``read=0``, ``status=0``): cubre el caso tipico del keep-alive, una
+    conexion del pool que el servidor cerro por inactividad y que falla al
+    reutilizarse. Es seguro tambien para las RPC que NO son idempotentes
+    (``instantiate_task`` crea una tarea por llamada): un fallo de conexion
+    significa que la peticion no llego a enviarse. Un fallo de LECTURA (la
+    peticion si salio, la respuesta no llego) no se reintenta nunca, por ese
+    mismo motivo.
+    """
+    session = requests.Session()
+    retry = Retry(total=1, connect=1, read=0, status=0, redirect=0)
+    session.mount("https://", HTTPAdapter(max_retries=retry))
+    session.mount("http://", HTTPAdapter(max_retries=retry))
+    return session
 
 
 def _load_config() -> tuple[str | None, str | None]:
@@ -290,6 +317,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
             )
         self._base = f"{url.rstrip('/')}/rest/v1"
         self._key = key
+        self._session = _build_session()
 
     def _headers(self, **extra: str) -> dict[str, str]:
         """Cabeceras base de PostgREST (``apikey`` + ``Authorization``)."""
@@ -314,7 +342,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         estado ni encadenar una segunda consulta de progreso.
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_today_habits",
                 headers=self._headers(Accept="application/json"),
                 params={
@@ -347,7 +375,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         ``build_log_habit``).
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_log_habits",
                 headers=self._headers(Accept="application/json"),
                 params={
@@ -369,7 +397,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
     def step(self, habit: Habit) -> float:
         """Avanza un paso ``habit`` via ``rpc/habit_step`` y devuelve el nuevo total."""
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/habit_step",
                 headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
                 json={"p_habit_id": habit.id},
@@ -392,7 +420,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         hoy no habia checkin, asi que repetirla es seguro.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/habit_undo",
                 headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
                 json={"p_habit_id": habit.id},
@@ -415,7 +443,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         del checkin de hoy.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/habit_set",
                 headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
                 json={"p_habit_id": habit.id, "p_value": value},
@@ -439,7 +467,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         la peticion (``_TASKS_ORDER``).
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_today_tasks",
                 headers=self._headers(Accept="application/json"),
                 params={
@@ -466,7 +494,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         idempotente en la base, de modo que un reintento no duplica nada.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/complete_task",
                 headers=self._headers(**{"Content-Type": "application/json"}),
                 json={"p_task_id": task.id},
@@ -484,7 +512,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         cuerpo, nada que parsear. Idempotente en la base.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/skip_task",
                 headers=self._headers(**{"Content-Type": "application/json"}),
                 json={"p_task_id": task.id},
@@ -503,7 +531,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         una ya completada/omitida o inexistente no hace nada, ni falla.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/set_task_priority",
                 headers=self._headers(**{"Content-Type": "application/json"}),
                 json={"p_task_id": task.id, "p_priority": priority},
@@ -524,7 +552,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         mismo ``grant``.
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_templates",
                 headers=self._headers(Accept="application/json"),
                 params={
@@ -556,7 +584,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         Y **no es idempotente**: dos llamadas crean dos tareas.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/instantiate_task",
                 headers=self._headers(**{"Content-Type": "application/json", "Accept": "application/json"}),
                 json={"p_template_id": template.id},
@@ -579,7 +607,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         etiquetas activas y el filtro es del cliente a proposito.
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_timer_labels",
                 headers=self._headers(Accept="application/json"),
                 params={
@@ -606,7 +634,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         base); ``None`` si la lista viene vacia.
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_running_timer",
                 headers=self._headers(Accept="application/json"),
                 params={"select": "id,task_id,label_id,title,started_at", "limit": "1"},
@@ -631,7 +659,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         clave -- no hay que distinguir de cual de las dos tablas viene.
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_timer_daily_totals",
                 headers=self._headers(Accept="application/json"),
                 params={"select": "task_id,label_id,seconds_today"},
@@ -655,7 +683,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         tiene "acumulado de siempre" en el contrato, solo el de hoy).
         """
         try:
-            resp = requests.get(
+            resp = self._session.get(
                 f"{self._base}/v_task_timer_totals",
                 headers=self._headers(Accept="application/json"),
                 params={"select": "task_id,seconds_total"},
@@ -679,7 +707,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         propio estado, no lo que este metodo asuma.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/timer_toggle",
                 headers=self._headers(**{"Content-Type": "application/json"}),
                 json={"p_task_id": task.id},
@@ -697,7 +725,7 @@ class SupabaseProvider(HabitProvider, TaskProvider, TemplateProvider, TimerProvi
         ``p_task_id`` -- la RPC exige exactamente uno de los dos.
         """
         try:
-            resp = requests.post(
+            resp = self._session.post(
                 f"{self._base}/rpc/timer_toggle",
                 headers=self._headers(**{"Content-Type": "application/json"}),
                 json={"p_label_id": label.id},

@@ -28,6 +28,11 @@ AUTO_RETURN_SECONDS = 300  # 5 min sin pulsar fuera de la vista "Hoy" -> vuelve 
 STANDBY_SECONDS = 1800  # 30 min sin pulsar nada -> stand by (pantalla apagada, sin refrescos)
 LONG_PRESS_SECONDS = 0.6  # mantener pulsado un habito/tarea este tiempo abre su menu de opciones
 
+CACHE_TTL_SECONDS = 60  # antiguedad maxima con la que se da por buena una lectura cacheada al entrar en una
+                        # pantalla (ver core.cache/core.screens.needs_for): ir y volver entre pantallas dentro
+                        # de ese minuto no pide nada a la base; pasado, se pinta al instante con lo cacheado y
+                        # se relee en segundo plano. Unica palanca para ajustar el compromiso frescura/latencia
+
 RESTORE_COOLDOWN_SECONDS = 1800  # 30 min minimo entre intentos de reactivar un proyecto Supabase pausado
 
 TIMER_TICK_SECONDS = 1  # repinta (sin refetch, calculo local a partir de running_timer_ref) mientras haya

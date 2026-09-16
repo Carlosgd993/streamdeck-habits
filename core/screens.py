@@ -107,7 +107,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
-from config import ALL_KEYS, AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
+from config import ALL_KEYS, AVAILABLE_KEYS, CACHE_TTL_SECONDS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
+from core.cache import HABIT_RESOURCES, Resource
 from core.key_map import paginate
 from provider.base import BooleanHabit, Habit, RealHabit, RunningTimer, Task, Template, TimerLabel, clip_title
 from ticktick.base import TickTickProject, TickTickTask
@@ -615,6 +616,18 @@ class ViewSpec:
         menu_label: Texto de su boton en el menu principal.
         menu_emoji: Icono de ese boton.
         build_page: Como reparte sus items entre las teclas de una pagina.
+        needs: Que lecturas necesita esta vista para pintarse (ver
+            ``core.cache.Resource``). Es lo que permite pedir SOLO eso al
+            entrar en ella -- "Habitos" no pide tareas, "Tareas" no pide
+            habitos -- en vez de releerlo todo. Obligatorio y sin default a
+            proposito: una vista nueva tiene que declararlo, y declararlo de
+            menos significa pintar datos viejos (lo que no se declara no se
+            refresca al entrar).
+        max_age_seconds: Antiguedad maxima tolerada para esas lecturas al
+            entrar, en segundos; ``None`` usa ``config.CACHE_TTL_SECONDS``,
+            que es el caso normal. Solo "Crear" lo baja a 0 (releer siempre):
+            su gris antiduplicado depende de tener las tareas al dia, ver
+            ``_create_items``.
         allows_undo: Si pulsar en esta vista un habito **booleano** ya hecho
             hoy lo deshace en vez de repetir el paso. Lo declara cada vista, no
             se hereda: una vista nueva no deshace nada salvo que lo pida. La
@@ -631,6 +644,8 @@ class ViewSpec:
     menu_label: str
     menu_emoji: str
     build_page: PageBuilder
+    needs: frozenset[Resource]
+    max_age_seconds: float | None = None
     allows_undo: bool = False
 
 
@@ -1096,16 +1111,49 @@ KEY_TASKS_PROJECTS_SHORTCUT = 1
 ``_flat_page_builder`` en vez de a ``core.key_map.update_mapping``."""
 
 VIEWS: dict[str, ViewSpec] = {
-    "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items), allows_undo=True),
+    "today": ViewSpec(
+        "today",
+        "Hoy",
+        "📅",
+        _flat_page_builder(_today_items),
+        needs=frozenset({Resource.HABITS, Resource.TASKS, Resource.RUNNING_TIMER, Resource.TASK_TOTALS}),
+        allows_undo=True,
+    ),
     "habits": ViewSpec(
-        "habits", "Habitos", "✅", _tiered_page_builder(frozenset({KEY_HABITS_SECTIONS_SHORTCUT})), allows_undo=True
+        "habits",
+        "Habitos",
+        "✅",
+        _tiered_page_builder(frozenset({KEY_HABITS_SECTIONS_SHORTCUT})),
+        needs=frozenset({Resource.HABITS}),
+        allows_undo=True,
     ),
     "tasks": ViewSpec(
-        "tasks", "Tareas", "🗒️", _flat_page_builder(_tasks_items, frozenset({KEY_TASKS_PROJECTS_SHORTCUT}))
+        "tasks",
+        "Tareas",
+        "🗒️",
+        _flat_page_builder(_tasks_items, frozenset({KEY_TASKS_PROJECTS_SHORTCUT})),
+        needs=frozenset({Resource.TASKS, Resource.RUNNING_TIMER, Resource.TASK_TOTALS}),
     ),
-    "create": ViewSpec("create", "Crear", "➕", _flat_page_builder(_create_items)),
-    "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items)),
-    "timers": ViewSpec("timers", "Cronometros", "⏱️", _flat_page_builder(_timer_items)),
+    # Unica vista con max_age 0: relee las tareas SIEMPRE al entrar, porque de
+    # ellas sale el gris que impide crear una ocurrencia duplicada
+    # (``_create_items``; ``instantiate_task`` no es idempotente). Las
+    # plantillas en si cambian rarisimamente, pero van en el mismo viaje.
+    "create": ViewSpec(
+        "create",
+        "Crear",
+        "➕",
+        _flat_page_builder(_create_items),
+        needs=frozenset({Resource.TEMPLATES, Resource.TASKS}),
+        max_age_seconds=0,
+    ),
+    "logs": ViewSpec("logs", "Logs", "📝", _flat_page_builder(_log_items), needs=frozenset({Resource.LOG_HABITS})),
+    "timers": ViewSpec(
+        "timers",
+        "Cronometros",
+        "⏱️",
+        _flat_page_builder(_timer_items),
+        needs=frozenset({Resource.TIMER_LABELS, Resource.RUNNING_TIMER, Resource.DAILY_TOTALS}),
+    ),
 }
 DEFAULT_VIEW_ID = "today"
 
@@ -1124,6 +1172,63 @@ MENU_ENTRIES: list[MenuEntry] = [
     MenuEntry("TickTick", "☑️", "open_ticktick"),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
+
+def needs_for(screen: ScreenState) -> frozenset[Resource]:
+    """Que lecturas necesita la pantalla activa para pintarse.
+
+    Es la funcion que hace selectivo el refresco: entrar en "Habitos" pide
+    habitos y nada mas, entrar en "Logs" pide solo los logs. Una pantalla que
+    no pinta datos (Sistema, el teclado numerico, el stand by, las opciones de
+    una seccion/proyecto) no necesita ninguna.
+
+    **Declarar de menos aqui no rompe nada, pero enseña datos viejos**: lo que
+    no aparezca en este conjunto no se refresca al entrar en esa pantalla (si
+    lo hara el ciclo periodico). Lo pintado y lo que hace cada tecla siguen
+    siendo coherentes pase lo que pase, porque ambos salen del mismo
+    ``resolve_page`` bajo el mismo lock (ver ``orchestrator._paint_current_screen``).
+    """
+    kind = screen.kind
+    if kind is ScreenKind.TICKTICK:
+        return frozenset({Resource.TICKTICK})
+    if kind is ScreenKind.MENU:
+        # Los dos cronometros son del atajo de la tecla 7 (_timer_shortcut_item);
+        # habitos y tareas, de los botones de seccion/proyecto fijados
+        # (_pinned_section_menu_entries/_pinned_project_menu_entries), que se
+        # derivan de ellos en cada resolucion.
+        return frozenset({Resource.HABITS, Resource.TASKS, Resource.RUNNING_TIMER, Resource.DAILY_TOTALS})
+    if kind is ScreenKind.SECTIONS_MENU:
+        return frozenset({Resource.HABITS})  # la lista de secciones se deriva de los habitos de hoy
+    if kind is ScreenKind.PROJECTS_MENU:
+        return frozenset({Resource.TASKS})  # idem, de las tareas pendientes
+    if kind is ScreenKind.ITEM_OPTIONS:
+        if screen.entry_item_kind == "habit":
+            return HABIT_RESOURCES  # las teclas informativas 5/10 pintan el progreso de hoy
+        return frozenset({Resource.TASKS, Resource.RUNNING_TIMER})  # la tecla 2 pinta el cronometro de la tarea
+    if kind is not ScreenKind.VIEW:
+        return frozenset()  # SYSTEM, NUMERIC_ENTRY, STANDBY, SECTION_OPTIONS, PROJECT_OPTIONS: layouts fijos
+    if screen.section_name:
+        return frozenset({Resource.HABITS})  # una seccion es "Habitos" filtrada (ver _section_page)
+    if screen.project_name:
+        # Un proyecto es "Tareas" filtrada, y pinta igual marco y acumulado de
+        # cronometro (ver _project_page -> _mark_running_task).
+        return frozenset({Resource.TASKS, Resource.RUNNING_TIMER, Resource.TASK_TOTALS})
+    spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
+    return spec.needs
+
+
+def max_age_for(screen: ScreenState) -> float:
+    """Antiguedad maxima tolerada al entrar en la pantalla activa, en segundos.
+
+    ``config.CACHE_TTL_SECONDS`` salvo que la vista pida otra cosa (hoy solo
+    "Crear", con 0 = releer siempre). Una pantalla que no es vista usa el TTL
+    normal: no hay motivo para que el menu sea mas exigente que "Hoy".
+    """
+    if screen.kind is ScreenKind.VIEW and not screen.section_name and not screen.project_name:
+        spec = VIEWS.get(screen.view_id) or VIEWS[DEFAULT_VIEW_ID]
+        if spec.max_age_seconds is not None:
+            return spec.max_age_seconds
+    return CACHE_TTL_SECONDS
+
 
 KEY_TIMER_SHORTCUT = 7
 """Tecla fija del menu principal para el atajo al cronometro (ver

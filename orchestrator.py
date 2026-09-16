@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import core.health as health
@@ -40,11 +41,21 @@ from config import (
     TIMER_SYNC_SECONDS,
     TIMER_TICK_SECONDS,
 )
+from core.cache import (
+    ALL_RESOURCES,
+    HABIT_RESOURCES,
+    SUPABASE_RESOURCES,
+    TASK_WRITE_RESOURCES,
+    TIMER_RESOURCES,
+    Resource,
+    ResourceCache,
+)
 from core.error_codes import CODES
 from deck.session import BRIGHTNESS, BRIGHTNESS_STANDBY, DeckSession
 from provider.base import (
     Habit,
     HabitProvider,
+    ProviderAuthError,
     ProviderError,
     RealHabit,
     RunningTimer,
@@ -160,7 +171,8 @@ def make_key_callback(
     reset_idle_timers: Callable[[], None],
     dispatch_navigation: Callable[[screens.PressAction], None],
     repaint: Callable[[], None],
-    refresh: Callable[[], None],
+    invalidate: Callable[[frozenset[Resource]], None],
+    refresh_after_write: Callable[[frozenset[Resource]], None],
     exit_numeric_entry: Callable[[], None],
     enter_item_options: Callable[[str, str], None],
     exit_item_options: Callable[[], None],
@@ -188,8 +200,8 @@ def make_key_callback(
       resuelve la pulsacion como "habit_undo" (un booleano ya hecho, en una
       vista que lo permita -- "Hoy" y "Habitos", ver
       ``core.screens.ViewSpec.allows_undo``). Pide ``undo`` al proveedor
-      y, si tiene exito, dispara un **refresco completo** (``refresh``) en vez
-      del repintado optimista: el valor que devuelve la base es el del dia y
+      y, si tiene exito, repinta con el valor optimista y relee los habitos
+      por detras (``refresh_after_write``): el valor que devuelve la base es el del dia y
       en un habito ``weekly_quota`` la vista pinta el contador de la semana,
       asi que el unico estado fiable es el que se relee. Fallo → tecla en rojo
       con codigo, igual que un paso.
@@ -219,10 +231,11 @@ def make_key_callback(
       optimista (a diferencia de habito/tarea/plantilla): la base decide
       start-vs-stop mirando su propio estado, y puede parar un cronometro
       DISTINTO del que se pulso (el que estuviera corriendo antes) -- el
-      unico estado fiable es el que trae un ``refresh()`` completo. Sin
-      acuse verde propio: a diferencia de cerrar una tarea o crear desde
-      plantilla, aqui no hay "peticion en vuelo" que merezca su propio
-      color, el ``refresh()`` ya es casi inmediato. **No sale del menu de
+      unico estado fiable es el que trae la relectura de los cronometros
+      (``refresh_after_write(TIMER_RESOURCES)``). Sin acuse verde propio: a
+      diferencia de cerrar una tarea o crear desde plantilla, aqui no hay
+      "peticion en vuelo" que merezca su propio color, esa relectura ya es
+      casi inmediata. **No sale del menu de
       opciones de la tarea** (a diferencia de "Skip"/"cambiar prioridad"):
       se queda ahi para poder ver el cronometro corriendo o volver a
       pulsarlo para pararlo, mismo criterio que "Ajustar el progreso" de un
@@ -345,10 +358,18 @@ def make_key_callback(
             usan los pasos de habito, los cierres de tarea y las creaciones
             desde plantilla con exito, para reflejar de inmediato un cambio que
             puede desplazar otros items.
-        refresh: Ciclo de refresco completo (refetch + repintado), el mismo
-            que corre periodicamente. Lo usa el deshacer de un habito, que
-            necesita releer el estado real en vez de fiarse del valor
-            devuelto.
+        invalidate: Marca como caducadas las lecturas que una escritura ha
+            podido cambiar (``core.cache.ResourceCache.invalidate``), **sin
+            pedir nada ahora**. Es lo que usa una escritura cuyo resultado
+            optimista ya es exacto (un paso de habito, un cierre de tarea):
+            la pantalla actual ya quedo bien, y esos datos se releeran en la
+            siguiente navegacion que los necesite.
+        refresh_after_write: Igual, pero ademas los relee ya, por detras
+            (``orchestrator._refresh_after_write``). Para escrituras cuyo
+            resultado optimista NO basta: un deshacer, un cambio de prioridad
+            (que reordena) o un cronometro (que la base pudo parar en otra
+            tarea). Nunca bloquea al hilo de callbacks: la relectura va en el
+            hilo de refresco y repinta al terminar.
         exit_numeric_entry: Vuelve de la pantalla de teclado numerico a la
             vista de origen y repinta. Lo usa una confirmacion ("OK") con
             exito; en un fallo se queda en el teclado (ver mas abajo) para
@@ -401,9 +422,9 @@ def make_key_callback(
         cualquier ``Habit`` (con objetivo o de solo registro, ver
         ``provider.base.LogHabit``), no solo el ``BooleanHabit`` hecho que ya
         cubre el tap-undo de "Habitos" (``core.screens._undoes``). Exito ->
-        mutacion optimista de ``habit.current_value`` + ``screen.kind =
-        ScreenKind.VIEW`` + ``refresh()`` completo (no ``exit_item_options``,
-        que solo repintaria con cache): el valor que devuelve la base es el
+        mutacion optimista de ``habit.current_value`` + ``exit_item_options``
+        (vuelve a la vista de origen) + relectura de los habitos por detras
+        (``refresh_after_write``): el valor que devuelve la base es el
         del dia, y en un habito ``weekly_quota`` hay que releer el contador
         semanal real -- mismo motivo que el ``"habit_undo"`` de una pulsacion
         corta normal, ver ``press_habit``.
@@ -416,11 +437,12 @@ def make_key_callback(
         delta fijo (el payload de la ``PressAction`` ya lo trae); "+Paso/-Paso"
         suman/restan el ``step`` propio del habito (el payload es solo el
         signo, el delta lo calcula ``press_habit_options_add_step`` con el
-        objeto ``Habit`` a mano). Exito -> mutacion optimista + ``refresh()``
-        completo (el valor fiable es el que devuelve ``habit_set``), pero **a
+        objeto ``Habit`` a mano). Exito -> mutacion optimista + relectura de
+        los habitos por detras (el valor fiable es el que devuelve
+        ``habit_set``), pero **a
         diferencia de "Deshacer" no sale de** ``ScreenKind.ITEM_OPTIONS``:
         se queda en la pantalla para poder encadenar varios ajustes seguidos,
-        y como ``refresh()`` repinta la pantalla activa (que sigue siendo
+        y como esa relectura repinta la pantalla activa (que sigue siendo
         esta), las teclas informativas 5/10 (progreso de hoy/unidad, ver
         ``core.screens.resolve_page``) tambien se actualizan. Solo "Volver"
         saca de aqui.
@@ -512,10 +534,19 @@ def make_key_callback(
             # refresco posterior falla, la tecla queda pintada con el estado
             # nuevo en vez de con el viejo.
             habit.current_value = new_value
+            _safe_render(repaint)
             if undo:
-                refresh()  # relee el estado real; ver el docstring de make_key_callback
+                # El valor que devuelve la base es el del dia, y en un habito
+                # weekly_quota la vista pinta el contador de la semana: hay que
+                # releer de verdad. La pantalla ya quedo repintada con el valor
+                # optimista, asi que la relectura va por detras (antes bloqueaba
+                # el hilo de callbacks con las ocho lecturas).
+                refresh_after_write(HABIT_RESOURCES)
             else:
-                _safe_render(repaint)
+                # Un paso si es exacto (el valor sale de la base), asi que basta
+                # con marcar los habitos como caducados: se releeran en la
+                # siguiente navegacion que los necesite, sin pedir nada ahora.
+                invalidate(HABIT_RESOURCES)
             print(f"{what} OK: {habit.name} -> {new_value}", flush=True)
 
     def press_habit_value(deck: Any, key: int, habit_id: str) -> None:
@@ -540,6 +571,7 @@ def make_key_callback(
         else:
             habit.current_value = new_value
             _safe_render(exit_numeric_entry)
+            invalidate(HABIT_RESOURCES)  # valor exacto de la base: basta con caducarlo, sin releer ahora
             print(f"Entrada manual OK: {habit.name} -> {new_value}", flush=True)
 
     def _clear_running_timer_if_task(task_id: str) -> None:
@@ -598,6 +630,11 @@ def make_key_callback(
             task.completed = True
             _clear_running_timer_if_task(task_id)
             _safe_render(repaint)
+            # La tarea se queda en gris hasta el proximo refresco REAL (ver
+            # "Completar no hace desaparecer" en CLAUDE.md), asi que no se
+            # relee ahora: solo se caduca -- junto con los cronometros, porque
+            # complete_task para en la base cualquiera abierto de esta tarea.
+            invalidate(TASK_WRITE_RESOURCES)
             print(f"Tarea completada: {task.title}", flush=True)
 
     def press_ticktick_toggle(deck: Any, key: int, task_id: str) -> None:
@@ -633,6 +670,7 @@ def make_key_callback(
         else:
             task.completed = not task.completed
             _safe_render(repaint)
+            invalidate(frozenset({Resource.TICKTICK}))  # igual que press_task: gris ahora, relectura al volver
             print(f"TickTick {'completada' if task.completed else 'reabierta'}: {task.title}", flush=True)
 
     def press_task_priority(deck: Any, key: int, priority_str: str) -> None:
@@ -652,6 +690,10 @@ def make_key_callback(
         else:
             task.priority = priority
             _safe_render(exit_item_options)
+            # La prioridad decide el ORDEN de la lista (priority.desc en el
+            # proveedor), y eso no lo arregla la mutacion optimista: se relee
+            # ya, por detras, para que la tarea aparezca donde toca.
+            refresh_after_write(frozenset({Resource.TASKS}))
             print(f"Prioridad cambiada: {task.title} -> {priority}", flush=True)
 
     def press_task_skip(deck: Any, key: int) -> None:
@@ -684,6 +726,7 @@ def make_key_callback(
             tasks_ref["value"].pop(task_id, None)
             _clear_running_timer_if_task(task_id)
             _safe_render(exit_item_options)
+            invalidate(TASK_WRITE_RESOURCES)  # igual que completar: skip_task tambien para su cronometro
             print(f"Tarea omitida: {task.title}", flush=True)
 
     def press_habit_undo_option(deck: Any, key: int) -> None:
@@ -694,12 +737,12 @@ def make_key_callback(
         cubre BooleanHabit hecho, ver core.screens._undoes).
 
         Igual que el "habit_undo" de una pulsacion normal (ver press_habit),
-        dispara refresh() en vez de mutacion optimista + exit_item_options:
-        el valor que devuelve la base es el del dia, y en un habito
-        weekly_quota hay que releer el contador semanal real -- refresh()
-        tambien saca de ScreenKind.ITEM_OPTIONS (se fija antes de llamarlo,
-        para que el repintado caiga sobre la vista de origen, no sobre el
-        menu de opciones).
+        la mutacion optimista no basta: el valor que devuelve la base es el
+        del dia, y en un habito weekly_quota hay que releer el contador
+        semanal real. Asi que sale del menu a la vista de origen
+        (exit_item_options, que ya repinta con lo optimista) y ademas relee
+        los habitos por detras (refresh_after_write) -- antes esto disparaba
+        el ciclo completo, las ocho lecturas, bloqueando el hilo de teclas.
         """
         with screen_lock:
             habit_id = screen.entry_item_id
@@ -715,9 +758,8 @@ def make_key_callback(
             print(f"Deshacer (opciones) FALLO [{code}]: {habit_id}", flush=True)
         else:
             habit.current_value = new_value
-            with screen_lock:
-                screen.kind = screens.ScreenKind.VIEW
-            refresh()
+            _safe_render(exit_item_options)  # sale del menu de opciones a la vista de origen, ya repintada
+            refresh_after_write(HABIT_RESOURCES)  # el valor fiable es el de la base, ver mas arriba
             print(f"Deshacer (opciones) OK: {habit.name} -> {new_value}", flush=True)
 
     def _press_habit_options_delta(deck: Any, key: int, amount: float, label: str) -> None:
@@ -734,11 +776,11 @@ def make_key_callback(
         ``ScreenKind.ITEM_OPTIONS``: el usuario quiere poder encadenar varios
         ajustes (p.ej. "+1" tres veces) sin que cada uno lo devuelva a la
         vista de origen -- solo "Volver" saca de esta pantalla. Aun asi se
-        llama a ``refresh()`` en vez de solo mutar de forma optimista: el
-        valor fiable es el que devuelve la base (p.ej. un habito
-        ``weekly_quota`` pinta el contador de la semana, no el delta suelto
-        que se acaba de mandar), y como ``screen.kind`` sigue en
-        ``ITEM_OPTIONS``, ``refresh()`` repinta esta misma pantalla -- con lo
+        releen los habitos por detras (``refresh_after_write``) en vez de solo
+        mutar de forma optimista: el valor fiable es el que devuelve la base
+        (p.ej. un habito ``weekly_quota`` pinta el contador de la semana, no
+        el delta suelto que se acaba de mandar), y como ``screen.kind`` sigue
+        en ``ITEM_OPTIONS``, ese repintado cae sobre esta misma pantalla -- con lo
         que las teclas informativas 5/10 (progreso de hoy/unidad, ver
         ``core.screens.resolve_page``) tambien quedan al dia.
         """
@@ -757,7 +799,11 @@ def make_key_callback(
             print(f"{label} FALLO [{code}]: {habit_id}", flush=True)
         else:
             habit.current_value = confirmed
-            refresh()
+            # No se sale de ITEM_OPTIONS (ver el docstring): se repinta esta
+            # misma pantalla con el valor optimista y la relectura, que llega
+            # por detras, vuelve a repintarla con el de la base.
+            _safe_render(repaint)
+            refresh_after_write(HABIT_RESOURCES)
             print(f"{label} OK: {habit.name} -> {confirmed}", flush=True)
 
     def press_habit_options_add_value(deck: Any, key: int, amount_str: str) -> None:
@@ -816,6 +862,10 @@ def make_key_callback(
                 template_id=template.id,
             )
             _safe_render(repaint)
+            # La ocurrencia insertada a mano no trae fecha ni orden reales
+            # (los pone la base): se caduca la lista para que la primera
+            # pantalla que muestre tareas la relea tal cual es.
+            invalidate(frozenset({Resource.TASKS}))
             print(f"Tarea creada desde plantilla: {template.title} -> {new_task_id}", flush=True)
 
     def press_timer_toggle(deck: Any, key: int, item_id: str) -> None:
@@ -829,15 +879,15 @@ def make_key_callback(
         Nunca mutacion optimista: ``rpc/timer_toggle`` puede parar un
         cronometro DISTINTO del que se pulso (el que estuviera corriendo
         antes, si no era este), asi que el unico estado fiable es el que
-        trae un ``refresh()`` completo.
+        traen las lecturas de cronometro (``refresh_after_write(TIMER_RESOURCES)``).
 
         A diferencia de "Deshacer" o "Skip", **no sale de**
         ``ScreenKind.ITEM_OPTIONS`` cuando se pulsa desde el menu de opciones
         de una tarea: se queda ahi para poder ver el cronometro corriendo (o
         volver a pulsar para pararlo) sin tener que reabrir el menu -- mismo
         patron que "Ajustar el progreso" de un habito real
-        (``_press_habit_options_delta``). Como ``screen.kind`` no cambia,
-        ``refresh()`` repinta la misma pantalla en la que se pulso (menu de
+        (``_press_habit_options_delta``). Como ``screen.kind`` no cambia, esa
+        relectura repinta la misma pantalla en la que se pulso (menu de
         opciones o "Cronometros"), y la tecla 2 ya sale con el label/tiempo
         al dia (``core.screens.resolve_page`` los recalcula en cada
         resolucion). Solo "Volver" saca del menu de opciones.
@@ -870,7 +920,11 @@ def make_key_callback(
             _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
             print(f"Cronometro FALLO [{code}]: {item_id}", flush=True)
         else:
-            refresh()
+            # Nunca mutacion optimista (ver el docstring): la base pudo parar
+            # un cronometro DISTINTO del pulsado, asi que el unico estado
+            # fiable es el que traiga la relectura -- pero solo la de
+            # cronometros, no las ocho lecturas de antes.
+            refresh_after_write(TIMER_RESOURCES)
             print(f"Cronometro alternado: {what}", flush=True)
 
     _HOLD_KINDS = ("habit", "habit_undo", "task")  # las unicas que SIEMPRE distinguen corta de mantenida
@@ -1121,16 +1175,18 @@ def main() -> None:
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
-    last_habits_code: str | None = None  # ultimo codigo de error de habitos, para pintarlo tras navegar sin refetch
-    last_log_habits_code: str | None = None  # idem para los habitos de solo registro
-    last_tasks_code: str | None = None  # idem para tareas
-    last_templates_code: str | None = None  # idem para plantillas
-    last_timer_labels_code: str | None = None  # idem para etiquetas de cronometro
-    last_running_timer_code: str | None = None  # idem para el cronometro en marcha (nunca se pinta en tecla, ver refresh_cycle)
-    last_daily_totals_code: str | None = None  # idem para los totales de hoy (tampoco se pinta en tecla, mismo motivo)
-    last_task_totals_code: str | None = None  # idem para los totales de siempre por tarea (tampoco se pinta)
-    last_ticktick_code: str | None = None  # idem para las tareas de TickTick, ver ticktick_refresh_cycle
-    last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
+    # Cuando se leyo cada cosa por ultima vez y con que resultado (ver
+    # core.cache): sustituye a los nueve "last_*_code" sueltos que habia antes
+    # -- ahora el codigo de error de cada lectura vive junto a su caducidad,
+    # que es lo que decide si hay que volver a pedirla.
+    cache = ResourceCache()
+    # Un solo hilo para TODAS las relecturas en segundo plano: el hilo de
+    # callbacks del deck nunca debe esperar a la red (era justo lo que hacia
+    # que pulsar una tecla no respondiera mientras se refrescaba). Uno basta
+    # y ademas serializa las peticiones, que es lo que quiere una Pi 3.
+    fetch_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="refresco")
+    # time.monotonic() del ultimo intento de reactivar el proyecto (ver _maybe_restore_project)
+    last_restore_attempt = 0.0
 
     def _prune_stale_last_timer() -> None:
         """Si ``last_timer_ref`` recuerda una tarea ya completada/omitida o
@@ -1205,6 +1261,15 @@ def main() -> None:
         # Los ids de vista van literales a proposito: es el unico sitio fuera de
         # core/screens.py que los conoce, y una vista nueva tiene que decidir
         # explicitamente que codigos le afectan.
+        # Ultimo codigo de cada lectura (core.cache): la que fue bien trae
+        # None, la que fallo trae su codigo corto hasta que vuelva a ir bien.
+        habits_code = cache.code(Resource.HABITS)
+        log_habits_code = cache.code(Resource.LOG_HABITS)
+        tasks_code = cache.code(Resource.TASKS)
+        templates_code = cache.code(Resource.TEMPLATES)
+        timer_labels_code = cache.code(Resource.TIMER_LABELS)
+        ticktick_code = cache.code(Resource.TICKTICK)
+
         is_view = screen.kind is screens.ScreenKind.VIEW
         # Una seccion (screen.section_name) tambien depende de get_habits(),
         # igual que "Hoy"/"Habitos" -- ver core.screens.ScreenState.section_name.
@@ -1217,27 +1282,29 @@ def main() -> None:
         # ni habitos sobre un proyecto) sobre una pantalla que no tiene nada
         # de eso.
         is_plain_view = is_view and not screen.section_name and not screen.project_name
-        if last_habits_code is not None and is_view and (screen.section_name or screen.view_id in ("today", "habits")):
-            code = last_habits_code
+        if habits_code is not None and is_view and (screen.section_name or screen.view_id in ("today", "habits")):
+            code = habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
-        if last_log_habits_code is not None and is_plain_view and screen.view_id == "logs":
-            code = last_log_habits_code
+        if log_habits_code is not None and is_plain_view and screen.view_id == "logs":
+            code = log_habits_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_habit.keys(), code))
-        if last_tasks_code is not None and is_view and (
+        if tasks_code is not None and is_view and (
             screen.project_name or (is_plain_view and screen.view_id in ("today", "tasks"))
         ):
-            code = last_tasks_code
+            code = tasks_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_task.keys(), code))
-        if last_templates_code is not None and is_plain_view and screen.view_id == "create":
-            code = last_templates_code
+        if templates_code is not None and is_plain_view and screen.view_id == "create":
+            code = templates_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_template.keys(), code))
-        if last_timer_labels_code is not None and is_plain_view and screen.view_id == "timers":
+        if timer_labels_code is not None and is_plain_view and screen.view_id == "timers":
             # Solo el catalogo de etiquetas pinta rojo: sin el no hay nada que
-            # ofrecer. Un fallo de get_running_timer() (last_running_timer_code)
-            # NO se pinta aqui a proposito -- ver el comentario en refresh_cycle.
-            code = last_timer_labels_code
+            # ofrecer. Un fallo de Resource.RUNNING_TIMER NO se pinta aqui a
+            # proposito: solo se pierde el resaltado de "cual esta corriendo",
+            # y el toggle sigue siendo correcto porque lo decide
+            # rpc/timer_toggle contra el estado real, no contra lo cacheado.
+            code = timer_labels_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_timer.keys(), code))
-        if last_ticktick_code is not None and screen.kind is screens.ScreenKind.TICKTICK:
+        if ticktick_code is not None and screen.kind is screens.ScreenKind.TICKTICK:
             # Por screen.kind, no por view_id: TickTick no es una VIEW (ver
             # core.screens.ScreenKind.TICKTICK), asi que is_view/is_plain_view
             # de arriba no le pegan. Incluye resolved.key_nav: en la pantalla
@@ -1245,7 +1312,7 @@ def main() -> None:
             # resolve_page), que dependen del mismo ticktick_refresh_cycle()
             # que las tareas -- en la pantalla filtrada por proyecto siempre
             # esta vacio, asi que aqui no cambia nada.
-            code = last_ticktick_code
+            code = ticktick_code
             keys = list(resolved.key_ticktick.keys()) + list(resolved.key_nav.keys())
             _safe_render(lambda: renderer.render_error_all(deck, keys, code))
 
@@ -1276,7 +1343,8 @@ def main() -> None:
                 _reset_idle_timers,
                 _dispatch_navigation,
                 _repaint_locked,
-                refresh_cycle,
+                cache.invalidate,
+                _refresh_after_write,
                 _exit_numeric_entry,
                 _enter_item_options,
                 _exit_item_options,
@@ -1298,8 +1366,8 @@ def main() -> None:
             _paint_current_screen()
 
     def _maybe_restore_project() -> None:
-        """Si el ciclo que acaba de terminar trajo NET en cualquiera de las
-        ocho lecturas, intenta reactivar el proyecto Supabase activo (ver
+        """Si alguna lectura de habits-core arrastra NET, intenta reactivar el
+        proyecto Supabase activo (ver
         ``provider.keepalive``): un NET persistente es el sintoma de un
         proyecto pausado por inactividad tanto como el de "sin red", y no
         hay forma de distinguirlos desde el propio checkin, asi que se
@@ -1308,21 +1376,15 @@ def main() -> None:
 
         Se auto-limita a un intento cada ``RESTORE_COOLDOWN_SECONDS``:
         reactivar tarda uno o dos minutos, y NET se repite cada ciclo
-        mientras tanto. Se llama SIN ``screen_lock`` (ver ``refresh_cycle``)
+        mientras tanto. Se llama SIN ``screen_lock`` (ver ``_fetch_resources``)
         y lanza la peticion en su propio hilo para no retrasar el repintado
         ni una pulsacion en curso con una llamada de red que no las afecta.
+
+        Solo cuentan las lecturas de habits-core (``SUPABASE_RESOURCES``): un
+        NET de la API de TickTick no dice nada del proyecto Supabase.
         """
         nonlocal last_restore_attempt
-        if "NET" not in (
-            last_habits_code,
-            last_log_habits_code,
-            last_tasks_code,
-            last_templates_code,
-            last_timer_labels_code,
-            last_running_timer_code,
-            last_daily_totals_code,
-            last_task_totals_code,
-        ):
+        if not cache.has_code("NET", SUPABASE_RESOURCES):
             return
         now = time.monotonic()
         if now - last_restore_attempt < RESTORE_COOLDOWN_SECONDS:
@@ -1335,218 +1397,243 @@ def main() -> None:
 
         threading.Thread(target=_attempt, daemon=True).start()
 
-    def refresh_cycle() -> None:
-        """Refetch + repintado de la pantalla activa.
+    # --- Lecturas: que se pide, como se aplica, y cuando se vuelve a pedir ---
+    #
+    # Una entrada por Resource (ver core.cache): la funcion que la lee, como
+    # se aplica su resultado y con que nombre sale en el log. Antes esto eran
+    # ocho bloques try/except copiados dentro de refresh_cycle, siempre los
+    # ocho; en forma de tabla, pedir solo un subconjunto -- lo que necesita la
+    # pantalla activa, o lo que acaba de tocar una escritura -- sale gratis.
+    def _fetch_ticktick() -> tuple[list[TickTickTask], list[TickTickProject]]:
+        """Las dos lecturas de TickTick como una sola (tareas + proyectos de
+        los botones): mismo proveedor, misma pantalla y un unico codigo de
+        error, igual que cuando ``ticktick_refresh_cycle`` las pedia a mano.
 
-        La llama el bucle principal cada ``REFRESH_SECONDS``, pero tambien el
-        hilo de callbacks del deck: al entrar en una vista desde el menu
-        (``_enter_view``) y al deshacer un habito, y ``_timer_sync`` cada
-        ``TIMER_SYNC_SECONDS`` mientras haya un cronometro corriendo.
+        Sin token configurado (``ticktick_provider`` es ``None``, ver
+        ``main``) ni siquiera intenta red: AUTH directo, el mismo codigo que
+        pintaria un 401 real."""
+        if ticktick_provider is None:
+            raise ProviderAuthError("Falta TICKTICK_ACCESS_TOKEN en el .env")
+        return ticktick_provider.get_tasks(), ticktick_provider.get_projects()
 
-        Las ocho lecturas de red se hacen SIN sujetar ``screen_lock`` --
-        cada una puede tardar hasta 10s (timeout de ``provider/supabase.py``)
-        antes de fallar, y ``on_key_change`` necesita el mismo lock para
-        resolver una pulsacion: si el lock se sujetara mientras dura la red,
-        una tecla no respondería hasta que las ocho terminaran, y con
-        ``TIMER_SYNC_SECONDS`` = 60s esto se repetiria cada minuto entero
-        mientras un cronometro siguiera corriendo (se detecto asi: un
-        timeout de 10s en ``get_daily_totals`` y un fallo de DNS en
-        ``get_log_habits`` en el mismo arranque, cada uno dejando el deck sin
-        responder mientras duraba). Cada lectura sigue fallando por separado
-        en su propio ``try/except``, igual que antes -- el resultado (o el
-        codigo de error) se guarda en una variable local aqui fuera; solo se
-        aplica al estado compartido (``mapping``, cada ``*_ref``, cada
-        ``last_*_code``) dentro del ``with screen_lock`` de mas abajo, que es
-        sincrono y rapido (sin red) y por tanto apenas compite con una
-        pulsacion.
+    fetchers: dict[Resource, Callable[[], Any]] = {
+        Resource.HABITS: habit_provider.get_habits,
+        Resource.LOG_HABITS: habit_provider.get_log_habits,
+        Resource.TASKS: task_provider.get_tasks,
+        Resource.TEMPLATES: template_provider.get_templates,
+        Resource.TIMER_LABELS: timer_provider.get_timer_labels,
+        Resource.RUNNING_TIMER: timer_provider.get_running_timer,
+        Resource.DAILY_TOTALS: timer_provider.get_daily_totals,
+        Resource.TASK_TOTALS: timer_provider.get_task_totals,
+        Resource.TICKTICK: _fetch_ticktick,
+    }
+    # Como se llama cada lectura en el log, con el mismo texto que ya usaba
+    # cada bloque del ciclo antiguo (para no romper la lectura del journal).
+    fetch_labels: dict[Resource, str] = {
+        Resource.HABITS: "habitos",
+        Resource.LOG_HABITS: "logs",
+        Resource.TASKS: "tareas",
+        Resource.TEMPLATES: "plantillas",
+        Resource.TIMER_LABELS: "cronometros",
+        Resource.RUNNING_TIMER: "cronometro activo",
+        Resource.DAILY_TOTALS: "totales de hoy",
+        Resource.TASK_TOTALS: "totales de siempre",
+        Resource.TICKTICK: "ticktick",
+    }
+    # Orden fijo en que se piden, cuando se piden varias: el mismo de siempre,
+    # para que el journal se lea igual que antes.
+    fetch_order: tuple[Resource, ...] = (
+        Resource.HABITS,
+        Resource.LOG_HABITS,
+        Resource.TASKS,
+        Resource.TEMPLATES,
+        Resource.TIMER_LABELS,
+        Resource.RUNNING_TIMER,
+        Resource.DAILY_TOTALS,
+        Resource.TASK_TOTALS,
+        Resource.TICKTICK,
+    )
 
-        Termina, ya sin el lock, intentando reactivar el proyecto Supabase si
-        el ciclo trajo NET (``_maybe_restore_project``, ver su docstring).
+    def _apply(resource: Resource, value: Any) -> None:
+        """Vuelca al estado compartido el resultado de una lectura con exito.
+
+        PRECONDICION: ``screen_lock`` ya adquirido (lo hace
+        ``_fetch_resources``). Cada rama es exactamente lo que hacia el bloque
+        equivalente del ciclo antiguo, incluido que solo los habitos tocan el
+        mapeo persistido de teclas -- llamar a ``key_map.update_mapping`` tras
+        una lectura fallida liberaria las teclas de habitos que siguen
+        existiendo, por eso solo se llega aqui con exito.
         """
         nonlocal mapping
-        nonlocal last_habits_code, last_log_habits_code, last_tasks_code, last_templates_code
-        nonlocal last_timer_labels_code, last_running_timer_code, last_daily_totals_code, last_task_totals_code
-
-        habits = habits_code = None
-        try:
-            habits = habit_provider.get_habits()
-        except ProviderError as exc:
-            _, habits_code = health.classify(exc)
-            print(f"[{habits_code}] {CODES[habits_code]} (habitos): {exc}", flush=True)
-
-        # Los habitos de solo registro no usan el mapeo persistido de
-        # core.key_map: "Logs" pagina de cero cada vez (igual que
-        # "Hoy"/"Tareas"), y como nunca desaparecen de su propia lista eso ya
-        # les da tecla estable sin necesitar el fichero (ver
-        # core.screens._log_items).
-        log_habits = log_habits_code = None
-        try:
-            log_habits = habit_provider.get_log_habits()
-        except ProviderError as exc:
-            _, log_habits_code = health.classify(exc)
-            print(f"[{log_habits_code}] {CODES[log_habits_code]} (logs): {exc}", flush=True)
-
-        tasks = tasks_code = None
-        try:
-            tasks = task_provider.get_tasks()
-        except ProviderError as exc:
-            _, tasks_code = health.classify(exc)
-            print(f"[{tasks_code}] {CODES[tasks_code]} (tareas): {exc}", flush=True)
-
-        templates = templates_code = None
-        try:
-            templates = template_provider.get_templates()
-        except ProviderError as exc:
-            _, templates_code = health.classify(exc)
-            print(f"[{templates_code}] {CODES[templates_code]} (plantillas): {exc}", flush=True)
-
-        timer_labels = timer_labels_code = None
-        try:
-            timer_labels = timer_provider.get_timer_labels()
-        except ProviderError as exc:
-            _, timer_labels_code = health.classify(exc)
-            print(f"[{timer_labels_code}] {CODES[timer_labels_code]} (cronometros): {exc}", flush=True)
-
-        # A diferencia de las otras cinco lecturas anteriores (esta y los dos
-        # totales, justo debajo, tampoco se pintan en tecla), un fallo aqui
-        # NO se pinta en tecla (ver _paint_current_screen): se pierde solo
-        # el resaltado de "cual esta corriendo", pero el toggle sigue siendo
-        # correcto porque lo decide rpc/timer_toggle contra el estado real,
-        # no contra este valor cacheado.
-        running_timer_ok = False
-        running_timer = running_timer_code = None
-        try:
-            running_timer = timer_provider.get_running_timer()
-            running_timer_ok = True
-        except ProviderError as exc:
-            _, running_timer_code = health.classify(exc)
-            print(
-                f"[{running_timer_code}] {CODES[running_timer_code]} (cronometro activo): {exc}",
-                flush=True,
+        if resource is Resource.HABITS:
+            mapping = key_map.update_mapping(
+                value, mapping, reserved_keys=frozenset({screens.KEY_HABITS_SECTIONS_SHORTCUT})
             )
+            habits_ref["value"] = {h.id: h for h in value}
+        elif resource is Resource.LOG_HABITS:
+            log_habits_ref["value"] = {h.id: h for h in value}
+        elif resource is Resource.TASKS:
+            tasks_ref["value"] = {t.id: t for t in value}
+        elif resource is Resource.TEMPLATES:
+            templates_ref["value"] = {t.id: t for t in value}
+        elif resource is Resource.TIMER_LABELS:
+            timer_labels_ref["value"] = {tl.id: tl for tl in value}
+        elif resource is Resource.RUNNING_TIMER:
+            running_timer_ref["value"] = value
+            if value is not None:
+                # last_timer_ref se queda con el ultimo valor NO vacio: nunca
+                # se pisa con None solo porque el cronometro pare (eso es lo
+                # que permite el atajo de la tecla 7, ver
+                # core.screens.KEY_TIMER_SHORTCUT). Solo lo limpia
+                # _prune_stale_last_timer, en _paint_current_screen.
+                last_timer_ref["value"] = value
+        elif resource is Resource.DAILY_TOTALS:
+            daily_totals_ref["value"] = value
+        elif resource is Resource.TASK_TOTALS:
+            task_totals_ref["value"] = value
+        else:
+            ticktick_tasks, ticktick_projects = value
+            ticktick_tasks_ref["value"] = {t.id: t for t in ticktick_tasks}
+            ticktick_projects_ref["value"] = {p.id: p for p in ticktick_projects}
 
-        # Igual que running_timer: un fallo aqui NO se pinta en tecla (ver
-        # _paint_current_screen), solo se pierde el total del dia hasta el
-        # proximo ciclo con exito -- la tecla sigue mostrando el nombre solo,
-        # nunca un numero obsoleto (se conserva el dict del ciclo anterior).
-        daily_totals = daily_totals_code = None
-        try:
-            daily_totals = timer_provider.get_daily_totals()
-        except ProviderError as exc:
-            _, daily_totals_code = health.classify(exc)
-            print(
-                f"[{daily_totals_code}] {CODES[daily_totals_code]} (totales de hoy): {exc}",
-                flush=True,
-            )
+    def _fetch_resources(resources: frozenset[Resource]) -> None:
+        """Lee ``resources``, aplica lo que llegue y repinta la pantalla activa.
 
-        # Mismo tratamiento que daily_totals justo encima: un fallo aqui
-        # tampoco se pinta en tecla, solo se pierde el acumulado de siempre
-        # hasta el proximo ciclo con exito.
-        task_totals = task_totals_code = None
-        try:
-            task_totals = timer_provider.get_task_totals()
-        except ProviderError as exc:
-            _, task_totals_code = health.classify(exc)
-            print(
-                f"[{task_totals_code}] {CODES[task_totals_code]} (totales de siempre): {exc}",
-                flush=True,
-            )
+        Sustituye al ciclo antiguo de ocho lecturas fijas: ahora el llamador
+        dice QUE quiere -- la pantalla activa pide lo suyo
+        (``_revalidate_screen``), una escritura pide lo que ha tocado
+        (``_refresh_after_write``), el ciclo periodico lo pide todo
+        (``refresh_cycle``).
 
-        with screen_lock:
-            last_habits_code = habits_code
-            if habits_code is None:
-                mapping = key_map.update_mapping(
-                    habits, mapping, reserved_keys=frozenset({screens.KEY_HABITS_SECTIONS_SHORTCUT})
-                )
-                habits_ref["value"] = {h.id: h for h in habits}
+        Conserva las dos propiedades del ciclo antiguo:
 
-            last_log_habits_code = log_habits_code
-            if log_habits_code is None:
-                log_habits_ref["value"] = {h.id: h for h in log_habits}
+        - **La red va SIN ``screen_lock``.** Cada peticion puede tardar hasta
+          10s (timeout de ``provider/supabase.py``) antes de fallar, y
+          ``on_key_change`` necesita ese mismo lock para resolver una
+          pulsacion: sujetarlo mientras dura la red dejaba el deck entero sin
+          responder, cada minuto, mientras un cronometro corria (se detecto en
+          produccion). Solo aplicar resultados y repintar -- sincrono, sin red
+          -- lo sujeta.
+        - **Cada lectura falla por separado**: la que falla conserva los datos
+          de la anterior, guarda su codigo y no afecta a las demas.
 
-            last_tasks_code = tasks_code
-            if tasks_code is None:
-                tasks_ref["value"] = {t.id: t for t in tasks}
-                if tasks:
-                    print(f"{len(tasks)} tarea(s) pendientes", flush=True)
-
-            last_templates_code = templates_code
-            if templates_code is None:
-                templates_ref["value"] = {t.id: t for t in templates}
-
-            last_timer_labels_code = timer_labels_code
-            if timer_labels_code is None:
-                timer_labels_ref["value"] = {tl.id: tl for tl in timer_labels}
-
-            last_running_timer_code = running_timer_code
-            if running_timer_ok:
-                running_timer_ref["value"] = running_timer
-                if running_timer_ref["value"] is not None:
-                    # last_timer_ref se queda con el ultimo valor NO vacio:
-                    # nunca se pisa con None solo porque el cronometro pare
-                    # (eso es lo que permite el atajo de la tecla 7, ver
-                    # core.screens.KEY_TIMER_SHORTCUT). Solo lo limpia
-                    # _prune_stale_last_timer, en _paint_current_screen.
-                    last_timer_ref["value"] = running_timer_ref["value"]
-
-            last_daily_totals_code = daily_totals_code
-            if daily_totals_code is None:
-                daily_totals_ref["value"] = daily_totals
-
-            last_task_totals_code = task_totals_code
-            if task_totals_code is None:
-                task_totals_ref["value"] = task_totals
-
-            _paint_current_screen()
-
-        _maybe_restore_project()  # fuera de screen_lock: es una llamada de red que no toca pantalla/mapeo
-
-    def ticktick_refresh_cycle() -> None:
-        """Refetch + repintado, pero SOLO de TickTick -- hermana de
-        ``refresh_cycle`` y deliberadamente independiente de ella (PoC ajena
-        a habits-core, ver ``ticktick/base.py``): nunca toca ``mapping`` ni
-        ningun ``*_ref`` de habits-core, ni al reves.
-
-        La llama ``_enter_ticktick`` al entrar en la pantalla "TickTick"
-        (mismo criterio que ``_enter_view`` con ``refresh_cycle``) y el bucle
-        principal cada ``REFRESH_SECONDS`` mientras esa pantalla siga activa
-        -- nunca si no, para no gastar peticiones a la API de TickTick sin
-        necesidad (ver el bucle principal, mas abajo). ``_enter_ticktick_project``
-        (entrar en un proyecto desde la pantalla principal) NO la llama: filtra
-        localmente lo que ya haya aqui, sin gastar otra peticion solo por
-        navegar (ver su docstring).
-
-        Trae tareas (``get_tasks()``) y proyectos (``get_projects()``, para
-        los botones de la pantalla principal) en la misma pasada, bajo un
-        unico codigo de error para las dos -- si cualquiera falla, se
-        conservan ambos ``*_ref`` del ciclo anterior, igual que el resto de
-        lecturas fallidas del daemon.
-
-        Si ``ticktick_provider`` es ``None`` (falta el token, ver ``main()``),
-        ni siquiera intenta red: fija ``AUTH`` directamente, mismo codigo que
-        pintaria un 401 real.
+        Y anade las dos garantias de ``core.cache``: no se pide lo que ya se
+        esta pidiendo (``begin_fetch`` devuelve ``None``), y un resultado que
+        quedo obsoleto por una escritura hecha mientras estaba en vuelo se
+        descarta y se vuelve a pedir (``end_fetch``), en vez de resucitar en
+        pantalla lo que el usuario acaba de cambiar.
         """
-        nonlocal last_ticktick_code
-        if ticktick_provider is None:
-            with screen_lock:
-                last_ticktick_code = "AUTH"
+        results: list[tuple[Resource, int, Any, str | None]] = []
+        network_started = time.monotonic()
+        for resource in fetch_order:
+            if resource not in resources:
+                continue
+            token = cache.begin_fetch(resource)
+            if token is None:
+                continue  # ya hay una lectura de esto en vuelo: la suya repinta por las dos
+            value: Any = None
+            code: str | None = None
+            try:
+                value = fetchers[resource]()
+            except ProviderError as exc:
+                _, code = health.classify(exc)
+                print(f"[{code}] {CODES[code]} ({fetch_labels[resource]}): {exc}", flush=True)
+            results.append((resource, token, value, code))
+        if not results:
+            return
+        network_ms = (time.monotonic() - network_started) * 1000
+
+        obsolete: set[Resource] = set()
+        applied: list[Resource] = []
+        paint_started = time.monotonic()
+        with screen_lock:
+            for resource, token, value, code in results:
+                if not cache.end_fetch(resource, token, code=code):
+                    obsolete.add(resource)
+                    continue
+                if code is None:
+                    _apply(resource, value)
+                applied.append(resource)
+            if applied:
+                # Se repinta aunque solo llegaran fallos: sus codigos tienen
+                # que salir en tecla, igual que en el ciclo antiguo.
                 _paint_current_screen()
+        paint_ms = (time.monotonic() - paint_started) * 1000
+
+        if applied:
+            # Una linea por lectura real. Su AUSENCIA es la otra mitad de la
+            # informacion: navegar sin que aparezca nada aqui significa que la
+            # cache sirvio los datos y no se toco la red.
+            names = ",".join(sorted(resource.value for resource in applied))
+            print(f"Lectura [{names}] red {network_ms:.0f} ms, pintado {paint_ms:.0f} ms", flush=True)
+        if obsolete:
+            _revalidate_async(frozenset(obsolete))
+        _maybe_restore_project()  # fuera de screen_lock: es red, no toca pantalla ni mapeo
+
+    def _revalidate_async(resources: frozenset[Resource]) -> None:
+        """Lee ``resources`` en el hilo de refresco, sin bloquear al llamador.
+
+        Es el camino de todo refresco disparado por una pulsacion: la pantalla
+        ya se pinto con lo cacheado, asi que el hilo de callbacks del deck
+        queda libre para atender la siguiente tecla mientras la red va por
+        detras. Un fallo inesperado aqui no puede matar ese hilo: se registra
+        como error de dispositivo, igual que en el bucle principal.
+        """
+        if not resources:
             return
 
-        tasks = projects = code = None
-        try:
-            tasks = ticktick_provider.get_tasks()
-            projects = ticktick_provider.get_projects()
-        except ProviderError as exc:
-            _, code = health.classify(exc)
-            print(f"[{code}] {CODES[code]} (ticktick): {exc}", flush=True)
+        def _run() -> None:
+            try:
+                _fetch_resources(resources)
+            except Exception as exc:
+                health.log_device_error(str(exc))
+                print(f"Error en el refresco en segundo plano: {exc}", flush=True)
 
+        fetch_executor.submit(_run)
+
+    def _revalidate_screen() -> None:
+        """Pide lo que la pantalla activa necesite Y tenga caducado.
+
+        El "pintar ya, refrescar detras" en una linea: el llamador ya pinto
+        con la cache, y esto solo toca la red si hace falta de verdad. Si esos
+        datos se leyeron hace menos de ``CACHE_TTL_SECONDS`` no se pide nada,
+        que es justo lo que hace gratis el ir y volver entre pantallas.
+        """
         with screen_lock:
-            last_ticktick_code = code
-            if code is None:
-                ticktick_tasks_ref["value"] = {t.id: t for t in tasks}
-                ticktick_projects_ref["value"] = {p.id: p for p in projects}
-            _paint_current_screen()
+            needs = screens.needs_for(screen)
+            max_age = screens.max_age_for(screen)
+        _revalidate_async(cache.stale(needs, max_age))
+
+    def _refresh_after_write(resources: frozenset[Resource]) -> None:
+        """Invalida ``resources`` y los relee ya, tras una escritura cuyo
+        resultado optimista no basta: un deshacer (el valor fiable es el de la
+        base, que en un habito ``weekly_quota`` es el contador semanal), un
+        cambio de prioridad (que reordena la lista), o un cronometro (que la
+        base pudo parar en otra tarea distinta de la pulsada).
+
+        La invalidacion va ANTES de pedir, a proposito: asi una lectura que
+        siguiera en vuelo desde antes de la escritura se descarta al volver
+        (``core.cache.ResourceCache.end_fetch``) en vez de pintar el estado
+        viejo encima del que el usuario acaba de provocar.
+        """
+        cache.invalidate(resources)
+        _revalidate_async(resources)
+
+    def refresh_cycle() -> None:
+        """Relee TODO lo de habits-core y repinta.
+
+        Es el ciclo periodico de ``REFRESH_SECONDS`` y la red de seguridad de
+        la cache: lo que no se haya refrescado por navegar o por escribir cae
+        aqui de todas formas.
+        """
+        _fetch_resources(SUPABASE_RESOURCES)
+
+    def ticktick_refresh_cycle() -> None:
+        """Relee TickTick y repinta: sigue siendo un ciclo aparte del de
+        habits-core (PoC independiente, ver ``ticktick/base.py``), ahora como
+        una lectura mas de la tabla -- ``Resource.TICKTICK``, con su propio
+        proveedor y su propio codigo de error."""
+        _fetch_resources(frozenset({Resource.TICKTICK}))
 
     def _is_standby() -> bool:
         """Si el deck esta ahora mismo suspendido (pantalla apagada)."""
@@ -1593,20 +1680,44 @@ def main() -> None:
     def _wake() -> None:
         """Sale del stand by: datos frescos primero, luz despues.
 
-        ``_enter_view`` ya hace todo lo necesario (reserva el centinela de
-        navegacion para que un doble toque no dispare dos refrescos, deja la
-        pantalla en "Hoy" -- lo que de paso saca de ``STANDBY`` -- y fuerza un
-        ``refresh_cycle`` completo), y como el repintado ocurre con el brillo
-        todavia a 0, el deck se enciende ya con el contenido correcto: sin
-        destello de datos viejos ni doble repintado.
+        **La unica navegacion que SI espera a la red**, a diferencia del resto
+        (que pinta con cache y revalida por detras): el deck lleva suspendido
+        de media hora para arriba, asi que lo cacheado no vale nada -- se
+        invalida TODO y se leen, bloqueando, los datos de "Hoy". Como ese
+        repintado ocurre con el brillo todavia a 0, el deck se enciende ya con
+        el contenido correcto: sin destello de datos viejos ni doble
+        repintado. A cambio tarda lo que tarde la red (1-2 s), que es
+        exactamente lo que hacia antes.
+
+        Lo que NO se pide aqui (plantillas, logs, cronometros...) queda
+        invalidado, asi que lo pedira la primera pantalla que lo necesite.
+
+        El centinela ``_claim`` sigue aqui (ya no en ``_enter_view``): dos
+        pulsaciones seguidas a ciegas sobre un deck apagado no deben encadenar
+        dos despertados.
 
         El ``finally`` no es decorativo: si el proveedor esta caido o falla el
         propio dispositivo, el deck TIENE que encenderse igual, o se quedaria
         negro para siempre y pareceria roto.
         """
+        if not _claim(_NAV_SENTINEL):
+            return  # ya hay un despertado en vuelo (doble toque sobre la pantalla apagada)
         try:
-            _enter_view(screens.DEFAULT_VIEW_ID)
+            with screen_lock:
+                screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, screens.DEFAULT_VIEW_ID, 0
+                screen.section_name = ""
+                screen.project_name = ""
+                needs = screens.needs_for(screen)
+            # Invalidar ANTES de leer no es solo para tirar lo viejo: al subir
+            # la generacion de todos los recursos, ninguna de estas lecturas
+            # puede saltarse por single-flight (ver
+            # core.cache.ResourceCache.begin_fetch), asi que _fetch_resources
+            # SIEMPRE llega a repintar. Sin eso, un refresco en vuelo podria
+            # dejar el deck encendido enseñando todavia la pantalla de stand by.
+            cache.invalidate(ALL_RESOURCES)
+            _fetch_resources(needs)  # bloqueante a proposito: datos frescos ANTES de encender
         finally:
+            _release(_NAV_SENTINEL)
             _safe_render(lambda: session.set_brightness(BRIGHTNESS))
             print("Stand by: pantalla despertada", flush=True)
 
@@ -1614,6 +1725,7 @@ def main() -> None:
         with screen_lock:
             screen.kind, screen.page = screens.ScreenKind.MENU, 0
             _paint_current_screen()
+        _revalidate_screen()
 
     def _enter_system() -> None:
         with screen_lock:
@@ -1623,13 +1735,14 @@ def main() -> None:
     def _enter_sections_menu() -> None:
         """Abre el submenu "Secciones" (``core.screens.ScreenKind.SECTIONS_MENU``).
 
-        Mismo patron que ``_enter_system``: pura navegacion, sin ``_claim`` ni
-        refetch -- la lista sale de los habitos ya cacheados
-        (``core.screens._section_menu_entries``), no hace falta pedir datos
-        frescos solo para abrir la lista."""
+        Mismo patron que el resto de pantallas con datos: pinta al instante
+        con los habitos ya cacheados (de ellos sale la lista, ver
+        ``core.screens._section_menu_entries``) y solo los relee por detras si
+        estan caducados."""
         with screen_lock:
             screen.kind, screen.page = screens.ScreenKind.SECTIONS_MENU, 0
             _paint_current_screen()
+        _revalidate_screen()
 
     def _enter_projects_menu() -> None:
         """Abre el submenu "Proyectos" (``core.screens.ScreenKind.PROJECTS_MENU``).
@@ -1638,6 +1751,7 @@ def main() -> None:
         with screen_lock:
             screen.kind, screen.page = screens.ScreenKind.PROJECTS_MENU, 0
             _paint_current_screen()
+        _revalidate_screen()
 
     def _change_page(delta: int) -> None:
         with screen_lock:
@@ -1782,44 +1896,48 @@ def main() -> None:
             _paint_current_screen()
 
     def _enter_view(view_id: str) -> None:
-        """Cambia a ``view_id`` en pagina 0 y fuerza un refresco completo
-        (refetch + repintado): entrar en una vista desde el menu siempre
-        pide datos frescos antes de pintarla.
+        """Cambia a ``view_id`` en pagina 0, la pinta YA con lo que haya en
+        cache y, solo si esos datos estan caducados, los relee por detras
+        (``_revalidate_screen``).
+
+        Antes esto forzaba un refresco completo -- las ocho lecturas, en el
+        hilo de callbacks -- en CADA entrada, aunque los datos tuvieran dos
+        segundos: entrar en una vista no respondia hasta que terminaba la red
+        y ademas releia cosas que esa vista ni pinta. Ahora la vista aparece
+        al instante y solo se pide lo suyo, y solo si hace falta (ver
+        ``core.screens.needs_for``/``max_age_for``).
+
+        Ya no hace falta el centinela ``_claim``: el single-flight de
+        ``core.cache.ResourceCache.begin_fetch`` es el que impide que un doble
+        toque dispare dos veces la misma lectura.
 
         Limpia ``section_name``/``project_name``: sin esto, entrar en
         "Hoy"/"Hábitos"/"Tareas" desde el menu tras haber visitado una
         seccion/proyecto dejaria ese filtro puesto por error (ver
         ``core.screens.ScreenState.section_name``/``project_name``)."""
-        if not _claim(_NAV_SENTINEL):
-            return  # ya hay una entrada a vista en vuelo (doble toque en el menu)
-        try:
-            with screen_lock:
-                screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, view_id, 0
-                screen.section_name = ""
-                screen.project_name = ""
-            refresh_cycle()
-        finally:
-            _release(_NAV_SENTINEL)
+        with screen_lock:
+            screen.kind, screen.view_id, screen.page = screens.ScreenKind.VIEW, view_id, 0
+            screen.section_name = ""
+            screen.project_name = ""
+            _paint_current_screen()
+        _revalidate_screen()
 
     def _enter_ticktick() -> None:
         """Entra en la pantalla principal de "TickTick" (``ScreenKind.TICKTICK``,
-        ``ticktick_project_id`` vacio) y fuerza un refresco completo -- pero
-        de ``ticktick_refresh_cycle()``, no de ``refresh_cycle()``: es una
-        pantalla ajena a habits-core, mismo patron que ``_enter_view`` pero
-        con su propio ciclo de refresco (ver ``ticktick_refresh_cycle``).
+        ``ticktick_project_id`` vacio), la pinta con lo cacheado y revalida
+        por detras si hace falta -- mismo patron que ``_enter_view``, pero lo
+        unico que puede pedir aqui es ``Resource.TICKTICK`` (ver
+        ``core.screens.needs_for``): esta pantalla es ajena a habits-core y
+        nunca dispara sus lecturas, ni al reves.
 
         Limpia ``screen.ticktick_project_id``: sin esto, reabrir "TickTick"
         desde el menu tras haber entrado en un proyecto se quedaria filtrada
         por error (ver ``core.screens.ScreenState.ticktick_project_id``)."""
-        if not _claim(_NAV_SENTINEL):
-            return  # ya hay una entrada a pantalla en vuelo (doble toque en el menu)
-        try:
-            with screen_lock:
-                screen.kind, screen.page = screens.ScreenKind.TICKTICK, 0
-                screen.ticktick_project_id = ""
-            ticktick_refresh_cycle()
-        finally:
-            _release(_NAV_SENTINEL)
+        with screen_lock:
+            screen.kind, screen.page = screens.ScreenKind.TICKTICK, 0
+            screen.ticktick_project_id = ""
+            _paint_current_screen()
+        _revalidate_screen()
 
     def _enter_ticktick_project(project_id: str) -> None:
         """Entra en un proyecto de TickTick (filtra la pantalla "TickTick" a
@@ -1851,40 +1969,30 @@ def main() -> None:
             _paint_current_screen()
 
     def _enter_section(section_name: str) -> None:
-        """Entra en la seccion ``section_name`` en pagina 0 y fuerza un
-        refresco completo, mismo patron que ``_enter_view``: pulsar una
-        entrada del submenu "Secciones" (tecla 1 de "Habitos") pide datos
-        frescos antes de pintar, igual que entrar en cualquier vista desde
-        el menu.
+        """Entra en la seccion ``section_name`` en pagina 0, pinta con la
+        cache y revalida por detras -- mismo patron que ``_enter_view``, y
+        como una seccion es "Habitos" filtrada, lo unico que puede pedir son
+        los habitos (ver ``core.screens.needs_for``).
 
         ``screen.view_id`` no se toca (queda con lo que hubiera antes): no se
         consulta mientras ``section_name`` no este vacio (ver
         ``core.screens.resolve_page``). Limpia ``project_name`` (nunca los
         dos filtros a la vez)."""
-        if not _claim(_NAV_SENTINEL):
-            return  # ya hay una entrada a vista/seccion en vuelo (doble toque)
-        try:
-            with screen_lock:
-                screen.kind, screen.section_name, screen.page = screens.ScreenKind.VIEW, section_name, 0
-                screen.project_name = ""
-            refresh_cycle()
-        finally:
-            _release(_NAV_SENTINEL)
+        with screen_lock:
+            screen.kind, screen.section_name, screen.page = screens.ScreenKind.VIEW, section_name, 0
+            screen.project_name = ""
+            _paint_current_screen()
+        _revalidate_screen()
 
     def _enter_project(project_name: str) -> None:
-        """Entra en el proyecto ``project_name`` en pagina 0 y fuerza un
-        refresco completo. Mirror exacto de ``_enter_section``, para tareas
-        (tecla 1 de "Tareas"/``KEY_TASKS_PROJECTS_SHORTCUT``). Limpia
-        ``section_name``."""
-        if not _claim(_NAV_SENTINEL):
-            return  # ya hay una entrada a vista/proyecto en vuelo (doble toque)
-        try:
-            with screen_lock:
-                screen.kind, screen.project_name, screen.page = screens.ScreenKind.VIEW, project_name, 0
-                screen.section_name = ""
-            refresh_cycle()
-        finally:
-            _release(_NAV_SENTINEL)
+        """Entra en el proyecto ``project_name`` en pagina 0. Mirror exacto de
+        ``_enter_section``, para tareas (tecla 1 de "Tareas"/
+        ``KEY_TASKS_PROJECTS_SHORTCUT``). Limpia ``section_name``."""
+        with screen_lock:
+            screen.kind, screen.project_name, screen.page = screens.ScreenKind.VIEW, project_name, 0
+            screen.section_name = ""
+            _paint_current_screen()
+        _revalidate_screen()
 
     def _on_auto_return_timeout() -> None:
         """Vuelve a "Hoy" tras ``AUTO_RETURN_SECONDS`` sin pulsaciones fuera
@@ -1999,14 +2107,18 @@ def main() -> None:
             threading.Timer(TIMER_TICK_SECONDS, _timer_tick).start()
 
     def _timer_sync() -> None:
-        """Cada ``TIMER_SYNC_SECONDS`` (60s): ciclo de refresco completo
-        (refetch + repintado, ``refresh_cycle``) para corregir el tiempo que
-        viene calculando ``_timer_tick`` en el cliente -- deriva de reloj, o
-        que otro cliente haya parado/arrancado el cronometro entre medias.
-        Mismo gasto de red que un ciclo normal; se acepta porque solo corre
-        mientras hay un cronometro corriendo, no todo el rato."""
+        """Cada ``TIMER_SYNC_SECONDS`` (60s): relee SOLO lo de cronometros
+        (``TIMER_RESOURCES``: cual corre y los dos acumulados) para corregir
+        el tiempo que viene calculando ``_timer_tick`` en el cliente --
+        deriva de reloj, o que otro cliente haya parado/arrancado el
+        cronometro entre medias.
+
+        Antes esto disparaba el ciclo completo, o sea las ocho lecturas cada
+        minuto entero mientras un cronometro siguiera corriendo, para
+        corregir un reloj. Ahora son tres, que es justo lo que puede haber
+        cambiado."""
         if not _is_standby() and running_timer_ref["value"] is not None:
-            refresh_cycle()
+            _fetch_resources(TIMER_RESOURCES)
         if not _timer_tick_stop.is_set():
             threading.Timer(TIMER_SYNC_SECONDS, _timer_sync).start()
 
@@ -2045,6 +2157,7 @@ def main() -> None:
         auto_return_timer.cancel()
         standby_timer.cancel()
         _timer_tick_stop.set()
+        fetch_executor.shutdown(wait=False)
         session.close()
 
 
