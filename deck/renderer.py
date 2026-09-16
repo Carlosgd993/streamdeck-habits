@@ -70,6 +70,7 @@ from deck.style import (
     TASK_TIMER_BORDER_WIDTH,
 )
 from provider.base import Habit, LogHabit, Task, Template, TimerLabel
+from ticktick.base import TickTickTask
 
 _DEFAULT_PRIORITY = 0  # al que cae una prioridad que no este en los diccionarios de estilo
 
@@ -197,6 +198,32 @@ def render_task(deck: Any, key: int, task: Task | None) -> None:
         emoji=task.emoji,
         border_color=border_color,
         border_width=TASK_TIMER_BORDER_WIDTH,
+    )
+    deck.set_key_image(key, image)
+
+
+def render_ticktick_task(deck: Any, key: int, task: TickTickTask | None) -> None:
+    """Pinta una tecla de la pantalla "TickTick" (``ScreenKind.TICKTICK``).
+
+    Pendiente: mismo color por prioridad que una tarea de habits-core
+    (``COLOR_TASK_BY_PRIORITY``/``COLOR_TEXT_TASK_BY_PRIORITY``, prioridad
+    desconocida cae a la 0) -- coincide que TickTick usa la misma escala
+    0/1/3/5. Completada (``task.completed``): el mismo gris de "hecho" que un
+    habito (``COLOR_HABIT_DONE``/``COLOR_TEXT_HABIT_DONE``) -- a diferencia de
+    una tarea de habits-core, aqui SI hay variante "hecha": la tarea sigue
+    visible en gris hasta el proximo refresco real, para poder deshacer un
+    completado por error (ver ``orchestrator.press_ticktick_toggle``).
+    """
+    if task is None:
+        deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
+        return
+    if task.completed:
+        color, text_color = COLOR_HABIT_DONE, COLOR_TEXT_HABIT_DONE
+    else:
+        color = COLOR_TASK_BY_PRIORITY.get(task.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+        text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(task.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+    image = text_tile(
+        deck, color, task.display_label(), text_color=text_color, font_size=FONT_SIZE_TASK, emoji=task.emoji
     )
     deck.set_key_image(key, image)
 
@@ -576,8 +603,9 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
     opciones primero (cada uno cubre las 15 y van antes porque ahi 0/5/10 no
     son menu/paginacion), luego menu (fija), flecha de paginacion o neutra,
     entrada de menu/sistema, habito, tarea, plantilla, etiqueta de cronometro,
-    atajo de cronometro del menu (tecla 7, ``ScreenKind.MENU`` unicamente) y,
-    si no es nada de eso, vacia.
+    atajo de cronometro del menu (tecla 7, ``ScreenKind.MENU`` unicamente),
+    tarea de TickTick (``ScreenKind.TICKTICK`` unicamente) y, si no es nada de
+    eso, vacia.
     ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
@@ -608,6 +636,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
             render_timer(deck, key, resolved.key_timer[key])
         elif key in resolved.key_timer_shortcut:
             render_timer_shortcut(deck, key, resolved.key_timer_shortcut[key])
+        elif key in resolved.key_ticktick:
+            render_ticktick_task(deck, key, resolved.key_ticktick[key])
         else:
             render_empty(deck, key)
 

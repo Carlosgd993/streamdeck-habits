@@ -49,10 +49,42 @@ estaba resuelto en ``v_today_tasks`` de fabrica: hizo falta una migration en
 ``../habits-core`` que anadiera el ``left join`` a ``projects``, mismo patron
 que ``section_name`` en ``v_today_habits``.
 
+"TickTick" (``ScreenKind.TICKTICK``) es un caso distinto de todos los
+anteriores: no es un filtro sobre datos de habits-core, es una pantalla
+completa con su propio origen de datos (``ticktick/``, PoC deliberadamente
+independiente de habits-core -- ver ``ticktick/base.py``). Vive fuera del
+mecanismo de ``VIEWS``/``PageBuilder`` por el mismo motivo que
+``NUMERIC_ENTRY``/``ITEM_OPTIONS``/``STANDBY``: su refresco tiene que ir
+desacoplado del ciclo de habits-core (``orchestrator.ticktick_refresh_cycle``,
+aparte de ``refresh_cycle``), asi que forzarla a compartir la firma de 8
+conjuntos de datos que reciben las vistas de ``VIEWS`` no aportaria nada. La
+tecla 5/10 se comportan normal (paginacion); la 0 solo se reinterpreta
+filtrada a un proyecto (ver justo abajo), en la principal sigue abriendo el
+menu como siempre.
+
+La pantalla principal de "TickTick" (``ScreenState.ticktick_project_id``
+vacio) mezcla dos cosas en una sola lista paginada: un boton por cada
+proyecto de TickTick (azul de navegacion, reutilizando ``MenuEntry``/
+``ResolvedPage.key_nav``/``deck.renderer.render_nav_entry`` -- entrar en uno
+es tan solo navegar, igual que "enter_section"/"enter_project") seguido de
+las tareas sin proyecto reconocido (Inbox, y cualquier tarea de un proyecto
+``closed`` -- ver ``TickTickProject.closed``), estas si en
+``ResolvedPage.key_ticktick``. Pulsar un boton de proyecto entra en esa
+misma pantalla con ``ticktick_project_id`` puesto (mismo patron que
+``section_name``/``project_name`` en ``ScreenKind.VIEW``: un campo mas de la
+pantalla, no un ``ScreenKind`` propio), que filtra a solo las tareas de ese
+proyecto -- aqui la tecla 0 SI se reinterpreta, como "Volver" a la pantalla
+principal (``PressAction("exit_ticktick_project")``, reutilizando el mismo
+``OptionEntry``/``render_option_entry`` que cualquier otro "Volver" del
+deck) en vez de abrir el menu principal. "TickTick" desde el menu siempre
+entra en la principal, nunca conserva el filtro (ver
+``orchestrator._enter_ticktick``).
+
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
-(``paginate``) y ``provider.base`` (``Habit``/``RealHabit``/``Task``/
-``Template``/``TimerLabel``/``RunningTimer``), igual que el resto de ``core/``.
+(``paginate``), ``provider.base`` (``Habit``/``RealHabit``/``Task``/
+``Template``/``TimerLabel``/``RunningTimer``) y ``ticktick.base``
+(``TickTickTask``), igual que el resto de ``core/``.
 """
 
 from __future__ import annotations
@@ -64,6 +96,7 @@ from enum import Enum, auto
 from config import ALL_KEYS, AVAILABLE_KEYS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.key_map import paginate
 from provider.base import BooleanHabit, Habit, RealHabit, RunningTimer, Task, Template, TimerLabel, clip_title
+from ticktick.base import TickTickProject, TickTickTask
 
 
 class ScreenKind(Enum):
@@ -79,6 +112,7 @@ class ScreenKind(Enum):
     SECTION_OPTIONS = auto()
     PROJECTS_MENU = auto()
     PROJECT_OPTIONS = auto()
+    TICKTICK = auto()
 
 
 @dataclass
@@ -157,6 +191,16 @@ class ScreenState:
             ``ScreenKind.MENU`` (boton de proyecto ya fijado). Mismo papel
             que ``entry_section_origin``: ``orchestrator._exit_project_options``
             vuelve exactamente aqui al pulsar "Volver".
+        ticktick_project_id: Id del proyecto de TickTick activo, solo si
+            ``kind`` es ``ScreenKind.TICKTICK`` y no esta vacio -- mismo
+            mecanismo que ``section_name``/``project_name`` (un campo mas de
+            la pantalla, no un ``ScreenKind`` propio): mientras este relleno,
+            ``resolve_page`` filtra a solo las tareas de ese proyecto en vez
+            de pintar la pantalla principal (botones de proyecto + tareas sin
+            proyecto). Vacio de fabrica y tambien cada vez que se entra en
+            "TickTick" desde el menu (``orchestrator._enter_ticktick``): no
+            hay boton de "volver" a la principal, asi que sin este reseteo
+            reabrir "TickTick" se quedaria en el ultimo proyecto visitado.
     """
 
     kind: ScreenKind = ScreenKind.VIEW
@@ -172,6 +216,7 @@ class ScreenState:
     project_name: str = ""
     entry_project_name: str = ""
     entry_project_origin: ScreenKind = ScreenKind.PROJECTS_MENU
+    ticktick_project_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -198,11 +243,14 @@ class MenuEntry:
             "enter_section" (entra en la seccion ``section_name``),
             "open_projects" (abre el submenu "Proyectos", ver
             ``ScreenKind.PROJECTS_MENU``), "enter_project" (entra en el
-            proyecto ``project_name``), "standby" (apaga la pantalla del
-            deck) o "shutdown" (apaga la Raspberry Pi). No hay boton de
-            "volver": la tecla de menu ya vuelve al menu principal desde
-            cualquier pantalla, incluida Sistema, asi que un boton "Atras"
-            seria redundante.
+            proyecto ``project_name``), "open_ticktick" (entra en la
+            pantalla "TickTick", ver ``ScreenKind.TICKTICK``),
+            "enter_ticktick_project" (filtra esa misma pantalla al proyecto
+            de TickTick ``ticktick_project_id``), "standby" (apaga la
+            pantalla del deck) o "shutdown" (apaga la Raspberry Pi). No hay
+            boton de "volver": la tecla de menu ya vuelve al menu principal
+            desde cualquier pantalla, incluida Sistema, asi que un boton
+            "Atras" seria redundante.
         view_id: Id de la vista a la que lleva, solo si ``action`` es
             "select_view".
         key: Tecla fija dentro de la pagina 0 (p.ej. "Sistema" siempre en la
@@ -217,6 +265,12 @@ class MenuEntry:
             "enter_project" -- mismo papel que ``section_name`` pero para
             proyectos (tecla 1 de "Tareas"/``KEY_TASKS_PROJECTS_SHORTCUT`` y
             ``_project_menu_entries`` para el submenu "Proyectos").
+        ticktick_project_id: Id del proyecto de TickTick al que lleva, solo
+            si ``action`` es "enter_ticktick_project" -- mismo papel que
+            ``project_name``, pero con el id real de TickTick (``TickTickProject.id``)
+            en vez de un nombre: a diferencia de un proyecto de habits-core,
+            aqui si hay un id estable que usar. Lo generan los botones de la
+            pantalla principal de "TickTick" (ver ``resolve_page``).
     """
 
     label: str
@@ -226,6 +280,7 @@ class MenuEntry:
     key: int | None = None
     section_name: str = ""
     project_name: str = ""
+    ticktick_project_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1031,6 +1086,9 @@ MENU_ENTRIES: list[MenuEntry] = [
     # KEY_TIMER_SHORTCUT/_timer_shortcut_item): las dos van pegadas a
     # proposito, la vista completa al lado de su acceso directo.
     MenuEntry(VIEWS["timers"].menu_label, VIEWS["timers"].menu_emoji, "select_view", view_id="timers", key=8),
+    # PoC independiente de habits-core (ver ScreenKind.TICKTICK): sin tecla
+    # fija, se reparte como Tareas/Crear/Logs.
+    MenuEntry("TickTick", "☑️", "open_ticktick"),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
@@ -1114,10 +1172,19 @@ class ResolvedPage:
     # deck.renderer.render_timer_shortcut) -- aunque el objeto sea el mismo
     # tipo, TimerLabel.
     key_timer_shortcut: dict[int, TimerLabel] = field(default_factory=dict)
+    # La pantalla principal de "TickTick" tambien lo usa, para sus botones de
+    # proyecto (ver resolve_page): son MenuEntry con action="enter_ticktick_project",
+    # pintados con render_nav_entry igual que cualquier otro boton de navegacion.
     key_nav: dict[int, MenuEntry] = field(default_factory=dict)
     key_numeric: dict[int, NumericKey] = field(default_factory=dict)
     key_standby: dict[int, StandbyKey] = field(default_factory=dict)
     key_options: dict[int, OptionEntry] = field(default_factory=dict)
+    # Solo lo rellena ScreenKind.TICKTICK (ver resolve_page): tareas de
+    # TickTick, independientes de todo lo demas (ver ticktick/base.py). En la
+    # pantalla principal, solo las que no caen bajo ningun boton de proyecto
+    # de key_nav (Inbox y tareas de un proyecto cerrado); en la filtrada por
+    # proyecto (ScreenState.ticktick_project_id), solo las de ese proyecto.
+    key_ticktick: dict[int, TickTickTask] = field(default_factory=dict)
     page: int = 0
     total_pages: int = 1
 
@@ -1165,6 +1232,8 @@ def resolve_page(
     habit_mapping: dict[str, int],
     pinned_sections: frozenset[str],
     pinned_projects: frozenset[str],
+    ticktick_tasks: list[TickTickTask],
+    ticktick_projects: list[TickTickProject],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
 
@@ -1215,6 +1284,15 @@ def resolve_page(
             favoritos desde ``ScreenKind.PROJECT_OPTIONS`` (ver
             ``core.pinned_projects``). Mismo papel que ``pinned_sections``,
             para ``ScreenKind.MENU``/``ScreenKind.PROJECT_OPTIONS``.
+        ticktick_tasks: Tareas de TickTick del ultimo
+            ``orchestrator.ticktick_refresh_cycle()`` exitoso. Solo las usa
+            ``ScreenKind.TICKTICK``; el resto de pantallas la reciben igual
+            (mismo criterio que ``log_habits``/``timer_labels``) pero no la
+            miran.
+        ticktick_projects: Proyectos de TickTick del mismo
+            ``ticktick_refresh_cycle()`` exitoso que ``ticktick_tasks``.
+            Tambien solo los usa ``ScreenKind.TICKTICK``, para los botones de
+            la pantalla principal (ver mas abajo).
 
     Returns:
         La pagina resuelta, lista para pintar con ``deck.renderer.render_page``.
@@ -1340,6 +1418,81 @@ def resolve_page(
         key_options = {key: layout.get(key, _ITEM_OPTIONS_BLANK) for key in ALL_KEYS}
         return ResolvedPage(key_options=key_options, page=0, total_pages=1)
 
+    if screen.kind is ScreenKind.TICKTICK:
+        # Tecla 5/10 normales (paginacion): con solo dos tipos de contenido
+        # (boton de proyecto, tarea) sobra sitio. La tecla 0 SI se reinterpreta,
+        # pero solo filtrada a un proyecto (ver justo abajo): en la principal
+        # sigue siendo el menu de siempre.
+        if screen.ticktick_project_id:
+            # Filtrada a un proyecto (ScreenState.ticktick_project_id, ver su
+            # docstring): mismo orden que la principal, pero sin botones.
+            # Tecla 0 = "Volver" a la principal (reutiliza el mismo
+            # OptionEntry/render_option_entry que el resto de "Volver" del
+            # deck, ver _ITEM_OPTIONS_BACK) en vez de abrir el menu principal
+            # -- resolve_press la resuelve a "exit_ticktick_project" ANTES
+            # que a "open_menu" (mismo orden que ITEM_OPTIONS/NUMERIC_ENTRY),
+            # asi que no hace falta rellenar el resto de teclas: las que no
+            # esten en key_options caen en key_ticktick como siempre.
+            # Orden SIN t.completed a proposito: completar una tarea no debe
+            # moverla de tecla (ver comentario igual en las tareas sueltas,
+            # unas lineas mas abajo).
+            matching = [t for t in ticktick_tasks if t.project_id == screen.ticktick_project_id]
+            ordered_tasks = sorted(matching, key=lambda t: (-t.priority, t.id))
+            page_items, total_pages = paginate(ordered_tasks, screen.page, PAGE_SIZE)
+            key_ticktick = dict(zip(AVAILABLE_KEYS, page_items, strict=False))
+            return ResolvedPage(
+                key_options={KEY_MENU: _ITEM_OPTIONS_BACK},
+                key_ticktick=key_ticktick,
+                page=_clamp_page(screen.page, total_pages),
+                total_pages=total_pages,
+            )
+
+        # Principal: un boton (azul de navegacion, mismo mecanismo que
+        # "enter_section"/"enter_project") por cada proyecto no cerrado,
+        # ordenados como en la propia TickTick (sort_order), seguidos de las
+        # tareas sin proyecto reconocido -- el Inbox (que no tiene entrada en
+        # GET /project, ver ticktick/client.py) y cualquier tarea de un
+        # proyecto closed (ver ticktick/base.py::TickTickProject.closed) --
+        # ordenadas por prioridad/id SIN mirar si estan completadas: una
+        # completada se queda en su misma tecla, solo en gris, hasta el
+        # proximo refresco real (ver orchestrator.press_ticktick_toggle) en
+        # vez de saltar al final y recolocar el resto. Proyectos y tareas se paginan
+        # juntos, como una sola lista: los proyectos siempre caen en las
+        # primeras teclas de la pagina 0 porque van primero en la lista.
+        open_projects = sorted((p for p in ticktick_projects if not p.closed), key=lambda p: (p.sort_order, p.id))
+        project_entries = [
+            MenuEntry(p.display_label(), "", "enter_ticktick_project", ticktick_project_id=p.id)
+            for p in open_projects
+        ]
+        open_project_ids = {p.id for p in open_projects}
+        # Orden SIN t.completed a proposito: si entrara en la clave, completar
+        # una tarea la mandaria al final del grupo y recolocaria TODAS las
+        # que quedan entre medias -- justo lo que se quiere evitar (mismo
+        # riesgo que ya resuelve _flat_page_builder en "Hoy" no aplica aqui,
+        # porque ahi el item completado SI desaparece de la lista de una vez;
+        # aqui se queda visible en gris hasta el proximo refresco real, ver
+        # orchestrator.press_ticktick_toggle). Con la prioridad/id fijos, la
+        # tecla de una tarea no se mueve solo por pulsarla.
+        loose_tasks = sorted(
+            (t for t in ticktick_tasks if t.project_id not in open_project_ids),
+            key=lambda t: (-t.priority, t.id),
+        )
+        mixed: list[MenuEntry | TickTickTask] = [*project_entries, *loose_tasks]
+        page_items, total_pages = paginate(mixed, screen.page, PAGE_SIZE)
+        key_nav: dict[int, MenuEntry] = {}
+        key_ticktick: dict[int, TickTickTask] = {}
+        for key, item in zip(AVAILABLE_KEYS, page_items, strict=False):
+            if isinstance(item, MenuEntry):
+                key_nav[key] = item
+            else:
+                key_ticktick[key] = item
+        return ResolvedPage(
+            key_nav=key_nav,
+            key_ticktick=key_ticktick,
+            page=_clamp_page(screen.page, total_pages),
+            total_pages=total_pages,
+        )
+
     if screen.section_name:
         # screen.kind sigue siendo ScreenKind.VIEW: la seccion es un campo
         # mas de esa pantalla, no un ScreenKind propio (ver ScreenState.
@@ -1400,7 +1553,9 @@ class PressAction:
             "habit_options_undo" | "habit_options_add_value" |
             "habit_options_add_step" | "section_options_exit" |
             "toggle_section_pin" | "open_projects" | "enter_project" |
-            "project_options_exit" | "toggle_project_pin" | "noop".
+            "project_options_exit" | "toggle_project_pin" |
+            "open_ticktick" | "enter_ticktick_project" |
+            "exit_ticktick_project" | "ticktick_toggle" | "noop".
         payload: Id del habito/tarea/plantilla/etiqueta-de-cronometro si
             ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
@@ -1430,7 +1585,15 @@ class PressAction:
             del proyecto (mismo patron que "enter_section" con
             ``section_name``); "toggle_project_pin" no lleva payload (mismo
             patron que "toggle_section_pin", lee ``ScreenState.
-            entry_project_name``). Vacio en el resto.
+            entry_project_name``). "enter_ticktick_project" lleva el id del
+            proyecto de TickTick (mismo patron que "enter_project" con
+            ``project_name``, pero con un id en vez de un nombre -- ver
+            ``MenuEntry.ticktick_project_id``). "ticktick_toggle" SI lleva el
+            id de la tarea de TickTick en el payload (mismo criterio que
+            "task"/"timer_toggle"): quien la ejecuta relee su ``completed``
+            actual para decidir completar o reabrir, en vez de decidirlo aqui
+            contra una pagina que podria haberse quedado desfasada. Vacio en
+            el resto.
     """
 
     kind: str
@@ -1468,6 +1631,8 @@ def _nav_press(entry: MenuEntry) -> PressAction:
         return PressAction("enter_section", entry.section_name)
     if entry.action == "enter_project":
         return PressAction("enter_project", entry.project_name)
+    if entry.action == "enter_ticktick_project":
+        return PressAction("enter_ticktick_project", entry.ticktick_project_id)
     return PressAction(entry.action)
 
 
@@ -1577,6 +1742,16 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     if key == KEY_MENU:
         if screen.kind is ScreenKind.MENU:
             return PressAction("noop")  # ya esta en el menu, no hace falta nada
+        if screen.kind is ScreenKind.TICKTICK and screen.ticktick_project_id:
+            # Filtrada a un proyecto: la tecla 0 es "Volver" a la pantalla
+            # principal de "TickTick" (ver resolve_page), no el menu
+            # principal -- unica excepcion a "key == KEY_MENU siempre abre el
+            # menu" en toda esta funcion, junto al mismo patron ya usado por
+            # NUMERIC_ENTRY/ITEM_OPTIONS/SECTION_OPTIONS/PROJECT_OPTIONS
+            # arriba (aunque esos cortocircuitan por screen.kind solo, este
+            # necesita tambien mirar ticktick_project_id: en la pantalla
+            # principal la tecla 0 sigue siendo el menu de siempre).
+            return PressAction("exit_ticktick_project")
         return PressAction("open_menu")
 
     if key in (KEY_PAGE_PREV, KEY_PAGE_NEXT):
@@ -1618,6 +1793,9 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     timer_label = page.key_timer.get(key)
     if timer_label is not None:
         return PressAction("timer_toggle", timer_label.id)
+    ticktick_task = page.key_ticktick.get(key)
+    if ticktick_task is not None:
+        return PressAction("ticktick_toggle", ticktick_task.id)
     # Atajo fijo dentro de una vista de VIEWS (KEY_HABITS_SECTIONS_SHORTCUT en
     # "Habitos", KEY_TASKS_PROJECTS_SHORTCUT en "Tareas", ver resolve_page):
     # screen.kind aqui es ScreenKind.VIEW, no pasa por el bloque MENU/SYSTEM/

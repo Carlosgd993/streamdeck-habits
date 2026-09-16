@@ -56,6 +56,8 @@ from provider.base import (
     TimerProvider,
 )
 from provider.supabase import SupabaseProvider
+from ticktick.base import TickTickProject, TickTickProvider, TickTickTask
+from ticktick.client import TickTickApiProvider
 
 state_lock = threading.Lock()
 pending_requests: set[str] = set()  # ids (habito, tarea, plantilla, cronometro o el centinela de navegacion) en vuelo
@@ -150,6 +152,9 @@ def make_key_callback(
     last_timer_ref: dict[str, RunningTimer | None],
     pinned_sections: frozenset[str],
     pinned_projects: frozenset[str],
+    ticktick_provider: TickTickProvider | None,
+    ticktick_tasks_ref: dict[str, dict[str, TickTickTask]],
+    ticktick_projects_ref: dict[str, dict[str, TickTickProject]],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     reset_idle_timers: Callable[[], None],
@@ -309,6 +314,19 @@ def make_key_callback(
             justo despues de mutarlo.
         pinned_projects: Igual que ``pinned_sections``, pero para proyectos
             (``core.pinned_projects``, ``_toggle_project_pin``).
+        ticktick_provider: Proveedor de TickTick (puerto ``ticktick.base.
+            TickTickProvider``), o ``None`` si no se pudo inicializar (falta
+            el token) -- ver ``main()``. Independiente de los cuatro
+            proveedores de habits-core de arriba.
+        ticktick_tasks_ref: Wrapper ``{"value": {id: TickTickTask}}`` con las
+            tareas de TickTick del ultimo ``orchestrator.ticktick_refresh_cycle()``
+            exitoso, mismo patron que ``tasks_ref`` pero para un ciclo de
+            refresco totalmente aparte (ver ``ticktick_refresh_cycle``).
+        ticktick_projects_ref: Wrapper ``{"value": {id: TickTickProject}}``
+            con los proyectos de TickTick del mismo
+            ``ticktick_refresh_cycle()`` exitoso que ``ticktick_tasks_ref``,
+            para los botones de la pantalla principal de "TickTick" (ver
+            ``core.screens.resolve_page``).
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
@@ -565,6 +583,41 @@ def make_key_callback(
             _safe_render(repaint)
             print(f"Tarea completada: {task.title}", flush=True)
 
+    def press_ticktick_toggle(deck: Any, key: int, task_id: str) -> None:
+        """Completa o reabre una tarea de la pantalla "TickTick", segun su
+        estado actual (``task.completed``) -- una sola accion para las dos
+        direcciones, igual que ``press_timer_toggle`` decide start-vs-stop
+        por estado en vez de por dos acciones separadas.
+
+        A diferencia de ``press_task`` (tareas de habits-core, que
+        desaparecen de ``tasks_ref`` al cerrarse): aqui la tarea **se queda**
+        en ``ticktick_tasks_ref`` tras completarla, solo cambia de color (gris)
+        -- para poder deshacer un completado por error volviendo a pulsarla.
+        Solo el proximo ``ticktick_refresh_cycle()`` (real, desde la API) la
+        quita de la lista si sigue completada -- ver
+        ``core.screens.ScreenKind.TICKTICK``.
+        """
+        if ticktick_provider is None:
+            return  # sin proveedor (falta el token): no deberia haber tareas que pulsar
+        task = ticktick_tasks_ref["value"].get(task_id)
+        if task is None:
+            return  # desaparecida entre refrescos (borrada/movida en TickTick): se ignora
+        _safe_render(lambda: renderer.render_task_sending(deck, key))
+        try:
+            if task.completed:
+                ticktick_provider.uncomplete_task(task)
+            else:
+                ticktick_provider.complete_task(task)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(task_id, str(exc), kind="ticktick")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"TickTick toggle FALLO [{code}]: {task_id}", flush=True)
+        else:
+            task.completed = not task.completed
+            _safe_render(repaint)
+            print(f"TickTick {'completada' if task.completed else 'reabierta'}: {task.title}", flush=True)
+
     def press_task_priority(deck: Any, key: int, priority_str: str) -> None:
         with screen_lock:
             task_id = screen.entry_item_id
@@ -807,13 +860,23 @@ def make_key_callback(
     def _run_action(deck: Any, key: int, action: screens.PressAction) -> None:
         """Ejecuta una ``PressAction`` ya resuelta (la accion corta de un
         habito/tarea, o cualquier otra que no distinga corta de mantenida)."""
-        if action.kind in ("habit", "habit_undo", "task", "template", "numeric_confirm", "timer_toggle"):
+        if action.kind in (
+            "habit",
+            "habit_undo",
+            "task",
+            "template",
+            "numeric_confirm",
+            "timer_toggle",
+            "ticktick_toggle",
+        ):
             # Un habito reserva su id sea cual sea la operacion, asi que un
             # paso/deshacer/confirmacion de entrada manual del mismo habito
             # tampoco pueden solaparse ("numeric_confirm" lleva el habit_id
             # como payload, ver core.screens.resolve_press). "timer_toggle"
             # lleva el id de la tarea/etiqueta en el payload sea cual sea su
             # origen (tecla de "Cronometros" o menu de opciones de una tarea).
+            # "ticktick_toggle" lleva el id de la tarea de TickTick, ajeno al
+            # resto (reserva de _claim independiente, no colisiona con nada).
             item_id = action.payload
             if not _claim(item_id):
                 return  # ya hay una peticion en vuelo para este elemento
@@ -826,6 +889,8 @@ def make_key_callback(
                     press_habit_value(deck, key, item_id)
                 elif action.kind == "timer_toggle":
                     press_timer_toggle(deck, key, item_id)
+                elif action.kind == "ticktick_toggle":
+                    press_ticktick_toggle(deck, key, item_id)
                 else:
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
@@ -920,6 +985,8 @@ def make_key_callback(
             templates_list = list(templates_ref["value"].values())
             log_habits_list = list(log_habits_ref["value"].values())
             timer_labels_list = list(timer_labels_ref["value"].values())
+            ticktick_tasks_list = list(ticktick_tasks_ref["value"].values())
+            ticktick_projects_list = list(ticktick_projects_ref["value"].values())
             running_timer = running_timer_ref["value"]
             screen_kind = screen.kind  # capturado aqui: decide si "enter_section" arma hold, ver mas abajo
             resolved = screens.resolve_page(
@@ -936,6 +1003,8 @@ def make_key_callback(
                 mapping,
                 pinned_sections,
                 pinned_projects,
+                ticktick_tasks_list,
+                ticktick_projects_list,
             )
             action = screens.resolve_press(screen, key, resolved)
 
@@ -976,6 +1045,19 @@ def main() -> None:
     template_provider: TemplateProvider = provider
     timer_provider: TimerProvider = provider
 
+    # A diferencia de SupabaseProvider() de arriba, un fallo aqui NO tumba el
+    # daemon: TickTick es una capacidad anadida (PoC independiente de
+    # habits-core, ver ticktick/base.py), no el nucleo del deck. Sin token
+    # configurado, ticktick_provider queda en None y la pantalla "TickTick"
+    # pinta directamente el codigo AUTH sin intentar red (ver
+    # ticktick_refresh_cycle).
+    ticktick_provider: TickTickProvider | None
+    try:
+        ticktick_provider = TickTickApiProvider()
+    except ProviderError as exc:
+        print(f"TickTick no disponible (pantalla 'TickTick' pintara AUTH): {exc}", flush=True)
+        ticktick_provider = None
+
     session = DeckSession()
     session.open()
 
@@ -1002,6 +1084,14 @@ def main() -> None:
     # solo si la tarea/etiqueta que recordaba ya no existe. Arranca vacio: el
     # daemon no sabe que corria antes de este arranque.
     last_timer_ref: dict[str, RunningTimer | None] = {"value": None}
+    # Tareas de TickTick del ultimo ticktick_refresh_cycle() exitoso, mismo
+    # patron que tasks_ref pero para un ciclo de refresco totalmente aparte
+    # (ver ticktick_refresh_cycle) -- nunca lo toca refresh_cycle().
+    ticktick_tasks_ref: dict[str, dict[str, TickTickTask]] = {"value": {}}
+    # Proyectos de TickTick del mismo ticktick_refresh_cycle() exitoso, para
+    # los botones de la pantalla principal de "TickTick" (ver
+    # core.screens.resolve_page).
+    ticktick_projects_ref: dict[str, dict[str, TickTickProject]] = {"value": {}}
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
@@ -1013,6 +1103,7 @@ def main() -> None:
     last_running_timer_code: str | None = None  # idem para el cronometro en marcha (nunca se pinta en tecla, ver refresh_cycle)
     last_daily_totals_code: str | None = None  # idem para los totales de hoy (tampoco se pinta en tecla, mismo motivo)
     last_task_totals_code: str | None = None  # idem para los totales de siempre por tarea (tampoco se pinta)
+    last_ticktick_code: str | None = None  # idem para las tareas de TickTick, ver ticktick_refresh_cycle
     last_restore_attempt = 0.0  # time.monotonic() del ultimo intento de reactivar el proyecto, ver _maybe_restore_project
 
     def _prune_stale_last_timer() -> None:
@@ -1068,6 +1159,8 @@ def main() -> None:
             mapping,
             pinned_sections,
             pinned_projects,
+            list(ticktick_tasks_ref["value"].values()),
+            list(ticktick_projects_ref["value"].values()),
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
 
@@ -1109,6 +1202,17 @@ def main() -> None:
             # NO se pinta aqui a proposito -- ver el comentario en refresh_cycle.
             code = last_timer_labels_code
             _safe_render(lambda: renderer.render_error_all(deck, resolved.key_timer.keys(), code))
+        if last_ticktick_code is not None and screen.kind is screens.ScreenKind.TICKTICK:
+            # Por screen.kind, no por view_id: TickTick no es una VIEW (ver
+            # core.screens.ScreenKind.TICKTICK), asi que is_view/is_plain_view
+            # de arriba no le pegan. Incluye resolved.key_nav: en la pantalla
+            # principal son los botones de proyecto (ver core.screens.
+            # resolve_page), que dependen del mismo ticktick_refresh_cycle()
+            # que las tareas -- en la pantalla filtrada por proyecto siempre
+            # esta vacio, asi que aqui no cambia nada.
+            code = last_ticktick_code
+            keys = list(resolved.key_ticktick.keys()) + list(resolved.key_nav.keys())
+            _safe_render(lambda: renderer.render_error_all(deck, keys, code))
 
         deck.set_key_callback(
             make_key_callback(
@@ -1129,6 +1233,9 @@ def main() -> None:
                 last_timer_ref,
                 pinned_sections,
                 pinned_projects,
+                ticktick_provider,
+                ticktick_tasks_ref,
+                ticktick_projects_ref,
                 screen,
                 screen_lock,
                 _reset_idle_timers,
@@ -1357,10 +1464,69 @@ def main() -> None:
 
         _maybe_restore_project()  # fuera de screen_lock: es una llamada de red que no toca pantalla/mapeo
 
+    def ticktick_refresh_cycle() -> None:
+        """Refetch + repintado, pero SOLO de TickTick -- hermana de
+        ``refresh_cycle`` y deliberadamente independiente de ella (PoC ajena
+        a habits-core, ver ``ticktick/base.py``): nunca toca ``mapping`` ni
+        ningun ``*_ref`` de habits-core, ni al reves.
+
+        La llama ``_enter_ticktick`` al entrar en la pantalla "TickTick"
+        (mismo criterio que ``_enter_view`` con ``refresh_cycle``) y el bucle
+        principal cada ``REFRESH_SECONDS`` mientras esa pantalla siga activa
+        -- nunca si no, para no gastar peticiones a la API de TickTick sin
+        necesidad (ver el bucle principal, mas abajo). ``_enter_ticktick_project``
+        (entrar en un proyecto desde la pantalla principal) NO la llama: filtra
+        localmente lo que ya haya aqui, sin gastar otra peticion solo por
+        navegar (ver su docstring).
+
+        Trae tareas (``get_tasks()``) y proyectos (``get_projects()``, para
+        los botones de la pantalla principal) en la misma pasada, bajo un
+        unico codigo de error para las dos -- si cualquiera falla, se
+        conservan ambos ``*_ref`` del ciclo anterior, igual que el resto de
+        lecturas fallidas del daemon.
+
+        Si ``ticktick_provider`` es ``None`` (falta el token, ver ``main()``),
+        ni siquiera intenta red: fija ``AUTH`` directamente, mismo codigo que
+        pintaria un 401 real.
+        """
+        nonlocal last_ticktick_code
+        if ticktick_provider is None:
+            with screen_lock:
+                last_ticktick_code = "AUTH"
+                _paint_current_screen()
+            return
+
+        tasks = projects = code = None
+        try:
+            tasks = ticktick_provider.get_tasks()
+            projects = ticktick_provider.get_projects()
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            print(f"[{code}] {CODES[code]} (ticktick): {exc}", flush=True)
+
+        with screen_lock:
+            last_ticktick_code = code
+            if code is None:
+                ticktick_tasks_ref["value"] = {t.id: t for t in tasks}
+                ticktick_projects_ref["value"] = {p.id: p for p in projects}
+            _paint_current_screen()
+
     def _is_standby() -> bool:
         """Si el deck esta ahora mismo suspendido (pantalla apagada)."""
         with screen_lock:
             return screen.kind is screens.ScreenKind.STANDBY
+
+    def _is_ticktick_active() -> bool:
+        """Si la pantalla "TickTick" es la que esta activa ahora mismo.
+
+        La usa el bucle principal para decidir si vale la pena disparar
+        ``ticktick_refresh_cycle()`` en el ciclo periodico: solo mientras se
+        esta viendo esa pantalla, nunca de fondo -- a diferencia de
+        ``refresh_cycle()`` (habits-core), que siempre corre cada
+        ``REFRESH_SECONDS`` sea cual sea la pantalla visible.
+        """
+        with screen_lock:
+            return screen.kind is screens.ScreenKind.TICKTICK
 
     def _enter_standby() -> None:
         """Apaga la retroiluminacion del deck y deja de refrescar.
@@ -1598,6 +1764,55 @@ def main() -> None:
         finally:
             _release(_NAV_SENTINEL)
 
+    def _enter_ticktick() -> None:
+        """Entra en la pantalla principal de "TickTick" (``ScreenKind.TICKTICK``,
+        ``ticktick_project_id`` vacio) y fuerza un refresco completo -- pero
+        de ``ticktick_refresh_cycle()``, no de ``refresh_cycle()``: es una
+        pantalla ajena a habits-core, mismo patron que ``_enter_view`` pero
+        con su propio ciclo de refresco (ver ``ticktick_refresh_cycle``).
+
+        Limpia ``screen.ticktick_project_id``: sin esto, reabrir "TickTick"
+        desde el menu tras haber entrado en un proyecto se quedaria filtrada
+        por error (ver ``core.screens.ScreenState.ticktick_project_id``)."""
+        if not _claim(_NAV_SENTINEL):
+            return  # ya hay una entrada a pantalla en vuelo (doble toque en el menu)
+        try:
+            with screen_lock:
+                screen.kind, screen.page = screens.ScreenKind.TICKTICK, 0
+                screen.ticktick_project_id = ""
+            ticktick_refresh_cycle()
+        finally:
+            _release(_NAV_SENTINEL)
+
+    def _enter_ticktick_project(project_id: str) -> None:
+        """Entra en un proyecto de TickTick (filtra la pantalla "TickTick" a
+        sus tareas), pulsando un boton de la pantalla principal.
+
+        A diferencia de ``_enter_ticktick``/``_enter_section``/``_enter_project``,
+        NO dispara ningun refresco: ``ticktick_tasks_ref`` ya trae TODAS las
+        tareas (de cualquier proyecto, ver ``ticktick.client.TickTickApiProvider.
+        get_tasks``) desde que se entro en la pantalla principal hace un
+        instante, asi que filtrar por ``project_id`` es una operacion local
+        (``core.screens.resolve_page``) -- gastar otra peticion a la API de
+        TickTick solo por pulsar un boton no aportaria nada, y es justo el
+        tipo de espera que se elimino al simplificar ``get_tasks()`` (ver
+        CLAUDE.md, "Vista TickTick"). Sin ``_claim``/``_release`` por el mismo
+        motivo: no hay red que pueda solaparse."""
+        with screen_lock:
+            screen.ticktick_project_id, screen.page = project_id, 0
+            _paint_current_screen()
+
+    def _exit_ticktick_project() -> None:
+        """"Volver" desde un proyecto de TickTick a la pantalla principal
+        (tecla 0, ver ``core.screens.resolve_press``): limpia
+        ``screen.ticktick_project_id`` y repinta. Mismo patron que
+        ``_enter_ticktick_project`` (sin refetch, sin ``_claim``/``_release``):
+        los proyectos y tareas ya estan cargados, esto solo cambia el
+        filtro."""
+        with screen_lock:
+            screen.ticktick_project_id, screen.page = "", 0
+            _paint_current_screen()
+
     def _enter_section(section_name: str) -> None:
         """Entra en la seccion ``section_name`` en pagina 0 y fuerza un
         refresco completo, mismo patron que ``_enter_view``: pulsar una
@@ -1679,6 +1894,12 @@ def main() -> None:
             _enter_projects_menu()
         elif action.kind == "enter_project":
             _enter_project(action.payload)
+        elif action.kind == "open_ticktick":
+            _enter_ticktick()
+        elif action.kind == "enter_ticktick_project":
+            _enter_ticktick_project(action.payload)
+        elif action.kind == "exit_ticktick_project":
+            _exit_ticktick_project()
         elif action.kind == "page_prev":
             _change_page(-1)
         elif action.kind == "page_next":
@@ -1764,6 +1985,11 @@ def main() -> None:
                 # propio ciclo completo (ver _wake).
                 if not _is_standby():
                     refresh_cycle()
+                    # TickTick es un ciclo aparte, y solo corre mientras esa
+                    # pantalla siga activa (ver _is_ticktick_active): no tiene
+                    # sentido pedirle datos a su API si nadie la esta mirando.
+                    if _is_ticktick_active():
+                        ticktick_refresh_cycle()
             except Exception as exc:
                 # Cualquier fallo que no sea del proveedor de habitos/tareas
                 # (esos ya se gestionan dentro de refresh_cycle) se trata
