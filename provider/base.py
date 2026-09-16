@@ -282,8 +282,9 @@ def clip_title(title: str) -> str:
 class Task:
     """Ocurrencia de tarea pendiente, agnostica del backend que la origino.
 
-    A diferencia de ``Habit`` no es abstracta ni tiene subtipos: una tarea solo
-    esta pendiente o deja de existir, no hay un estado "hecha" que pintar.
+    A diferencia de ``Habit`` no es abstracta ni tiene subtipos: solo una
+    diferencia de estado, ``completed`` (ver abajo), no una jerarquia de
+    tipos.
 
     Attributes:
         id: Identificador unico de la ocurrencia en el proveedor. Es el que hay
@@ -329,6 +330,23 @@ class Task:
             filtrar/agrupar por proyecto sin ``isinstance``. Vacio si la
             tarea no tiene proyecto (no deberia pasar, ``project_id`` es
             ``not null`` en ``../habits-core``).
+        completed: Si esta tarea ya se marco como completada desde el deck.
+            **Siempre ``False`` al construirse** (``get_tasks()`` solo trae
+            pendientes: el backend nunca envia una tarea ya completada) --
+            lo muta a ``True`` de forma optimista ``orchestrator.press_task``
+            tras un ``complete_task`` con exito, mismo campo y mismo
+            proposito que ``ticktick.base.TickTickTask.completed``: pintar la
+            tecla en gris SIN quitarla de la lista (ver
+            ``deck.renderer.render_task``), para que completar una tarea no
+            reordene las demas ni la haga desaparecer de golpe (estandar del
+            proyecto para cualquier "check", ver "Completar no hace
+            desaparecer" en CLAUDE.md). Solo el siguiente
+            ``refresh_cycle()`` real (que reemplaza ``tasks_ref`` entero con
+            lo que devuelva ``get_tasks()``) la hace desaparecer de verdad,
+            si sigue completada. A diferencia de TickTick, aqui no hay accion
+            para revertirlo: habits-core no expone (todavia) una RPC de
+            "descompletar" tarea, asi que pulsar una tarea ya gris no hace
+            nada (ver ``core.screens.resolve_press``).
     """
 
     def __init__(
@@ -352,6 +370,7 @@ class Task:
         self.project_name = project_name
         self.timer_running = False
         self.total_seconds = 0
+        self.completed = False
 
     def display_label(self) -> str:
         """Texto a mostrar en la tecla: el titulo, recortado si no cabe.
@@ -641,10 +660,14 @@ class TaskProvider(ABC):
     def complete_task(self, task: Task) -> None:
         """Marca ``task`` como completada.
 
-        No devuelve nada: la tarea deja de estar pendiente, no pasa a un estado
-        que el cliente deba pintar. Es idempotente, asi que reintentar es
-        seguro. Que se vuelva a abrir el siguiente ciclo (tareas periodicas) lo
-        decide el proveedor, no el llamador.
+        No devuelve nada: el backend no expone un estado "completada" que
+        volver a leer (una tarea cerrada simplemente deja de venir en el
+        siguiente ``get_tasks()``). El gris-y-sin-moverse que se ve en el
+        deck tras completar (``Task.completed``) es puramente optimista del
+        lado del cliente (ver ``orchestrator.press_task``), no algo que este
+        metodo devuelva. Es idempotente, asi que reintentar es seguro. Que se
+        vuelva a abrir el siguiente ciclo (tareas periodicas) lo decide el
+        proveedor, no el llamador.
 
         Args:
             task: La tarea a cerrar.

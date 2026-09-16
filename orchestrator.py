@@ -175,26 +175,32 @@ def make_key_callback(
 
     - **Habito**: pide al proveedor que avance un paso y, si tiene exito,
       repinta la **pantalla entera** (``repaint``, no solo esta tecla): en
-      "Hoy" un habito que queda ``is_done`` desaparece de la lista y lo que
-      quede se recoloca sin dejar hueco (ver ``core.screens._today_items``),
-      asi que hace falta recalcular toda la pagina, no solo esta tecla. En
-      "Habitos" el efecto visible es el de siempre (blanco/gris segun
-      objetivo), porque esa vista no oculta nada. Fallo → tecla en rojo con
-      codigo, sin tocar el resto. Una tecla con el objetivo ya alcanzado hoy
-      se sigue pudiendo pulsar: es la base quien decide el nuevo valor
-      (``habit_step``), y un habito cuantificable sigue sumando sin tope.
+      "Hoy"/"Habitos" el habito se queda en la misma tecla, solo cambia de
+      blanco a gris (``is_done``, ver ``core.screens._today_items``) --
+      "Completar no hace desaparecer" (ver CLAUDE.md), asi que ni un habito
+      hecho ni una tarea cerrada mueven ninguna otra tecla; se recalcula toda
+      la pagina igualmente porque un habito nuevo podria haber entrado por el
+      otro lado del reparto. Fallo → tecla en rojo con codigo, sin tocar el
+      resto. Una tecla con el objetivo ya alcanzado hoy se sigue pudiendo
+      pulsar: es la base quien decide el nuevo valor (``habit_step``), y un
+      habito cuantificable sigue sumando sin tope.
     - **Deshacer un habito**: la misma tecla, cuando ``core.screens``
       resuelve la pulsacion como "habit_undo" (un booleano ya hecho, en una
-      vista que lo permita — hoy solo "Habitos"). Pide ``undo`` al proveedor
+      vista que lo permita -- "Hoy" y "Habitos", ver
+      ``core.screens.ViewSpec.allows_undo``). Pide ``undo`` al proveedor
       y, si tiene exito, dispara un **refresco completo** (``refresh``) en vez
       del repintado optimista: el valor que devuelve la base es el del dia y
       en un habito ``weekly_quota`` la vista pinta el contador de la semana,
       asi que el unico estado fiable es el que se relee. Fallo → tecla en rojo
       con codigo, igual que un paso.
     - **Tarea**: la pinta en verde de acuse de recibo, pide cerrarla y, solo
-      cuando la base lo confirma, la saca de ``tasks_ref`` y repinta la
-      pantalla entera (``repaint``) para que las tareas restantes se
-      recoloquen sin hueco, por el mismo motivo que un habito.
+      cuando la base lo confirma, muta ``task.completed = True`` (se QUEDA en
+      ``tasks_ref``, ver ``press_task``) y repinta la pantalla entera
+      (``repaint``): la tecla pasa a gris sin moverse ni dejar hueco, mismo
+      estandar que un habito. Solo el proximo refresco real la quita de la
+      lista. Pulsar una tarea ya gris no hace nada (``PressAction("noop")``,
+      ver ``core.screens.resolve_press``): habits-core no tiene forma de
+      revertir un cierre.
     - **Plantilla** (vista "Crear"): mismo acuse verde, pide crear la
       ocurrencia y, al confirmar la base, **anade la tarea nueva a
       ``tasks_ref``** y repinta. La plantilla **no** sale de ``templates_ref``
@@ -563,6 +569,20 @@ def make_key_callback(
             running_timer_ref["value"] = None
 
     def press_task(deck: Any, key: int, task_id: str) -> None:
+        """Completa ``task_id``. Aplica el estandar del proyecto para
+        cualquier "check" (ver "Completar no hace desaparecer" en
+        CLAUDE.md): a diferencia del comportamiento antiguo (la tarea se
+        quitaba de ``tasks_ref`` y todo lo que quedaba se recolocaba), aqui
+        la tarea se QUEDA en ``tasks_ref`` -- solo se muta
+        ``task.completed = True`` (optimista, mismo patron que
+        ``press_ticktick_toggle``) y se repinta: la tecla se pone en gris
+        (``deck.renderer.render_task``) sin moverse ni dejar hueco, y
+        ``core.screens.resolve_press`` ya bloquea una segunda pulsacion
+        sobre ella (``PressAction("noop")``, no hay RPC de "descompletar"
+        tarea en habits-core, al reves que TickTick). Solo desaparece de
+        verdad en el proximo ``refresh_cycle()`` real, que reemplaza
+        ``tasks_ref`` entero con lo que devuelva ``get_tasks()`` -- si sigue
+        completada, ya no viene."""
         task = tasks_ref["value"].get(task_id)
         if task is None:
             return  # ya cerrada o desaparecida entre ciclos: se ignora
@@ -575,10 +595,7 @@ def make_key_callback(
             _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
             print(f"Cierre FALLO [{code}]: {task_id}", flush=True)
         else:
-            # Confirmado por la base: la tarea deja de existir para el deck. Se
-            # quita de tasks_ref para que otra pulsacion no reintente cerrarla,
-            # y se repinta la pantalla entera para que lo que quede se recoloque.
-            tasks_ref["value"].pop(task_id, None)
+            task.completed = True
             _clear_running_timer_if_task(task_id)
             _safe_render(repaint)
             print(f"Tarea completada: {task.title}", flush=True)
@@ -638,6 +655,15 @@ def make_key_callback(
             print(f"Prioridad cambiada: {task.title} -> {priority}", flush=True)
 
     def press_task_skip(deck: Any, key: int) -> None:
+        """Omite (skip) la tarea abierta en el menu de opciones.
+
+        Deliberadamente FUERA del estandar "Completar no hace desaparecer"
+        (ver CLAUDE.md, y contrastar con ``press_task`` arriba): omitir no es
+        un check que se pueda pulsar por error igual de facil -- solo se
+        llega aqui manteniendo pulsada la tarea y entrando en su menu de
+        opciones, no con un tap normal -- asi que se mantiene el
+        comportamiento de siempre: sale de ``tasks_ref`` al instante y todo
+        se recoloca."""
         with screen_lock:
             task_id = screen.entry_item_id
         task = tasks_ref["value"].get(task_id)
@@ -1127,12 +1153,21 @@ def main() -> None:
         No toca nada si lo recordado es justo lo que esta corriendo ahora
         (comparacion por identidad, ver ``refresh_cycle``): eso lo decide
         siempre ``running_timer_ref``, nunca esta poda.
+
+        Una tarea completada (``Task.completed``) cuenta como "ya no
+        existe" aqui aunque siga en ``tasks_ref`` (ver "Completar no hace
+        desaparecer" en CLAUDE.md: ya no se quita al cerrarla, solo se pinta
+        en gris) -- sin este chequeo extra la tecla 7 seguiria enseñando el
+        recordatorio de una tarea ya cerrada hasta el proximo refresco real,
+        en vez de volver de inmediato al aviso "Sin cronometro".
         """
         last = last_timer_ref["value"]
         if last is None or last is running_timer_ref["value"]:
             return
-        if last.task_id and last.task_id not in tasks_ref["value"]:
-            last_timer_ref["value"] = None
+        if last.task_id:
+            task = tasks_ref["value"].get(last.task_id)
+            if task is None or task.completed:
+                last_timer_ref["value"] = None
         elif last.label_id and last.label_id not in timer_labels_ref["value"]:
             last_timer_ref["value"] = None
 
@@ -1255,8 +1290,10 @@ def main() -> None:
         diferencia de ``_paint_current_screen``, que asume el lock ya
         adquirido). La usa ``make_key_callback`` tras un paso de habito o un
         cierre de tarea con exito, fuera de cualquier ``with screen_lock``
-        en curso, para reflejar de inmediato un cambio que puede desplazar
-        otros items (p.ej. recolocar "Hoy" sin dejar hueco)."""
+        en curso, para reflejar de inmediato el cambio de color de esa
+        tecla (blanco/prioridad -> gris, ver "Completar no hace desaparecer"
+        en CLAUDE.md) -- se repinta la pantalla entera, no solo la tecla,
+        por simetria con el resto de acciones optimistas de este modulo."""
         with screen_lock:
             _paint_current_screen()
 

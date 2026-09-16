@@ -11,6 +11,20 @@ resuelve con la funcion ``build_page`` que registra su ``ViewSpec`` en
 (con un ``_tiered_page_builder``/``_flat_page_builder``, o uno propio) y un
 boton mas en ``MENU_ENTRIES``; nada mas del sistema cambia.
 
+**Estandar del proyecto: completar no hace desaparecer** (ver CLAUDE.md,
+seccion del mismo nombre, para el porque). Cualquier "check" -- avanzar un
+habito hasta su objetivo, cerrar una tarea -- pinta el elemento en gris
+(``deck.renderer.render_habit``/``render_task``, mismo gris
+``COLOR_HABIT_DONE`` para los dos) SIN sacarlo de la lista ni recolocar el
+resto: se queda en su misma tecla hasta que un refresco REAL (no un
+repintado optimista) deje de traerlo. Ya lo hacia un habito
+(``Habit.is_done``) desde siempre; ``Task.completed`` (mutado por
+``orchestrator.press_task``, igual que ``ticktick.base.TickTickTask.
+completed``) lo extiende a las tareas. Una vista nueva que pinte habitos o
+tareas hereda esto solo con incluirlos en su ``items_fn``/``PageBuilder``
+sin filtrar por ``is_done``/``completed`` -- filtrarlos ahi seria repetir el
+error que tenia "Hoy" antes de este estandar.
+
 Hay tres pantallas que no son menu/sistema/vista y no aparecen en ``VIEWS``:
 el teclado numerico (``ScreenKind.NUMERIC_ENTRY``, ver ``NUMERIC_KEYPAD``),
 que abre un habito ``manual_entry`` al pulsarlo; el menu de opciones de un
@@ -603,10 +617,14 @@ class ViewSpec:
         build_page: Como reparte sus items entre las teclas de una pagina.
         allows_undo: Si pulsar en esta vista un habito **booleano** ya hecho
             hoy lo deshace en vez de repetir el paso. Lo declara cada vista, no
-            se hereda: una vista nueva no deshace nada salvo que lo pida. Solo
-            lo usa "Habitos", que es la que muestra los habitos hechos (en
-            gris) y sirve por tanto para repasarlos y corregir una pulsacion
-            erronea; "Hoy" los oculta, asi que ahi no hay nada que deshacer.
+            se hereda: una vista nueva no deshace nada salvo que lo pida. La
+            usan "Habitos" y "Hoy" (las dos vistas que muestran habitos
+            hechos, en gris, sin ocultarlos -- ver "Completar no hace
+            desaparecer" en CLAUDE.md): un toque corto sobre uno ya hecho lo
+            deshace en vez de repetir el paso, asi que un click por error es
+            tan facil de corregir como de dar. Un habito cuantificable NUNCA
+            deshace por tap (aqui ni en ninguna vista): sigue sumando paso
+            por encima del objetivo, eso lo decide el tipo, no la vista.
     """
 
     id: str
@@ -753,20 +771,29 @@ def _today_items(
     daily_totals: dict[str, int],
     task_totals: dict[str, int],
 ) -> list[ViewItem]:
-    """Items de la vista "Hoy": habitos pendientes (sin los ya completados
-    hoy -- ``is_done``, booleano marcado o cuantificable que alcanzo su
-    objetivo -- ordenados por ``(order, id)``, igual que un reparto de
-    tecla nuevo) seguidos de las tareas pendientes en el orden que ya trae
-    el proveedor (prioridad descendente, fecha ascendente).
+    """Items de la vista "Hoy": TODOS los habitos de hoy (pendientes y ya
+    hechos, ordenados por ``(order, id)``, igual que un reparto de tecla
+    nuevo) seguidos de TODAS las tareas pendientes/recien completadas en el
+    orden que ya trae el proveedor (prioridad descendente, fecha
+    ascendente).
+
+    Ni un habito hecho ni una tarea recien completada se filtran aqui --
+    ``deck.renderer.render_habit``/``render_task`` los pintan en gris, mismo
+    "check no hace desaparecer" que cualquier otra pantalla (ver "Completar
+    no hace desaparecer" en CLAUDE.md). Un habito hecho sigue en su misma
+    posicion (``(order, id)`` no depende de ``is_done``) y una tarea
+    completada en la suya (el orden de ``tasks`` no cambia al marcar
+    ``Task.completed``, ver ``orchestrator.press_task``) -- nada se
+    recoloca por completar algo.
 
     A diferencia de ``habits``, esta vista **no** reutiliza el mapeo estable
-    de habitos: se pagina de cero cada vez con ``_flat_page_builder``, asi
-    que al completar algo lo que queda se recoloca desde la primera tecla
-    disponible, sin dejar hueco -- "Hoy" es la vista que se va vaciando
-    durante el dia, no la que conserva la tecla de cada habito."""
-    pending_habits = sorted((h for h in habits if not h.is_done), key=lambda h: (h.order, h.id))
+    de habitos: se pagina de cero cada vez con ``_flat_page_builder`` (mismo
+    motivo que "Tareas"/"Logs"/"Cronometros": nada desaparece de la lista
+    solo por completarse, asi que ya sale tecla estable entre ciclos sin
+    necesitar ``core.key_map``)."""
     _mark_running_task(tasks, running_timer, task_totals)
-    return [ViewItem("habit", h) for h in pending_habits] + [ViewItem("task", t) for t in tasks]
+    all_habits = sorted(habits, key=lambda h: (h.order, h.id))
+    return [ViewItem("habit", h) for h in all_habits] + [ViewItem("task", t) for t in tasks]
 
 
 def _tasks_items(
@@ -779,8 +806,12 @@ def _tasks_items(
     daily_totals: dict[str, int],
     task_totals: dict[str, int],
 ) -> list[ViewItem]:
-    """Items de la vista "Tareas": solo las tareas pendientes, en el orden que
-    ya trae el proveedor."""
+    """Items de la vista "Tareas": todas las de ``tasks`` (pendientes y las
+    recien completadas que todavia no ha limpiado un refresco real -- ver
+    ``Task.completed``), en el orden que ya trae el proveedor. No se filtra
+    nada aqui: completar una tarea no la saca de la lista (ver "Completar no
+    hace desaparecer" en CLAUDE.md), solo la pinta en gris
+    (``deck.renderer.render_task``)."""
     _mark_running_task(tasks, running_timer, task_totals)
     return [ViewItem("task", t) for t in tasks]
 
@@ -808,8 +839,10 @@ def _create_items(
     ultimo ciclo: una ocurrencia creada desde otro cliente hace un minuto no se
     ve todavia, y eso es aceptable -- el aviso es una red, no un candado.
 
-    A diferencia de "Hoy", las plantillas usadas **no desaparecen**: siguen ahi
-    en gris para la proxima vez que toquen.
+    A diferencia de una tarea completada (``Task.completed``, ver "Completar
+    no hace desaparecer" en CLAUDE.md), una plantilla usada no solo se queda
+    en gris: vuelve sola a su color normal en cuanto la ocurrencia que creo
+    se cierra -- no hace falta esperar a un refresco real.
     """
     pending_template_ids = {t.template_id for t in tasks if t.template_id}
     for template in templates:
@@ -830,9 +863,9 @@ def _log_items(
     """Items de la vista "Logs": los habitos de solo registro (``LogHabit``),
     todos, ordenados por ``(order, id)`` -- mismo criterio que un reparto de
     tecla nuevo en "Habitos", pero sin necesitar su mapeo persistido: un log
-    nunca desaparece de esta lista (no hay ``is_done`` que lo filtre, al
-    reves que en "Hoy"), asi que paginar de cero cada ciclo con el mismo
-    orden ya da la misma tecla de forma estable mientras no cambien los
+    no tiene ``is_done`` que lo filtre (nunca esta "pendiente" ni "hecho", ver
+    ``provider.base.LogHabit``), asi que paginar de cero cada ciclo con el
+    mismo orden ya da la misma tecla de forma estable mientras no cambien los
     habitos de registro que hay. Por eso esta vista usa ``_flat_page_builder``
     en vez de ``_tiered_page_builder``: no hace falta la persistencia de
     ``core.key_map`` para conseguir el mismo efecto.
@@ -1063,7 +1096,7 @@ KEY_TASKS_PROJECTS_SHORTCUT = 1
 ``_flat_page_builder`` en vez de a ``core.key_map.update_mapping``."""
 
 VIEWS: dict[str, ViewSpec] = {
-    "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items)),
+    "today": ViewSpec("today", "Hoy", "📅", _flat_page_builder(_today_items), allows_undo=True),
     "habits": ViewSpec(
         "habits", "Habitos", "✅", _tiered_page_builder(frozenset({KEY_HABITS_SECTIONS_SHORTCUT})), allows_undo=True
     ),
@@ -1467,12 +1500,12 @@ def resolve_page(
         open_project_ids = {p.id for p in open_projects}
         # Orden SIN t.completed a proposito: si entrara en la clave, completar
         # una tarea la mandaria al final del grupo y recolocaria TODAS las
-        # que quedan entre medias -- justo lo que se quiere evitar (mismo
-        # riesgo que ya resuelve _flat_page_builder en "Hoy" no aplica aqui,
-        # porque ahi el item completado SI desaparece de la lista de una vez;
-        # aqui se queda visible en gris hasta el proximo refresco real, ver
-        # orchestrator.press_ticktick_toggle). Con la prioridad/id fijos, la
-        # tecla de una tarea no se mueve solo por pulsarla.
+        # que quedan entre medias -- justo lo que "Completar no hace
+        # desaparecer" (ver CLAUDE.md) prohibe en cualquier pantalla del
+        # deck. Aqui la tarea se queda visible en gris hasta el proximo
+        # refresco real (ver orchestrator.press_ticktick_toggle). Con la
+        # prioridad/id fijos, la tecla de una tarea no se mueve solo por
+        # pulsarla.
         loose_tasks = sorted(
             (t for t in ticktick_tasks if t.project_id not in open_project_ids),
             key=lambda t: (-t.priority, t.id),
@@ -1604,12 +1637,12 @@ def _undoes(screen: ScreenState, habit: Habit) -> bool:
     """Decide si pulsar ``habit`` en ``screen`` deshace en vez de avanzar.
 
     Solo deshace un habito **booleano** ya hecho hoy, y solo en una vista que
-    lo declare (``ViewSpec.allows_undo``) o en una seccion (``screen.
-    section_name``, ver ``ScreenState``) -- una seccion siempre deshace,
-    mismo comportamiento que "Habitos", sin necesitar una entrada en
-    ``VIEWS``. Un habito cuantificable nunca deshace al pulsarlo: sigue
-    sumando ``step`` aunque ya haya pasado su objetivo (10/8 -> 11/8), que es
-    justo lo que su tecla en gris significa.
+    lo declare (``ViewSpec.allows_undo`` -- "Hoy" y "Habitos", ver ahi mismo)
+    o en una seccion (``screen.section_name``, ver ``ScreenState``) -- una
+    seccion siempre deshace, mismo comportamiento que "Habitos", sin
+    necesitar una entrada en ``VIEWS``. Un habito cuantificable nunca deshace
+    al pulsarlo: sigue sumando ``step`` aunque ya haya pasado su objetivo
+    (10/8 -> 11/8), que es justo lo que su tecla en gris significa.
     """
     if screen.section_name:
         allows_undo = True
@@ -1781,6 +1814,14 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
         return PressAction("habit_undo" if _undoes(screen, habit) else "habit", habit.id)
     task = page.key_task.get(key)
     if task is not None:
+        # Ya completada (Task.completed, mutada de forma optimista por
+        # orchestrator.press_task): se queda gris en su tecla hasta el
+        # proximo refresco real, pero pulsarla no hace nada -- a diferencia
+        # de TickTick, habits-core no tiene RPC para "descompletar" una
+        # tarea, asi que no hay nada que ejecutar aqui (mismo criterio que
+        # una plantilla con ocurrencia pendiente, unas lineas mas abajo).
+        if task.completed:
+            return PressAction("noop")
         return PressAction("task", task.id)
     template = page.key_template.get(key)
     if template is not None:

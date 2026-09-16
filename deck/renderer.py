@@ -158,12 +158,22 @@ def render_habit(deck: Any, key: int, habit: Habit | None) -> None:
 
 
 def render_task(deck: Any, key: int, task: Task | None) -> None:
-    """Pinta una tecla de tarea pendiente.
+    """Pinta una tecla de tarea.
 
-    El color de fondo lo da la prioridad de la tarea (blanca, verde, amarilla o
-    roja, ver ``deck/style.py``); una prioridad desconocida cae al color de la
-    prioridad 0 en vez de fallar. No hay variante "hecha": una tarea completada
-    desaparece de la lista, y la tecla se pinta vacia (``task`` a ``None``).
+    Pendiente: el color de fondo lo da la prioridad de la tarea (blanca,
+    verde, amarilla o roja, ver ``deck/style.py``); una prioridad desconocida
+    cae al color de la prioridad 0 en vez de fallar. Completada
+    (``task.completed``, mutado de forma optimista por
+    ``orchestrator.press_task``): el mismo gris de "hecho" que un habito
+    (``COLOR_HABIT_DONE``/``COLOR_TEXT_HABIT_DONE``, ver ``render_habit``) --
+    la tarea SIGUE en su tecla, no se pinta vacia ni se recoloca el resto:
+    "Completar no hace desaparecer" es el estandar del proyecto para
+    cualquier check (ver CLAUDE.md), aqui igual que en ``render_habit``/
+    ``render_ticktick_task``. Solo el proximo refresco real la quita de la
+    lista si sigue completada (``core.screens._today_items``/``_tasks_items``/
+    ``_project_page`` ya no la filtran, dependen de que deje de llegar en
+    ``TaskProvider.get_tasks()``). Si ``task`` es ``None`` la tecla se pinta
+    vacia.
 
     El texto es ``task.display_label()`` (el titulo, ya recortado si era largo)
     y el emoji que llevara el titulo, si lo habia, se pinta aparte como icono a
@@ -184,8 +194,11 @@ def render_task(deck: Any, key: int, task: Task | None) -> None:
     if task is None:
         deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
         return
-    color = COLOR_TASK_BY_PRIORITY.get(task.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
-    text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(task.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+    if task.completed:
+        color, text_color = COLOR_HABIT_DONE, COLOR_TEXT_HABIT_DONE
+    else:
+        color = COLOR_TASK_BY_PRIORITY.get(task.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+        text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(task.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
     border_color = None
     if task.timer_running:
         border_color = COLOR_TASK_TIMER_BORDER_HIGH_PRIORITY if task.priority == 5 else COLOR_TASK_TIMER_BORDER
