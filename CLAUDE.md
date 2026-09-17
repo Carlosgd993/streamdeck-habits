@@ -59,7 +59,8 @@ ticktick/              PoC de la pantalla "TickTick", DELIBERADAMENTE independie
 deploy/deploy.sh       Despliegue en la Pi: normal (git pull + reinicio) o --test (reinicio a secas,
                        sin git pull). No tiene nada que ver con el proyecto Supabase de test.
 deploy/*.service       Unit de systemd. No se instala sola.
-scripts/               Dos smoke tests de hardware. Requieren un deck conectado.
+scripts/               Dos smoke tests de hardware (requieren un deck conectado) y usbreset.py,
+                       que desatasca el deck cuando rechaza toda escritura USB.
 ```
 
 | Si vas a cambiar… | Toca | Ojo con |
@@ -634,6 +635,33 @@ ssh admin@RP3-MotoComm-1.local "bash /opt/streamdeck-habits/deploy/deploy.sh"
 - **No instala cambios de la unit de systemd.** Si tocas `deploy/streamdeck-habits.service`, cópialo a mano a `/etc/systemd/system/` con `sudo` + `daemon-reload` + `restart`.
 - Existe un alias `habits-update` en el `~/.bashrc` de la Pi para uso interactivo, pero **no funciona desde `ssh host "habits-update"`**: el `.bashrc` de Debian corta la ejecución al inicio si el shell no es interactivo (`case $- in *i*) ;; *) return;; esac`), así que el alias nunca llega a definirse y falla con `command not found`. Usa siempre la ruta completa al script.
 
+### El deck se queda colgado tras varios reinicios seguidos (`Failed to write feature report`)
+
+**Síntoma**: el servicio entra en **bucle de reinicio** y el journal repite esto, con un PID nuevo cada pocos segundos:
+
+```
+File "/opt/streamdeck-habits/deck/session.py", line 63, in open
+    deck.reset()
+StreamDeck.Transport.Transport.TransportError: Failed to write feature report (-1)
+python: ../../libusb/os/threads_posix.h:46: usbi_mutex_lock: Assertion `pthread_mutex_lock(mutex) == 0' failed.
+```
+
+`systemctl is-active` responde `activating`, el `MainPID` es `0` y el contador de reinicios sube sin parar.
+
+**Qué NO es**: no es el código que acabas de desplegar. Revienta en `session.open()` → `deck.reset()`, o sea en la **primera escritura USB**, antes de tocar datos, red o pantalla — el deck sigue apareciendo en `lsusb`, pero rechaza cualquier escritura. Antes de buscar el fallo en un cambio tuyo, comprueba si la traza es esta.
+
+**Causa**: el dispositivo se queda atascado a nivel HID después de **encadenar varios reinicios bruscos**. `deploy.sh` reinicia matando el proceso con `kill -9` (es lo que le permite funcionar sin sudo), y si eso pilla una transferencia USB a medias, el deck se queda en ese estado. Con un despliegue suelto no pasa; se vio haciendo tres seguidos en diez minutos (`--test`, `--test`, despliegue normal).
+
+**Arreglo**, sin sudo y sin tocar el cable:
+
+```bash
+ssh admin@RP3-MotoComm-1.local '/opt/streamdeck-habits/venv/bin/python /opt/streamdeck-habits/scripts/usbreset.py'
+```
+
+Manda el ioctl `USBDEVFS_RESET` al nodo del dispositivo (equivale a desenchufarlo y enchufarlo). No hace falta parar el servicio: systemd sigue reintentando y el siguiente intento, unos segundos después, abre el deck ya sin problema. Confírmalo con `systemctl is-active` (debe decir `active`) y con un `MainPID` que se mantenga.
+
+**Cómo evitarlo**: no encadenes reinicios sin necesidad. Un cambio que solo toca documentación, `scripts/` o cualquier cosa que el daemon no importe **no necesita reiniciar**: basta con `ssh admin@RP3-MotoComm-1.local 'git -C /opt/streamdeck-habits pull'`, sin `deploy.sh`.
+
 ### Disposición en la Pi
 
 `config.py` fija `BASE_DIR = "/opt/streamdeck-habits"` y el shebang de `orchestrator.py` apunta a `/opt/streamdeck-habits/venv/bin/python` (Python 3.13.5). **No hay override por variable de entorno: trata `BASE_DIR` como fijo.** Junto al código se espera (todo gitignored salvo `.env.example`):
@@ -656,8 +684,9 @@ pip install streamdeck python-dotenv requests Pillow
 - `python orchestrator.py` — daemon principal (requiere una Stream Deck real conectada y un `.env` válido)
 - `python scripts/test_hw.py` — smoke test de hardware: enumera el deck, imprime modelo/serie/firmware, registra pulsaciones crudas
 - `python scripts/toggle_test.py` — smoke test visual: alterna cada tecla entre azul y verde al pulsarla, sin llamadas de red
+- `python scripts/usbreset.py` — resetea el deck por USB cuando se queda colgado a nivel HID y el servicio entra en bucle de reinicio (ver [El deck se queda colgado tras varios reinicios seguidos](#el-deck-se-queda-colgado-tras-varios-reinicios-seguidos-failed-to-write-feature-report)). Es el único que NO usa la librería `StreamDeck` ni necesita que el deck responda: habla directamente con el nodo USB
 
-Los tres necesitan que la librería `StreamDeck` (python-elgato-streamdeck) tenga acceso al dispositivo USB físico, así que solo tienen sentido en el hardware objetivo.
+Los tres primeros necesitan que la librería `StreamDeck` (python-elgato-streamdeck) tenga acceso al dispositivo USB físico; `usbreset.py` solo necesita el nodo de `/dev/bus/usb` (por eso sirve justo cuando la librería ya no puede abrirlo). Los cuatro solo tienen sentido en el hardware objetivo.
 
 Para pintar el emoji del nombre de un hábito como icono a color hace falta además la fuente del sistema `fonts-noto-color-emoji` (paquete Debian, no de Python): `sudo apt install fonts-noto-color-emoji` — requiere sudo interactivo, no se puede instalar por SSH no interactivo desde aquí. Si falta, `deck/primitives.py::_emoji_font()` devuelve `None` y la tecla simplemente no pinta icono: **se degrada, no falla**.
 
