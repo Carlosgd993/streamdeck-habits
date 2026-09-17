@@ -534,6 +534,11 @@ def make_key_callback(
             # refresco posterior falla, la tecla queda pintada con el estado
             # nuevo en vez de con el viejo.
             habit.current_value = new_value
+            # Marca "pulsado aqui, aun sin refresco": mantiene el habito
+            # visible en gris en "Hoy" (que si filtra los ya hechos) hasta que
+            # una lectura real reconstruya el objeto. Ver provider.base.Habit
+            # y core.screens._today_items.
+            habit.just_pressed = True
             _safe_render(repaint)
             if undo:
                 # El valor que devuelve la base es el del dia, y en un habito
@@ -570,6 +575,7 @@ def make_key_callback(
             print(f"Entrada manual FALLO [{code}]: {habit_id}", flush=True)
         else:
             habit.current_value = new_value
+            habit.just_pressed = True  # ver press_habit: lo mantiene visible en "Hoy" hasta el refresco
             _safe_render(exit_numeric_entry)
             invalidate(HABIT_RESOURCES)  # valor exacto de la base: basta con caducarlo, sin releer ahora
             print(f"Entrada manual OK: {habit.name} -> {new_value}", flush=True)
@@ -758,6 +764,7 @@ def make_key_callback(
             print(f"Deshacer (opciones) FALLO [{code}]: {habit_id}", flush=True)
         else:
             habit.current_value = new_value
+            habit.just_pressed = True  # ver press_habit: lo mantiene visible en "Hoy" hasta el refresco
             _safe_render(exit_item_options)  # sale del menu de opciones a la vista de origen, ya repintada
             refresh_after_write(HABIT_RESOURCES)  # el valor fiable es el de la base, ver mas arriba
             print(f"Deshacer (opciones) OK: {habit.name} -> {new_value}", flush=True)
@@ -799,6 +806,7 @@ def make_key_callback(
             print(f"{label} FALLO [{code}]: {habit_id}", flush=True)
         else:
             habit.current_value = confirmed
+            habit.just_pressed = True  # ver press_habit: lo mantiene visible en "Hoy" hasta el refresco
             # No se sale de ITEM_OPTIONS (ver el docstring): se repinta esta
             # misma pantalla con el valor optimista y la relectura, que llega
             # por detras, vuelve a repintarla con el de la base.

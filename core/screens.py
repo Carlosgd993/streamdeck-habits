@@ -786,29 +786,44 @@ def _today_items(
     daily_totals: dict[str, int],
     task_totals: dict[str, int],
 ) -> list[ViewItem]:
-    """Items de la vista "Hoy": TODOS los habitos de hoy (pendientes y ya
-    hechos, ordenados por ``(order, id)``, igual que un reparto de tecla
-    nuevo) seguidos de TODAS las tareas pendientes/recien completadas en el
-    orden que ya trae el proveedor (prioridad descendente, fecha
-    ascendente).
+    """Items de la vista "Hoy": los habitos que **quedan** por hacer hoy
+    (ordenados por ``(order, id)``, igual que un reparto de tecla nuevo)
+    seguidos de las tareas que quedan pendientes, en el orden que ya trae el
+    proveedor (prioridad descendente, fecha ascendente).
 
-    Ni un habito hecho ni una tarea recien completada se filtran aqui --
-    ``deck.renderer.render_habit``/``render_task`` los pintan en gris, mismo
-    "check no hace desaparecer" que cualquier otra pantalla (ver "Completar
-    no hace desaparecer" en CLAUDE.md). Un habito hecho sigue en su misma
-    posicion (``(order, id)`` no depende de ``is_done``) y una tarea
-    completada en la suya (el orden de ``tasks`` no cambia al marcar
-    ``Task.completed``, ver ``orchestrator.press_task``) -- nada se
-    recoloca por completar algo.
+    "Hoy" es la unica pantalla donde completar algo acaba haciendolo
+    desaparecer: es una lista de lo que falta, no un repaso del dia (para eso
+    estan "Habitos"/"Tareas", que siguen mostrandolo todo). Pero desaparece
+    **al refrescar, nunca bajo el dedo** -- ver 'La excepcion: "Hoy" si se
+    vacia al refrescar' en CLAUDE.md:
+
+    - Un habito hecho se filtra aqui, **salvo** si tiene ``just_pressed``
+      (pulsado en este deck y aun sin refresco que lo confirme, ver
+      ``provider.base.Habit``): ese se queda en gris, en su misma tecla, para
+      poder revisarlo o deshacerlo. Como cada lectura real reconstruye los
+      habitos desde la base, el flag se pierde solo y el habito desaparece en
+      ese momento.
+    - Una tarea completada no necesita filtro equivalente: el proveedor solo
+      devuelve pendientes, asi que una recien cerrada solo sigue en ``tasks``
+      (en gris, via ``Task.completed``) hasta la proxima lectura real. El
+      efecto es el mismo por el otro camino.
+
+    Nada se recoloca por completar algo en el momento de pulsarlo (las dos
+    marcas de arriba mantienen el elemento en la lista); es el refresco
+    posterior el que compacta la pagina al repartir de cero.
 
     A diferencia de ``habits``, esta vista **no** reutiliza el mapeo estable
-    de habitos: se pagina de cero cada vez con ``_flat_page_builder`` (mismo
-    motivo que "Tareas"/"Logs"/"Cronometros": nada desaparece de la lista
-    solo por completarse, asi que ya sale tecla estable entre ciclos sin
-    necesitar ``core.key_map``)."""
+    de habitos: se pagina de cero cada vez con ``_flat_page_builder``. Aqui la
+    tecla de cada elemento SI cambia al refrescar (justo por ese filtrado,
+    que es lo que se busca: que la lista se vaya vaciando sin huecos), al
+    contrario que en "Tareas"/"Logs"/"Cronometros", donde nada desaparece y
+    por eso sale estable sin necesitar ``core.key_map``."""
     _mark_running_task(tasks, running_timer, task_totals)
-    all_habits = sorted(habits, key=lambda h: (h.order, h.id))
-    return [ViewItem("habit", h) for h in all_habits] + [ViewItem("task", t) for t in tasks]
+    pending_habits = sorted(
+        (h for h in habits if not h.is_done or h.just_pressed),
+        key=lambda h: (h.order, h.id),
+    )
+    return [ViewItem("habit", h) for h in pending_habits] + [ViewItem("task", t) for t in tasks]
 
 
 def _tasks_items(

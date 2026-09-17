@@ -81,6 +81,17 @@ class Habit(ABC):
             ``BooleanHabit``/``RealHabit``) para que una vista filtrada por
             seccion (ver ``core.screens``) pueda leerlo sin ``isinstance``,
             igual que ``manual_entry``.
+        just_pressed: **Mutable, y NO viene del backend** (mismo patron que
+            ``Task.completed``/``Template.has_pending``): lo pone a ``True``
+            el orquestador tras cualquier escritura con exito sobre este
+            habito (paso, deshacer, entrada manual, ajuste), y se pierde solo
+            en cuanto una lectura real vuelve a construir el objeto desde la
+            base. Significa "pulsado en este deck y todavia sin refresco que
+            lo confirme": es lo que mantiene visible en gris, hasta ese
+            refresco, un habito recien completado en la vista "Hoy" -- que es
+            la unica que si lo filtra al refrescar (ver
+            ``core.screens._today_items`` y 'La excepcion: "Hoy" si se vacia
+            al refrescar' en CLAUDE.md).
     """
 
     def __init__(
@@ -100,6 +111,11 @@ class Habit(ABC):
         self.current_value = current_value
         self.manual_entry = manual_entry
         self.section_name = section_name
+        # No es parametro del constructor a proposito: no es un dato del
+        # backend, es estado local del deck. Que nazca siempre en False es
+        # justo lo que hace que cada lectura real lo "olvide" (ver el
+        # docstring de la clase).
+        self.just_pressed = False
 
     @property
     def goal(self) -> float:
