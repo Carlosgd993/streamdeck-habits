@@ -40,9 +40,11 @@ def log_failure(item_id: str, detail: str, kind: str = "habit") -> None:
         item_id: Id del habito, de la tarea, de la plantilla o de la
             etiqueta/tarea de cronometro sobre el que fallo la escritura.
         detail: Mensaje de la excepcion.
-        kind: ``"habit"``, ``"task"``, ``"template"``, ``"timer"`` o
-            ``"ticktick"`` (tarea de la pantalla "TickTick", independiente de
-            habits-core), para saber a que se refiere ``item_id``.
+        kind: ``"habit"``, ``"task"``, ``"template"``, ``"timer"``,
+            ``"ticktick"`` (tarea de la pantalla "TickTick") o
+            ``"google_tasks"`` (tarea de la pantalla "Google Tasks") --
+            las dos ultimas independientes de habits-core, para saber a que
+            se refiere ``item_id``.
     """
     with open(FAIL_LOG, "a") as f:
         f.write(json.dumps({

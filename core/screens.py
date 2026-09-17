@@ -94,11 +94,27 @@ deck) en vez de abrir el menu principal. "TickTick" desde el menu siempre
 entra en la principal, nunca conserva el filtro (ver
 ``orchestrator._enter_ticktick``).
 
+"Google Tasks" (``ScreenKind.GOOGLE_TASKS``) sigue el mismo patron que
+"TickTick" -- otra pantalla completa con su propio origen de datos
+(``google_tasks/``, PoC independiente de habits-core -- ver
+``google_tasks/base.py``), fuera de ``VIEWS``/``PageBuilder`` por el mismo
+motivo (refresco desacoplado, ``orchestrator.google_tasks_refresh_cycle``).
+Unica diferencia de forma: aqui TODA tarea pertenece a una lista (no hay
+"tareas sueltas" tipo Inbox de TickTick), asi que la pantalla principal
+(``ScreenState.google_list_id`` vacio) mezcla un boton por cada lista
+(``GoogleTaskList``, azul de navegacion, igual que un boton de proyecto de
+TickTick) seguido de TODAS las tareas pendientes de TODAS las listas --
+pensado para verlas de un vistazo sin tener que entrar en cada lista una por
+una. Pulsar un boton filtra a esa lista sola (``google_list_id`` puesto,
+mismo mecanismo que ``ticktick_project_id``); la tecla 0 se reinterpreta ahi
+como "Volver" a la principal, igual que en "TickTick".
+
 Este modulo no sabe nada del Stream Deck (no importa nada de ``deck/``): solo
 depende de ``config`` (constantes de teclas/paginacion), ``core.key_map``
 (``paginate``), ``provider.base`` (``Habit``/``RealHabit``/``Task``/
-``Template``/``TimerLabel``/``RunningTimer``) y ``ticktick.base``
-(``TickTickTask``), igual que el resto de ``core/``.
+``Template``/``TimerLabel``/``RunningTimer``), ``ticktick.base``
+(``TickTickTask``) y ``google_tasks.base`` (``GoogleTask``/``GoogleTaskList``),
+igual que el resto de ``core/``.
 """
 
 from __future__ import annotations
@@ -110,6 +126,7 @@ from enum import Enum, auto
 from config import ALL_KEYS, AVAILABLE_KEYS, CACHE_TTL_SECONDS, KEY_MENU, KEY_PAGE_NEXT, KEY_PAGE_PREV, PAGE_SIZE
 from core.cache import HABIT_RESOURCES, Resource
 from core.key_map import paginate
+from google_tasks.base import GoogleTask, GoogleTaskList
 from provider.base import BooleanHabit, Habit, RealHabit, RunningTimer, Task, Template, TimerLabel, clip_title
 from ticktick.base import TickTickProject, TickTickTask
 
@@ -128,6 +145,7 @@ class ScreenKind(Enum):
     PROJECTS_MENU = auto()
     PROJECT_OPTIONS = auto()
     TICKTICK = auto()
+    GOOGLE_TASKS = auto()
 
 
 @dataclass
@@ -216,6 +234,15 @@ class ScreenState:
             "TickTick" desde el menu (``orchestrator._enter_ticktick``): no
             hay boton de "volver" a la principal, asi que sin este reseteo
             reabrir "TickTick" se quedaria en el ultimo proyecto visitado.
+        google_list_id: Id de la lista de Google Tasks activa, solo si
+            ``kind`` es ``ScreenKind.GOOGLE_TASKS`` y no esta vacio -- mismo
+            mecanismo que ``ticktick_project_id`` (un campo mas de la
+            pantalla, no un ``ScreenKind`` propio): mientras este relleno,
+            ``resolve_page`` filtra a solo las tareas de esa lista en vez de
+            pintar la pantalla principal (botones de lista + TODAS las
+            tareas). Vacio de fabrica y tambien cada vez que se entra en
+            "Google Tasks" desde el menu (``orchestrator._enter_google_tasks``),
+            mismo motivo que ``ticktick_project_id``.
     """
 
     kind: ScreenKind = ScreenKind.VIEW
@@ -232,6 +259,7 @@ class ScreenState:
     entry_project_name: str = ""
     entry_project_origin: ScreenKind = ScreenKind.PROJECTS_MENU
     ticktick_project_id: str = ""
+    google_list_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -261,11 +289,14 @@ class MenuEntry:
             proyecto ``project_name``), "open_ticktick" (entra en la
             pantalla "TickTick", ver ``ScreenKind.TICKTICK``),
             "enter_ticktick_project" (filtra esa misma pantalla al proyecto
-            de TickTick ``ticktick_project_id``), "standby" (apaga la
-            pantalla del deck) o "shutdown" (apaga la Raspberry Pi). No hay
-            boton de "volver": la tecla de menu ya vuelve al menu principal
-            desde cualquier pantalla, incluida Sistema, asi que un boton
-            "Atras" seria redundante.
+            de TickTick ``ticktick_project_id``), "open_google_tasks" (entra
+            en la pantalla "Google Tasks", ver ``ScreenKind.GOOGLE_TASKS``),
+            "enter_google_list" (filtra esa misma pantalla a la lista de
+            Google Tasks ``google_list_id``), "standby" (apaga la pantalla
+            del deck) o "shutdown" (apaga la Raspberry Pi). No hay boton de
+            "volver": la tecla de menu ya vuelve al menu principal desde
+            cualquier pantalla, incluida Sistema, asi que un boton "Atras"
+            seria redundante.
         view_id: Id de la vista a la que lleva, solo si ``action`` es
             "select_view".
         key: Tecla fija dentro de la pagina 0 (p.ej. "Sistema" siempre en la
@@ -286,6 +317,11 @@ class MenuEntry:
             en vez de un nombre: a diferencia de un proyecto de habits-core,
             aqui si hay un id estable que usar. Lo generan los botones de la
             pantalla principal de "TickTick" (ver ``resolve_page``).
+        google_list_id: Id de la lista de Google Tasks a la que lleva, solo
+            si ``action`` es "enter_google_list" -- mismo papel que
+            ``ticktick_project_id``, con el id real de la lista
+            (``GoogleTaskList.id``). Lo generan los botones de la pantalla
+            principal de "Google Tasks" (ver ``resolve_page``).
     """
 
     label: str
@@ -296,6 +332,7 @@ class MenuEntry:
     section_name: str = ""
     project_name: str = ""
     ticktick_project_id: str = ""
+    google_list_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1170,6 +1207,9 @@ MENU_ENTRIES: list[MenuEntry] = [
     # PoC independiente de habits-core (ver ScreenKind.TICKTICK): sin tecla
     # fija, se reparte como Tareas/Crear/Logs.
     MenuEntry("TickTick", "☑️", "open_ticktick"),
+    # Otra PoC independiente de habits-core (ver ScreenKind.GOOGLE_TASKS),
+    # mismo criterio que TickTick: sin tecla fija.
+    MenuEntry("Google Tasks", "📋", "open_google_tasks"),
     MenuEntry("Sistema", "⚙️", "open_system", key=14),
 ]
 
@@ -1190,6 +1230,8 @@ def needs_for(screen: ScreenState) -> frozenset[Resource]:
     kind = screen.kind
     if kind is ScreenKind.TICKTICK:
         return frozenset({Resource.TICKTICK})
+    if kind is ScreenKind.GOOGLE_TASKS:
+        return frozenset({Resource.GOOGLE_TASKS})
     if kind is ScreenKind.MENU:
         # Los dos cronometros son del atajo de la tecla 7 (_timer_shortcut_item);
         # habitos y tareas, de los botones de seccion/proyecto fijados
@@ -1323,12 +1365,32 @@ class ResolvedPage:
     # de key_nav (Inbox y tareas de un proyecto cerrado); en la filtrada por
     # proyecto (ScreenState.ticktick_project_id), solo las de ese proyecto.
     key_ticktick: dict[int, TickTickTask] = field(default_factory=dict)
+    # Solo lo rellena ScreenKind.GOOGLE_TASKS (ver resolve_page): tareas de
+    # Google Tasks, independientes de todo lo demas (ver
+    # google_tasks/base.py). En la pantalla principal, TODAS las tareas
+    # pendientes de TODAS las listas (a diferencia de TickTick, aqui no hay
+    # tareas "sueltas" que distinguir: toda tarea pertenece a una lista); en
+    # la filtrada por lista (ScreenState.google_list_id), solo las de esa
+    # lista.
+    key_google_tasks: dict[int, GoogleTask] = field(default_factory=dict)
     page: int = 0
     total_pages: int = 1
 
 
 def _clamp_page(page: int, total_pages: int) -> int:
     return max(0, min(page, total_pages - 1))
+
+
+def _google_tasks_sort_key(task: GoogleTask) -> tuple[str, str]:
+    """Orden de una tarea de Google Tasks: por ``position`` (el orden manual
+    que le dio el usuario en su propia app -- cadena opaca, pero que SI
+    ordena correctamente como texto dentro de una misma lista, ver
+    ``GoogleTask.position``), con el ``id`` como desempate estable entre
+    listas distintas (``position`` no es comparable entre listas). Sin
+    ``completed`` en la clave a proposito, mismo motivo que TickTick
+    (``resolve_page``, rama ``ScreenKind.TICKTICK``): completar una tarea no
+    debe moverla de tecla."""
+    return (task.position, task.id)
 
 
 def _nav_page(
@@ -1372,6 +1434,8 @@ def resolve_page(
     pinned_projects: frozenset[str],
     ticktick_tasks: list[TickTickTask],
     ticktick_projects: list[TickTickProject],
+    google_tasks: list[GoogleTask],
+    google_lists: list[GoogleTaskList],
 ) -> ResolvedPage:
     """Resuelve la pantalla/pagina activa contra los datos vigentes.
 
@@ -1431,6 +1495,14 @@ def resolve_page(
             ``ticktick_refresh_cycle()`` exitoso que ``ticktick_tasks``.
             Tambien solo los usa ``ScreenKind.TICKTICK``, para los botones de
             la pantalla principal (ver mas abajo).
+        google_tasks: Tareas de Google Tasks del ultimo
+            ``orchestrator.google_tasks_refresh_cycle()`` exitoso. Solo las
+            usa ``ScreenKind.GOOGLE_TASKS``, mismo criterio que
+            ``ticktick_tasks``.
+        google_lists: Listas de Google Tasks del mismo
+            ``google_tasks_refresh_cycle()`` exitoso que ``google_tasks``.
+            Tambien solo los usa ``ScreenKind.GOOGLE_TASKS``, para los
+            botones de la pantalla principal (ver mas abajo).
 
     Returns:
         La pagina resuelta, lista para pintar con ``deck.renderer.render_page``.
@@ -1631,6 +1703,56 @@ def resolve_page(
             total_pages=total_pages,
         )
 
+    if screen.kind is ScreenKind.GOOGLE_TASKS:
+        # Mismo patron que ScreenKind.TICKTICK justo arriba, con una
+        # diferencia de forma: en Google Tasks TODA tarea pertenece a una
+        # lista (no hay Inbox/"tareas sueltas" que distinguir), asi que la
+        # pantalla principal mezcla un boton por cada lista con TODAS las
+        # tareas de TODAS las listas, no solo las "sin lista reconocida".
+        if screen.google_list_id:
+            # Filtrada a una lista: mismo orden que la principal, sin
+            # botones. Tecla 0 = "Volver" a la principal (mismo OptionEntry/
+            # render_option_entry que _ITEM_OPTIONS_BACK reutiliza en
+            # TickTick) -- resolve_press la resuelve a "exit_google_list"
+            # ANTES que a "open_menu", igual que con TickTick.
+            matching = [t for t in google_tasks if t.list_id == screen.google_list_id]
+            ordered_tasks = sorted(matching, key=_google_tasks_sort_key)
+            page_items, total_pages = paginate(ordered_tasks, screen.page, PAGE_SIZE)
+            key_google_tasks = dict(zip(AVAILABLE_KEYS, page_items, strict=False))
+            return ResolvedPage(
+                key_options={KEY_MENU: _ITEM_OPTIONS_BACK},
+                key_google_tasks=key_google_tasks,
+                page=_clamp_page(screen.page, total_pages),
+                total_pages=total_pages,
+            )
+
+        # Principal: un boton (azul de navegacion) por cada lista, ordenadas
+        # por nombre (Google Tasks no expone un sort_order de lista como
+        # TickTick con sus proyectos), seguido de TODAS las tareas
+        # pendientes de TODAS las listas -- sin filtrar por completada
+        # (mismo motivo que TickTick: completar no debe mover la tecla de
+        # sitio, ver "Completar no hace desaparecer" en CLAUDE.md).
+        sorted_lists = sorted(google_lists, key=lambda lst: (lst.title.lower(), lst.id))
+        list_entries = [
+            MenuEntry(lst.display_label(), "", "enter_google_list", google_list_id=lst.id) for lst in sorted_lists
+        ]
+        ordered_tasks = sorted(google_tasks, key=_google_tasks_sort_key)
+        mixed: list[MenuEntry | GoogleTask] = [*list_entries, *ordered_tasks]
+        page_items, total_pages = paginate(mixed, screen.page, PAGE_SIZE)
+        key_nav: dict[int, MenuEntry] = {}
+        key_google_tasks: dict[int, GoogleTask] = {}
+        for key, item in zip(AVAILABLE_KEYS, page_items, strict=False):
+            if isinstance(item, MenuEntry):
+                key_nav[key] = item
+            else:
+                key_google_tasks[key] = item
+        return ResolvedPage(
+            key_nav=key_nav,
+            key_google_tasks=key_google_tasks,
+            page=_clamp_page(screen.page, total_pages),
+            total_pages=total_pages,
+        )
+
     if screen.section_name:
         # screen.kind sigue siendo ScreenKind.VIEW: la seccion es un campo
         # mas de esa pantalla, no un ScreenKind propio (ver ScreenState.
@@ -1693,7 +1815,9 @@ class PressAction:
             "toggle_section_pin" | "open_projects" | "enter_project" |
             "project_options_exit" | "toggle_project_pin" |
             "open_ticktick" | "enter_ticktick_project" |
-            "exit_ticktick_project" | "ticktick_toggle" | "noop".
+            "exit_ticktick_project" | "ticktick_toggle" |
+            "open_google_tasks" | "enter_google_list" |
+            "exit_google_list" | "google_task_toggle" | "noop".
         payload: Id del habito/tarea/plantilla/etiqueta-de-cronometro si
             ``kind`` es
             "habit"/"habit_undo"/"habit_enter_value"/"task"/"template"/
@@ -1730,8 +1854,12 @@ class PressAction:
             id de la tarea de TickTick en el payload (mismo criterio que
             "task"/"timer_toggle"): quien la ejecuta relee su ``completed``
             actual para decidir completar o reabrir, en vez de decidirlo aqui
-            contra una pagina que podria haberse quedado desfasada. Vacio en
-            el resto.
+            contra una pagina que podria haberse quedado desfasada.
+            "enter_google_list" lleva el id de la lista de Google Tasks
+            (mismo patron que "enter_ticktick_project" con
+            ``MenuEntry.google_list_id``). "google_task_toggle" SI lleva el
+            id de la tarea de Google Tasks en el payload -- mismo criterio
+            exacto que "ticktick_toggle". Vacio en el resto.
     """
 
     kind: str
@@ -1771,6 +1899,8 @@ def _nav_press(entry: MenuEntry) -> PressAction:
         return PressAction("enter_project", entry.project_name)
     if entry.action == "enter_ticktick_project":
         return PressAction("enter_ticktick_project", entry.ticktick_project_id)
+    if entry.action == "enter_google_list":
+        return PressAction("enter_google_list", entry.google_list_id)
     return PressAction(entry.action)
 
 
@@ -1890,6 +2020,9 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
             # necesita tambien mirar ticktick_project_id: en la pantalla
             # principal la tecla 0 sigue siendo el menu de siempre).
             return PressAction("exit_ticktick_project")
+        if screen.kind is ScreenKind.GOOGLE_TASKS and screen.google_list_id:
+            # Mismo caso que TickTick justo arriba, para Google Tasks.
+            return PressAction("exit_google_list")
         return PressAction("open_menu")
 
     if key in (KEY_PAGE_PREV, KEY_PAGE_NEXT):
@@ -1942,6 +2075,9 @@ def resolve_press(screen: ScreenState, key: int, page: ResolvedPage) -> PressAct
     ticktick_task = page.key_ticktick.get(key)
     if ticktick_task is not None:
         return PressAction("ticktick_toggle", ticktick_task.id)
+    google_task = page.key_google_tasks.get(key)
+    if google_task is not None:
+        return PressAction("google_task_toggle", google_task.id)
     # Atajo fijo dentro de una vista de VIEWS (KEY_HABITS_SECTIONS_SHORTCUT en
     # "Habitos", KEY_TASKS_PROJECTS_SHORTCUT en "Tareas", ver resolve_page):
     # screen.kind aqui es ScreenKind.VIEW, no pasa por el bloque MENU/SYSTEM/

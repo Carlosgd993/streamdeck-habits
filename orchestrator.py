@@ -66,6 +66,8 @@ from provider.base import (
     TimerLabel,
     TimerProvider,
 )
+from google_tasks.base import GoogleTask, GoogleTaskList, GoogleTasksProvider
+from google_tasks.client import GoogleTasksApiProvider
 from provider.supabase import SupabaseProvider
 from ticktick.base import TickTickProject, TickTickProvider, TickTickTask
 from ticktick.client import TickTickApiProvider
@@ -166,6 +168,9 @@ def make_key_callback(
     ticktick_provider: TickTickProvider | None,
     ticktick_tasks_ref: dict[str, dict[str, TickTickTask]],
     ticktick_projects_ref: dict[str, dict[str, TickTickProject]],
+    google_tasks_provider: GoogleTasksProvider | None,
+    google_tasks_ref: dict[str, dict[str, GoogleTask]],
+    google_lists_ref: dict[str, dict[str, GoogleTaskList]],
     screen: screens.ScreenState,
     screen_lock: threading.Lock,
     reset_idle_timers: Callable[[], None],
@@ -346,6 +351,20 @@ def make_key_callback(
             ``ticktick_refresh_cycle()`` exitoso que ``ticktick_tasks_ref``,
             para los botones de la pantalla principal de "TickTick" (ver
             ``core.screens.resolve_page``).
+        google_tasks_provider: Proveedor de Google Tasks (puerto
+            ``google_tasks.base.GoogleTasksProvider``), o ``None`` si no se
+            pudo inicializar (faltan las credenciales OAuth2) -- ver
+            ``main()``. Independiente de ``ticktick_provider`` y de los
+            cuatro proveedores de habits-core.
+        google_tasks_ref: Wrapper ``{"value": {id: GoogleTask}}`` con las
+            tareas de Google Tasks del ultimo
+            ``orchestrator.google_tasks_refresh_cycle()`` exitoso, mismo
+            patron que ``ticktick_tasks_ref`` pero para un ciclo de refresco
+            totalmente aparte.
+        google_lists_ref: Wrapper ``{"value": {id: GoogleTaskList}}`` con las
+            listas de Google Tasks del mismo ``google_tasks_refresh_cycle()``
+            exitoso que ``google_tasks_ref``, para los botones de la pantalla
+            principal de "Google Tasks" (ver ``core.screens.resolve_page``).
         screen: Pantalla activa (menu, sistema o vista con su pagina).
         screen_lock: Lock que serializa lecturas/escrituras de ``screen`` y
             ``mapping`` frente al ciclo de refresco.
@@ -673,6 +692,37 @@ def make_key_callback(
             invalidate(frozenset({Resource.TICKTICK}))  # igual que press_task: gris ahora, relectura al volver
             print(f"TickTick {'completada' if task.completed else 'reabierta'}: {task.title}", flush=True)
 
+    def press_google_task_toggle(deck: Any, key: int, task_id: str) -> None:
+        """Completa o reabre una tarea de la pantalla "Google Tasks", segun su
+        estado actual (``task.completed``) -- mismo criterio exacto que
+        ``press_ticktick_toggle``: una sola accion para las dos direcciones,
+        la tarea se QUEDA en ``google_tasks_ref`` tras completarla (solo
+        cambia a gris, ver "Completar no hace desaparecer" en CLAUDE.md), y
+        solo el proximo ``google_tasks_refresh_cycle()`` real la quita de la
+        lista si sigue completada.
+        """
+        if google_tasks_provider is None:
+            return  # sin proveedor (faltan credenciales): no deberia haber tareas que pulsar
+        task = google_tasks_ref["value"].get(task_id)
+        if task is None:
+            return  # desaparecida entre refrescos (borrada/movida en Google Tasks): se ignora
+        _safe_render(lambda: renderer.render_task_sending(deck, key))
+        try:
+            if task.completed:
+                google_tasks_provider.uncomplete_task(task)
+            else:
+                google_tasks_provider.complete_task(task)
+        except ProviderError as exc:
+            _, code = health.classify(exc)
+            health.log_failure(task_id, str(exc), kind="google_tasks")
+            _safe_render(lambda: renderer.render_checkin_error(deck, key, code))
+            print(f"Google Tasks toggle FALLO [{code}]: {task_id}", flush=True)
+        else:
+            task.completed = not task.completed
+            _safe_render(repaint)
+            invalidate(frozenset({Resource.GOOGLE_TASKS}))  # igual que press_task: gris ahora, relectura al volver
+            print(f"Google Tasks {'completada' if task.completed else 'reabierta'}: {task.title}", flush=True)
+
     def press_task_priority(deck: Any, key: int, priority_str: str) -> None:
         with screen_lock:
             task_id = screen.entry_item_id
@@ -948,6 +998,7 @@ def make_key_callback(
             "numeric_confirm",
             "timer_toggle",
             "ticktick_toggle",
+            "google_task_toggle",
         ):
             # Un habito reserva su id sea cual sea la operacion, asi que un
             # paso/deshacer/confirmacion de entrada manual del mismo habito
@@ -955,8 +1006,9 @@ def make_key_callback(
             # como payload, ver core.screens.resolve_press). "timer_toggle"
             # lleva el id de la tarea/etiqueta en el payload sea cual sea su
             # origen (tecla de "Cronometros" o menu de opciones de una tarea).
-            # "ticktick_toggle" lleva el id de la tarea de TickTick, ajeno al
-            # resto (reserva de _claim independiente, no colisiona con nada).
+            # "ticktick_toggle"/"google_task_toggle" llevan el id de la tarea
+            # de TickTick/Google Tasks, ajenos al resto (reserva de _claim
+            # independiente, no colisiona con nada).
             item_id = action.payload
             if not _claim(item_id):
                 return  # ya hay una peticion en vuelo para este elemento
@@ -971,6 +1023,8 @@ def make_key_callback(
                     press_timer_toggle(deck, key, item_id)
                 elif action.kind == "ticktick_toggle":
                     press_ticktick_toggle(deck, key, item_id)
+                elif action.kind == "google_task_toggle":
+                    press_google_task_toggle(deck, key, item_id)
                 else:
                     press_habit(deck, key, item_id, undo=action.kind == "habit_undo")
             finally:
@@ -1067,6 +1121,8 @@ def make_key_callback(
             timer_labels_list = list(timer_labels_ref["value"].values())
             ticktick_tasks_list = list(ticktick_tasks_ref["value"].values())
             ticktick_projects_list = list(ticktick_projects_ref["value"].values())
+            google_tasks_list = list(google_tasks_ref["value"].values())
+            google_lists_list = list(google_lists_ref["value"].values())
             running_timer = running_timer_ref["value"]
             screen_kind = screen.kind  # capturado aqui: decide si "enter_section" arma hold, ver mas abajo
             resolved = screens.resolve_page(
@@ -1085,6 +1141,8 @@ def make_key_callback(
                 pinned_projects,
                 ticktick_tasks_list,
                 ticktick_projects_list,
+                google_tasks_list,
+                google_lists_list,
             )
             action = screens.resolve_press(screen, key, resolved)
 
@@ -1138,6 +1196,15 @@ def main() -> None:
         print(f"TickTick no disponible (pantalla 'TickTick' pintara AUTH): {exc}", flush=True)
         ticktick_provider = None
 
+    # Mismo criterio que ticktick_provider justo arriba: un fallo aqui NO
+    # tumba el daemon, es otra capacidad anadida (ver google_tasks/base.py).
+    google_tasks_provider: GoogleTasksProvider | None
+    try:
+        google_tasks_provider = GoogleTasksApiProvider()
+    except ProviderError as exc:
+        print(f"Google Tasks no disponible (pantalla 'Google Tasks' pintara AUTH): {exc}", flush=True)
+        google_tasks_provider = None
+
     session = DeckSession()
     session.open()
 
@@ -1172,6 +1239,14 @@ def main() -> None:
     # los botones de la pantalla principal de "TickTick" (ver
     # core.screens.resolve_page).
     ticktick_projects_ref: dict[str, dict[str, TickTickProject]] = {"value": {}}
+    # Tareas de Google Tasks del ultimo google_tasks_refresh_cycle() exitoso,
+    # mismo patron que ticktick_tasks_ref pero para un ciclo de refresco
+    # totalmente aparte (ver google_tasks_refresh_cycle).
+    google_tasks_ref: dict[str, dict[str, GoogleTask]] = {"value": {}}
+    # Listas de Google Tasks del mismo google_tasks_refresh_cycle() exitoso,
+    # para los botones de la pantalla principal de "Google Tasks" (ver
+    # core.screens.resolve_page).
+    google_lists_ref: dict[str, dict[str, GoogleTaskList]] = {"value": {}}
 
     screen = screens.ScreenState()  # arranca en "Hoy", pagina 0
     screen_lock = threading.Lock()  # serializa screen/mapping entre el ciclo y los callbacks
@@ -1252,6 +1327,8 @@ def main() -> None:
             pinned_projects,
             list(ticktick_tasks_ref["value"].values()),
             list(ticktick_projects_ref["value"].values()),
+            list(google_tasks_ref["value"].values()),
+            list(google_lists_ref["value"].values()),
         )
         _safe_render(lambda: renderer.render_page(deck, resolved))
 
@@ -1269,6 +1346,7 @@ def main() -> None:
         templates_code = cache.code(Resource.TEMPLATES)
         timer_labels_code = cache.code(Resource.TIMER_LABELS)
         ticktick_code = cache.code(Resource.TICKTICK)
+        google_tasks_code = cache.code(Resource.GOOGLE_TASKS)
 
         is_view = screen.kind is screens.ScreenKind.VIEW
         # Una seccion (screen.section_name) tambien depende de get_habits(),
@@ -1315,6 +1393,11 @@ def main() -> None:
             code = ticktick_code
             keys = list(resolved.key_ticktick.keys()) + list(resolved.key_nav.keys())
             _safe_render(lambda: renderer.render_error_all(deck, keys, code))
+        if google_tasks_code is not None and screen.kind is screens.ScreenKind.GOOGLE_TASKS:
+            # Mismo criterio que TickTick justo arriba, para Google Tasks.
+            code = google_tasks_code
+            keys = list(resolved.key_google_tasks.keys()) + list(resolved.key_nav.keys())
+            _safe_render(lambda: renderer.render_error_all(deck, keys, code))
 
         deck.set_key_callback(
             make_key_callback(
@@ -1338,6 +1421,9 @@ def main() -> None:
                 ticktick_provider,
                 ticktick_tasks_ref,
                 ticktick_projects_ref,
+                google_tasks_provider,
+                google_tasks_ref,
+                google_lists_ref,
                 screen,
                 screen_lock,
                 _reset_idle_timers,
@@ -1381,7 +1467,8 @@ def main() -> None:
         ni una pulsacion en curso con una llamada de red que no las afecta.
 
         Solo cuentan las lecturas de habits-core (``SUPABASE_RESOURCES``): un
-        NET de la API de TickTick no dice nada del proyecto Supabase.
+        NET de la API de TickTick o de Google no dice nada del proyecto
+        Supabase.
         """
         nonlocal last_restore_attempt
         if not cache.has_code("NET", SUPABASE_RESOURCES):
@@ -1416,6 +1503,21 @@ def main() -> None:
             raise ProviderAuthError("Falta TICKTICK_ACCESS_TOKEN en el .env")
         return ticktick_provider.get_tasks(), ticktick_provider.get_projects()
 
+    def _fetch_google_tasks() -> tuple[list[GoogleTask], list[GoogleTaskList]]:
+        """Las lecturas de Google Tasks como una sola, mismo criterio que
+        ``_fetch_ticktick``: primero las listas (para saber cuales pedir) y
+        luego, con esos ids, las tareas de cada una -- el "1+N" que exige la
+        API de Google Tasks (ver ``google_tasks.base.GoogleTasksProvider``),
+        bajo un unico codigo de error.
+
+        Sin credenciales configuradas (``google_tasks_provider`` es
+        ``None``, ver ``main``) ni siquiera intenta red: AUTH directo."""
+        if google_tasks_provider is None:
+            raise ProviderAuthError("Falta GOOGLE_CLIENT_ID/GOOGLE_CLIENT_SECRET/GOOGLE_REFRESH_TOKEN en el .env")
+        google_lists = google_tasks_provider.get_task_lists()
+        google_tasks = google_tasks_provider.get_tasks([lst.id for lst in google_lists])
+        return google_tasks, google_lists
+
     fetchers: dict[Resource, Callable[[], Any]] = {
         Resource.HABITS: habit_provider.get_habits,
         Resource.LOG_HABITS: habit_provider.get_log_habits,
@@ -1426,6 +1528,7 @@ def main() -> None:
         Resource.DAILY_TOTALS: timer_provider.get_daily_totals,
         Resource.TASK_TOTALS: timer_provider.get_task_totals,
         Resource.TICKTICK: _fetch_ticktick,
+        Resource.GOOGLE_TASKS: _fetch_google_tasks,
     }
     # Como se llama cada lectura en el log, con el mismo texto que ya usaba
     # cada bloque del ciclo antiguo (para no romper la lectura del journal).
@@ -1439,6 +1542,7 @@ def main() -> None:
         Resource.DAILY_TOTALS: "totales de hoy",
         Resource.TASK_TOTALS: "totales de siempre",
         Resource.TICKTICK: "ticktick",
+        Resource.GOOGLE_TASKS: "google_tasks",
     }
     # Orden fijo en que se piden, cuando se piden varias: el mismo de siempre,
     # para que el journal se lea igual que antes.
@@ -1452,6 +1556,7 @@ def main() -> None:
         Resource.DAILY_TOTALS,
         Resource.TASK_TOTALS,
         Resource.TICKTICK,
+        Resource.GOOGLE_TASKS,
     )
 
     def _apply(resource: Resource, value: Any) -> None:
@@ -1491,10 +1596,14 @@ def main() -> None:
             daily_totals_ref["value"] = value
         elif resource is Resource.TASK_TOTALS:
             task_totals_ref["value"] = value
-        else:
+        elif resource is Resource.TICKTICK:
             ticktick_tasks, ticktick_projects = value
             ticktick_tasks_ref["value"] = {t.id: t for t in ticktick_tasks}
             ticktick_projects_ref["value"] = {p.id: p for p in ticktick_projects}
+        else:
+            google_tasks, google_lists = value
+            google_tasks_ref["value"] = {t.id: t for t in google_tasks}
+            google_lists_ref["value"] = {lst.id: lst for lst in google_lists}
 
     def _fetch_resources(resources: frozenset[Resource]) -> None:
         """Lee ``resources``, aplica lo que llegue y repinta la pantalla activa.
@@ -1635,6 +1744,13 @@ def main() -> None:
         proveedor y su propio codigo de error."""
         _fetch_resources(frozenset({Resource.TICKTICK}))
 
+    def google_tasks_refresh_cycle() -> None:
+        """Relee Google Tasks y repinta: mismo patron exacto que
+        ``ticktick_refresh_cycle``, otro ciclo aparte del de habits-core, como
+        una lectura mas de la tabla -- ``Resource.GOOGLE_TASKS``, con su
+        propio proveedor y su propio codigo de error."""
+        _fetch_resources(frozenset({Resource.GOOGLE_TASKS}))
+
     def _is_standby() -> bool:
         """Si el deck esta ahora mismo suspendido (pantalla apagada)."""
         with screen_lock:
@@ -1651,6 +1767,13 @@ def main() -> None:
         """
         with screen_lock:
             return screen.kind is screens.ScreenKind.TICKTICK
+
+    def _is_google_tasks_active() -> bool:
+        """Si la pantalla "Google Tasks" es la que esta activa ahora mismo.
+        Mismo papel exacto que ``_is_ticktick_active``, para el otro ciclo
+        aparte de habits-core."""
+        with screen_lock:
+            return screen.kind is screens.ScreenKind.GOOGLE_TASKS
 
     def _enter_standby() -> None:
         """Apaga la retroiluminacion del deck y deja de refrescar.
@@ -1968,6 +2091,40 @@ def main() -> None:
             screen.ticktick_project_id, screen.page = "", 0
             _paint_current_screen()
 
+    def _enter_google_tasks() -> None:
+        """Entra en la pantalla principal de "Google Tasks"
+        (``ScreenKind.GOOGLE_TASKS``, ``google_list_id`` vacio). Mismo patron
+        exacto que ``_enter_ticktick``: pinta con lo cacheado y revalida por
+        detras, y lo unico que puede pedir es ``Resource.GOOGLE_TASKS``.
+
+        Limpia ``screen.google_list_id``: sin esto, reabrir "Google Tasks"
+        desde el menu tras haber entrado en una lista se quedaria filtrada
+        por error."""
+        with screen_lock:
+            screen.kind, screen.page = screens.ScreenKind.GOOGLE_TASKS, 0
+            screen.google_list_id = ""
+            _paint_current_screen()
+        _revalidate_screen()
+
+    def _enter_google_list(list_id: str) -> None:
+        """Entra en una lista de Google Tasks (filtra la pantalla "Google
+        Tasks" a sus tareas). Mismo patron exacto que
+        ``_enter_ticktick_project``: NO dispara ningun refresco --
+        ``google_tasks_ref`` ya trae TODAS las tareas de TODAS las listas
+        desde que se entro en la pantalla principal, asi que filtrar por
+        ``list_id`` es una operacion local (``core.screens.resolve_page``)."""
+        with screen_lock:
+            screen.google_list_id, screen.page = list_id, 0
+            _paint_current_screen()
+
+    def _exit_google_list() -> None:
+        """"Volver" desde una lista de Google Tasks a la pantalla principal
+        (tecla 0). Mismo patron exacto que ``_exit_ticktick_project``: limpia
+        ``screen.google_list_id`` y repinta, sin refetch."""
+        with screen_lock:
+            screen.google_list_id, screen.page = "", 0
+            _paint_current_screen()
+
     def _enter_section(section_name: str) -> None:
         """Entra en la seccion ``section_name`` en pagina 0, pinta con la
         cache y revalida por detras -- mismo patron que ``_enter_view``, y
@@ -2045,6 +2202,12 @@ def main() -> None:
             _enter_ticktick_project(action.payload)
         elif action.kind == "exit_ticktick_project":
             _exit_ticktick_project()
+        elif action.kind == "open_google_tasks":
+            _enter_google_tasks()
+        elif action.kind == "enter_google_list":
+            _enter_google_list(action.payload)
+        elif action.kind == "exit_google_list":
+            _exit_google_list()
         elif action.kind == "page_prev":
             _change_page(-1)
         elif action.kind == "page_next":
@@ -2134,11 +2297,14 @@ def main() -> None:
                 # propio ciclo completo (ver _wake).
                 if not _is_standby():
                     refresh_cycle()
-                    # TickTick es un ciclo aparte, y solo corre mientras esa
-                    # pantalla siga activa (ver _is_ticktick_active): no tiene
+                    # TickTick/Google Tasks son ciclos aparte, y cada uno solo
+                    # corre mientras su propia pantalla siga activa (ver
+                    # _is_ticktick_active/_is_google_tasks_active): no tiene
                     # sentido pedirle datos a su API si nadie la esta mirando.
                     if _is_ticktick_active():
                         ticktick_refresh_cycle()
+                    if _is_google_tasks_active():
+                        google_tasks_refresh_cycle()
             except Exception as exc:
                 # Cualquier fallo que no sea del proveedor de habitos/tareas
                 # (esos ya se gestionan dentro de refresh_cycle) se trata

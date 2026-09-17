@@ -69,6 +69,7 @@ from deck.style import (
     FONT_SIZE_TIMER,
     TASK_TIMER_BORDER_WIDTH,
 )
+from google_tasks.base import GoogleTask
 from provider.base import Habit, LogHabit, Task, Template, TimerLabel
 from ticktick.base import TickTickTask
 
@@ -235,6 +236,33 @@ def render_ticktick_task(deck: Any, key: int, task: TickTickTask | None) -> None
     else:
         color = COLOR_TASK_BY_PRIORITY.get(task.priority, COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
         text_color = COLOR_TEXT_TASK_BY_PRIORITY.get(task.priority, COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY])
+    image = text_tile(
+        deck, color, task.display_label(), text_color=text_color, font_size=FONT_SIZE_TASK, emoji=task.emoji
+    )
+    deck.set_key_image(key, image)
+
+
+def render_google_task(deck: Any, key: int, task: GoogleTask | None) -> None:
+    """Pinta una tecla de la pantalla "Google Tasks" (``ScreenKind.GOOGLE_TASKS``).
+
+    A diferencia de ``render_ticktick_task`` (que colorea por prioridad: el
+    contrato de TickTick coincide por casualidad con la escala 0/1/3/5 de
+    habits-core), el contrato de Google Tasks no tiene prioridad -- toda
+    tarea pendiente se pinta con el color liso de la prioridad 0 (blanca),
+    sin inventar ninguna derivada de otra cosa (p.ej. ``due``). Completada
+    (``task.completed``): mismo gris de "hecho" que un habito
+    (``COLOR_HABIT_DONE``/``COLOR_TEXT_HABIT_DONE``) -- la tarea sigue
+    visible en gris hasta el proximo refresco real, para poder deshacer un
+    completado por error (ver ``orchestrator.press_google_task_toggle``).
+    """
+    if task is None:
+        deck.set_key_image(key, solid_tile(deck, COLOR_EMPTY))
+        return
+    if task.completed:
+        color, text_color = COLOR_HABIT_DONE, COLOR_TEXT_HABIT_DONE
+    else:
+        color = COLOR_TASK_BY_PRIORITY[_DEFAULT_PRIORITY]
+        text_color = COLOR_TEXT_TASK_BY_PRIORITY[_DEFAULT_PRIORITY]
     image = text_tile(
         deck, color, task.display_label(), text_color=text_color, font_size=FONT_SIZE_TASK, emoji=task.emoji
     )
@@ -617,8 +645,9 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
     son menu/paginacion), luego menu (fija), flecha de paginacion o neutra,
     entrada de menu/sistema, habito, tarea, plantilla, etiqueta de cronometro,
     atajo de cronometro del menu (tecla 7, ``ScreenKind.MENU`` unicamente),
-    tarea de TickTick (``ScreenKind.TICKTICK`` unicamente) y, si no es nada de
-    eso, vacia.
+    tarea de TickTick (``ScreenKind.TICKTICK`` unicamente), tarea de Google
+    Tasks (``ScreenKind.GOOGLE_TASKS`` unicamente) y, si no es nada de eso,
+    vacia.
     ``resolved`` ya trae listo que hay en cada tecla; esta funcion solo pinta.
 
     Args:
@@ -651,6 +680,8 @@ def render_page(deck: Any, resolved: ResolvedPage) -> None:
             render_timer_shortcut(deck, key, resolved.key_timer_shortcut[key])
         elif key in resolved.key_ticktick:
             render_ticktick_task(deck, key, resolved.key_ticktick[key])
+        elif key in resolved.key_google_tasks:
+            render_google_task(deck, key, resolved.key_google_tasks[key])
         else:
             render_empty(deck, key)
 

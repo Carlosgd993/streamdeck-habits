@@ -34,9 +34,10 @@ class Resource(StrEnum):
     """Una lectura independiente del daemon: cada valor es una peticion.
 
     Los ocho primeros son las lecturas del contrato de ``habits-core`` (ver
-    ``provider.supabase``); ``TICKTICK`` es la PoC aparte (ver
-    ``ticktick.client``), que no comparte proveedor ni codigo de error con
-    las anteriores pero si el mismo mecanismo de caducidad.
+    ``provider.supabase``); ``TICKTICK``/``GOOGLE_TASKS`` son PoCs aparte (ver
+    ``ticktick.client``/``google_tasks.client``), que no comparten proveedor
+    ni codigo de error con las anteriores (ni entre si) pero si el mismo
+    mecanismo de caducidad.
     """
 
     HABITS = "habits"
@@ -48,6 +49,7 @@ class Resource(StrEnum):
     DAILY_TOTALS = "daily_totals"
     TASK_TOTALS = "task_totals"
     TICKTICK = "ticktick"
+    GOOGLE_TASKS = "google_tasks"
 
 
 SUPABASE_RESOURCES = frozenset(
@@ -62,10 +64,10 @@ SUPABASE_RESOURCES = frozenset(
         Resource.TASK_TOTALS,
     }
 )
-"""Las lecturas de ``habits-core``. Aparte de ``TICKTICK`` porque solo estas
-cuentan para decidir si hay que reactivar un proyecto Supabase pausado
-(``orchestrator._maybe_restore_project``): un NET de la API de TickTick no
-dice nada de Supabase."""
+"""Las lecturas de ``habits-core``. Aparte de ``TICKTICK``/``GOOGLE_TASKS``
+porque solo estas cuentan para decidir si hay que reactivar un proyecto
+Supabase pausado (``orchestrator._maybe_restore_project``): un NET de la API
+de TickTick o de Google no dice nada de Supabase."""
 
 ALL_RESOURCES = frozenset(Resource)
 
